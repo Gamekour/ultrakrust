@@ -8,6 +8,7 @@
 //! Output: `parity/report.tsv` (all metrics) and a printed list of failures/regressions only.
 mod checks;
 mod coverage;
+mod shaders;
 
 use std::collections::BTreeMap;
 
@@ -46,7 +47,18 @@ fn main() {
     let install = uk_assets::find_install().expect("ULTRAKILL install not found (set ULTRAKILL_DIR)");
 
     let run = |name: &str| only.as_deref().is_none_or(|o| name.contains(o) || o.contains(name));
+    // Repo hygiene: nothing read or derived from the game may be tracked (translated shaders,
+    // SPIR-V, Unity bundles/assets, decompiled code).
+    if let Ok(out) = std::process::Command::new("git").args(["ls-files"]).output() {
+        let tracked = String::from_utf8_lossy(&out.stdout);
+        let bad: Vec<&str> = tracked
+            .lines()
+            .filter(|f| [".wgsl", ".spv", ".bundle", ".assets", ".resS", ".resource", ".cs", ".dll"].iter().any(|e| f.ends_with(e)))
+            .collect();
+        r.pass("repo.no_game_files", bad.is_empty(), format!("tracked game-derived files: {bad:?}"));
+    }
     if run("level0-1") { checks::level_0_1(&install, &mut r) }
+    if run("shaders") { shaders::level(&install, "level0-1", &mut r) }
     if full && run("coverage") { coverage::all_scenes(&install, &mut r) }
 
     std::fs::create_dir_all("parity").unwrap();

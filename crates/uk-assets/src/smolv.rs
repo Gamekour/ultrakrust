@@ -488,7 +488,8 @@ pub fn decoded_size(data: &[u8]) -> Option<usize> {
 /// Decodes one SMOL-V module (the slice may extend past its end; decoding stops at the declared size).
 pub fn decode(data: &[u8]) -> Option<Vec<u32>> {
     let size = decoded_size(data)?;
-    let mut out: Vec<u32> = Vec::with_capacity(size / 4);
+    // SMOL-V is never larger than its SPIR-V by more than a small factor; cap the reservation
+    let mut out: Vec<u32> = Vec::with_capacity((size / 4).min(data.len() * 4));
     let mut r = Reader { b: data, i: 4 };
     out.push(SPIRV_MAGIC);
     let v = r.u4()?;

@@ -10,3 +10,4 @@ uk-core = { path = "../uk-core" }
 uk-assets = { path = "../uk-assets" }
 uk-game = { path = "../uk-game" }
 bevy_math.workspace = true
+naga = { version = "29.0.4", features = ["spv-in"] }

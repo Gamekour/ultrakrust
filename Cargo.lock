@@ -5187,6 +5187,7 @@ name = "uk-harness"
 version = "0.1.0"
 dependencies = [
  "bevy_math",
+ "naga",
  "uk-assets",
  "uk-core",
  "uk-game",

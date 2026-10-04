@@ -99,6 +99,19 @@ fn main() {
                     let s = lz4_flex::block::decompress(&blob[so..so + sc], sd).unwrap();
                     let e = &s[eo..eo + el];
                     println!("entry {ei}: segment {seg} offset {eo} len {el}");
+                    if std::env::var("TOKENS").is_ok() {
+                        // strings (u32 length + bytes, padded to 4) vs plain u32s
+                        let mut i = 0;
+                        let mut toks = Vec::new();
+                        while i + 4 <= el {
+                            let w = u32::from_le_bytes(e[i..i + 4].try_into().unwrap()) as usize;
+                            let s = (2..=64).contains(&w) && i + 4 + w <= el && e[i + 4..i + 4 + w].iter().all(|c| c.is_ascii_graphic() || *c == b' ');
+                            if s { toks.push(format!("\"{}\"", String::from_utf8_lossy(&e[i + 4..i + 4 + w]))); i += 4 + w.div_ceil(4) * 4; }
+                            else { toks.push(if w > 0xFFFF { format!("{w:#x}") } else { w.to_string() }); i += 4; }
+                        }
+                        println!("{}", toks.join(" "));
+                        return;
+                    }
                     for k in (std::env::var("FROM").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0) / 4)..(el / 4).min(std::env::var("TO").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(192) / 4) { let w = u32::from_le_bytes(e[k * 4..k * 4 + 4].try_into().unwrap()); println!("  +{:4} {w:08x} {w:>10} {:?}", k * 4, String::from_utf8_lossy(&e[k * 4..k * 4 + 4])); }
                     let mut hits = Vec::new();
                     for i in 0..e.len().saturating_sub(4) { let w = u32::from_le_bytes(e[i..i + 4].try_into().unwrap()); if w == 0x07230203 || w == 0x534D4F4C || &e[i..i + 4] == b"SMOL" { hits.push((i, w)); } }

@@ -136,6 +136,7 @@ pass.level8-3.navmesh	1
 pass.levelp-1.navmesh	1
 pass.levelp-2.navmesh	1
 pass.other.navmesh	1
+pass.repo.no_game_files	1
 pass.tutorial.navmesh	1
 pass.uk.navmesh	1
 perf.0-1.game_build_ms	43.586600000000004
@@ -201,3 +202,4 @@ render.other.tris_against_normals_pct	0.16063749051353401
 render.tundraassets.tris_against_normals_pct	0
 render.tutorial.tris_against_normals_pct	0.28585874299937775
 render.uk.tris_against_normals_pct	3.714142203370912
+shader.level0-1.materials_translated_pct	95.93908629441624

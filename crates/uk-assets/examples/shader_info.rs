@@ -62,7 +62,13 @@ fn main() {
                     }
                 }
                 let kw = pf.get("m_KeywordNames").array();
-                println!("keyword names: {}", kw.len());
+                println!("keyword names ({}): {:?}", kw.len(), kw.iter().map(|k| k.str()).collect::<Vec<_>>());
+                for (j, p) in subs[0].get("m_Passes").array().iter().enumerate() {
+                    let tags: Vec<String> = p.get("m_State").get("m_Tags").get("tags").array().iter().map(|t| format!("{}={}", t.get("first").str(), t.get("second").str())).collect();
+                    let st = p.get("m_State");
+                    println!("pass {j}: name {:?} tags {tags:?} cull {} zwrite {} ztest {} blend src {} dst {} | vtx progs {} frag progs {}", st.get("m_Name").str(), st.get("culling").get("val").f32(), st.get("zWrite").get("val").f32(), st.get("zTest").get("val").f32(), st.get("rtBlend0").get("srcBlend").get("val").f32(), st.get("rtBlend0").get("destBlend").get("val").f32(), p.get("progVertex").get("m_PlayerSubPrograms").array().iter().map(|l| l.array().len()).sum::<usize>(), p.get("progFragment").get("m_PlayerSubPrograms").array().iter().map(|l| l.array().len()).sum::<usize>());
+                    println!("   culling raw: {}", st.get("culling").compact());
+                }
                 let mut t = String::new();
                 let first_prog = subs.first().and_then(|s| s.get("m_Passes").array().first().cloned());
                 if let Some(p) = first_prog { shape(&p.get("progVertex"), 5, &mut t); }
