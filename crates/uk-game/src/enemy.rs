@@ -61,6 +61,14 @@ pub struct Enemy {
     pub hitboxes: Vec<Hitbox>,
     pub activate_on_death: Vec<u32>,
     pub counted: bool,
+    // Malicious Face
+    pub burst_charge: f32,
+    pub current_burst: u32,
+    pub beam_prob: f32,
+    pub beam_charge: f32,
+    pub beam_fire_t: f32,
+    pub beam_target: Vec3,
+    pub rng: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -115,10 +123,18 @@ impl Enemy {
                 continue;
             }
             if c.node == node && !c.trigger {
-                if let ShapeDef::Capsule { a, b, radius: r } = &c.shape {
-                    radius = *r;
-                    half_height = a.distance(*b) * 0.5 + r;
-                    center_y = ((*a + *b) * 0.5 - pos0).y;
+                match &c.shape {
+                    ShapeDef::Capsule { a, b, radius: r } => {
+                        radius = *r;
+                        half_height = a.distance(*b) * 0.5 + r;
+                        center_y = ((*a + *b) * 0.5 - pos0).y;
+                    }
+                    ShapeDef::Sphere { center, radius: r } => {
+                        radius = *r;
+                        half_height = *r;
+                        center_y = (*center - pos0).y;
+                    }
+                    _ => {}
                 }
             }
             if c.trigger {
@@ -163,6 +179,13 @@ impl Enemy {
             hitboxes,
             activate_on_death,
             counted: false,
+            burst_charge: 5.0,
+            current_burst: 0,
+            beam_prob: 0.0,
+            beam_charge: -1.0,
+            beam_fire_t: -1.0,
+            beam_target: Vec3::ZERO,
+            rng: node.wrapping_mul(2654435761).max(1),
         })
     }
 
@@ -441,22 +464,103 @@ pub fn update(g: &mut Game, dt: f32) {
                 }
             }
             Kind::MaliciousFace => {
-                if en.cooldown > 0.0 {
-                    en.cooldown = move_towards(en.cooldown, 0.0, dt);
-                }
-                let dir = (target - en.center()).normalize_or_zero();
-                en.yaw = dir.x.atan2(-dir.z);
-                if en.cooldown <= 0.0 && dist < 150.0 {
-                    en.cooldown = 2.0;
-                    let from = en.center();
-                    for k in -1..=1 {
-                        let spread = Quat::from_rotation_y(k as f32 * 0.08) * dir;
-                        g.s.projectiles.push(Projectile { pos: from + spread * 4.0, vel: spread * 65.0, damage: 25.0, friendly: false, life: 10.0 });
-                    }
-                }
+                malicious_face(g, i, dt, target);
             }
             Kind::Other => {}
         }
+    }
+}
+
+fn next_rand(state: &mut u32) -> f32 {
+    // xorshift32
+    let mut x = *state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x;
+    (x as f32) / (u32::MAX as f32)
+}
+
+/// MaliciousFace (Standard difficulty): projectile bursts of 6 in a cross pattern,
+/// and a 2 s charged beam aimed at where the player is heading.
+fn malicious_face(g: &mut Game, i: usize, dt: f32, target: Vec3) {
+    let player_vel = g.s.player.vel;
+    let player_pos = g.s.player.pos;
+    let en = &mut g.s.enemies[i];
+    let mouth = en.center();
+    let to = target - mouth;
+    let dist = to.length();
+    let dir = to.normalize_or_zero();
+    en.yaw = dir.x.atan2(-dir.z);
+    // slow walk toward the player (NavMeshAgent speed 3.5), keeping height
+    if en.beam_charge < 0.0 && dist > 20.0 {
+        let flat = Vec3::new(dir.x, 0.0, dir.z).normalize_or_zero();
+        en.pos += flat * 3.5 * dt;
+    }
+    // beam: charging -> locked target -> fire
+    if en.beam_charge >= 0.0 {
+        en.beam_charge = (en.beam_charge + 0.5 * dt).min(1.0);
+        if en.beam_charge >= 1.0 && en.beam_fire_t < 0.0 {
+            en.beam_target = player_pos + Vec3::Y * 1.67 + Vec3::new(player_vel.x, player_vel.y / 2.0, player_vel.z) / 2.0;
+            en.beam_fire_t = 0.5;
+        }
+        if en.beam_fire_t >= 0.0 {
+            en.beam_fire_t -= dt;
+            if en.beam_fire_t < 0.0 {
+                let bdir = (en.beam_target - mouth).normalize_or_zero();
+                en.beam_charge = -1.0;
+                en.burst_charge = 1.0;
+                let world_hit = g.world.raycast(mouth + bdir * 2.5, bdir, 400.0).map(|h| h.distance).unwrap_or(400.0);
+                let cap = g.s.player.capsule();
+                let rel = |p: Vec3| p - mouth;
+                let along = rel((cap.a + cap.b) * 0.5).dot(bdir);
+                let closest = mouth + bdir * along.clamp(0.0, world_hit);
+                let ab = cap.b - cap.a;
+                let t = ((closest - cap.a).dot(ab) / ab.length_squared()).clamp(0.0, 1.0);
+                let d = (cap.a + ab * t).distance(closest);
+                g.events.push(GameEvent::Shot { from: mouth, to: mouth + bdir * world_hit, pierce: true });
+                if d < cap.radius + 1.5 && along > 0.0 && along < world_hit + 1.0 {
+                    // ContinuousBeam: GetHurt(..., ignoreInvincibility: true)
+                    g.hurt_player_ignoring_invincibility(50);
+                }
+            }
+        }
+        return;
+    }
+    if en.burst_charge > 0.0 {
+        en.burst_charge = move_towards(en.burst_charge, 0.0, dt);
+    }
+    if en.current_burst > 5 && en.burst_charge == 0.0 {
+        en.current_burst = 0;
+        en.burst_charge = 1.0;
+    }
+    if en.burst_charge > 0.0 || dist > 150.0 {
+        return;
+    }
+    // AttackCheck
+    let shoot = if en.current_burst != 0 {
+        true
+    } else {
+        let r = next_rand(&mut en.rng) * en.health * 0.4;
+        let beam = (en.beam_prob > 5.0 || r < en.beam_prob) && dist <= 50.0;
+        if beam {
+            en.beam_charge = 0.0;
+            en.beam_fire_t = -1.0;
+            en.beam_prob = if en.health > 10.0 { 0.0 } else { 1.0 };
+            false
+        } else {
+            en.beam_prob += 1.0;
+            true
+        }
+    };
+    if shoot {
+        // Standard difficulty: every projectile of the burst aims at the head (the
+        // cross-shaped spread is difficulty >= 4 only).
+        let aim = target + Vec3::Y * 1.0;
+        let pdir = (aim - mouth).normalize_or_zero();
+        en.current_burst += 1;
+        en.burst_charge = 0.1;
+        g.s.projectiles.push(Projectile { pos: mouth + pdir * 3.0, vel: pdir * 65.0, damage: 25.0, friendly: false, life: 10.0 });
     }
 }
 

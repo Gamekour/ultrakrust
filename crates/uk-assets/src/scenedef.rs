@@ -41,8 +41,9 @@ pub mod tags {
     pub const ARMOR: u32 = 20028;
 }
 
-/// Layers that never render in the world (UI, HUD, the original player rig).
-const HIDDEN_LAYERS: &[u8] = &[2, 5, 13, 19, 28, 30];
+/// Layers the player's Main Camera does not draw (its culling mask is 0x8fd2dfd7):
+/// trigger volumes (16 Invisible), UI, HUD, PlayerOnly/EnemyWall blockers, ...
+const HIDDEN_LAYERS: &[u8] = &[3, 5, 13, 16, 18, 19, 21, 28, 29, 30];
 
 #[derive(Clone, Debug)]
 pub struct NodeDef {

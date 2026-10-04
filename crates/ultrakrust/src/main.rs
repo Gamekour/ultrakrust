@@ -1,12 +1,14 @@
-//! ULTRAKRUST: Bevy frontend for `uk-core`.
+//! ULTRAKRUST: Bevy frontend for `uk-core` / `uk-game`.
 //!
-//! `ultrakrust` loads level 0-1 from your ULTRAKILL install (if found);
-//! `ultrakrust --level 1-1` picks another level; `ultrakrust --sandbox` opens the test map.
+//! `ultrakrust` plays level 0-1 from your ULTRAKILL install (if found);
+//! `ultrakrust --level 1-1` picks another level; `ultrakrust --sandbox` opens the test map;
+//! `ultrakrust --tour <dir>` saves screenshots of every room and exits.
 //!
 //! Controls (ULTRAKILL defaults): WASD move, Space jump, Left Shift dash,
-//! Left Ctrl slide / slam, LMB fire, hold RMB to charge a piercing shot.
-//! R respawn, N noclip, [ ] sensitivity, T toggle camera tilt, Esc release mouse, click to grab.
+//! Left Ctrl slide / slam, LMB fire, hold RMB to charge a piercing shot, F punch (parries).
+//! R restart from checkpoint, N noclip, [ ] sensitivity, T camera tilt, Esc release mouse.
 
+mod demo;
 mod level;
 mod map;
 mod tour;
@@ -16,32 +18,36 @@ use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::light::NotShadowCaster;
 use bevy::pbr::{DistanceFog, FogFalloff};
 use bevy::prelude::*;
+use bevy::text::FontSize;
 use bevy::window::{CursorGrabMode, CursorOptions, PresentMode, WindowResolution};
+use std::sync::Arc;
 use uk_core::camera::FpCamera;
 use uk_core::collide::World;
 use uk_core::consts::FIXED_DT;
 use uk_core::player::{Event, Input as PInput, Player};
 use uk_core::revolver::{Revolver, Shot};
+use uk_game::{Game, GameEvent};
 
 const SANDBOX_SPAWN: Vec3 = Vec3::new(0.0, 1.5, 100.0);
 const VIEW_LAYER: usize = 1;
 
 #[derive(Resource)]
 struct Sim {
-    world: World,
-    player: Player,
+    game: Game,
     cam: FpCamera,
     revolver: Revolver,
-    targets: Vec<map::Target>,
     /// Input latched for the fixed step (held state only).
     fixed_input: PInput,
     clock: f64,
     log: Vec<(String, f32)>,
+    banner: Option<(String, f32)>,
     recoil: f32,
-    spawn: Vec3,
-    spawn_yaw: f32,
+    punch_cd: f32,
+    punch_anim: f32,
     noclip: bool,
     title: String,
+    sandbox_targets: Vec<map::Target>,
+    level_time: f32,
 }
 
 #[derive(Component)]
@@ -49,9 +55,19 @@ struct MainCam;
 #[derive(Component)]
 struct ViewModel;
 #[derive(Component)]
+struct FistModel;
+#[derive(Component)]
 struct HudText;
 #[derive(Component)]
+struct HintText;
+#[derive(Component)]
+struct BannerText;
+#[derive(Component)]
 struct StaminaBar(usize);
+#[derive(Component)]
+struct HpBar;
+#[derive(Component)]
+struct HpText;
 #[derive(Component)]
 struct PierceBar;
 #[derive(Component)]
@@ -81,9 +97,10 @@ fn main() {
         .insert_resource(Time::<Fixed>::from_seconds(FIXED_DT as f64))
         .insert_resource(ClearColor(Color::srgb(0.02, 0.02, 0.03)))
         .insert_resource(GlobalAmbientLight { brightness: 350.0, ..default() })
+        .init_resource::<level::LevelView>()
         .add_systems(Startup, setup)
         .add_systems(FixedUpdate, fixed_sim)
-        .add_systems(Update, (cursor_grab, frame_sim, apply_view, update_beams, update_hud, tour::run_tour).chain())
+        .add_systems(Update, (cursor_grab, frame_sim, sync_level, apply_view, update_beams, update_hud, tour::run_tour).chain())
         .run();
 }
 
@@ -93,62 +110,53 @@ fn setup(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
 ) {
-    let tex = |images: &mut Assets<Image>, d: [u8; 3], l: [u8; 3], cells| images.add(map::checker(d, l, cells));
-    let mats = map::Materials {
-        floor: materials.add(StandardMaterial {
-            base_color_texture: Some(tex(&mut images, [38, 36, 34], [52, 49, 46], 4)),
-            perceptual_roughness: 0.95,
-            ..default()
-        }),
-        wall: materials.add(StandardMaterial {
-            base_color_texture: Some(tex(&mut images, [60, 26, 24], [78, 34, 30], 2)),
-            perceptual_roughness: 0.9,
-            ..default()
-        }),
-        accent: materials.add(StandardMaterial {
-            base_color_texture: Some(tex(&mut images, [70, 70, 76], [96, 96, 104], 2)),
-            perceptual_roughness: 0.8,
-            ..default()
-        }),
-        target: materials.add(StandardMaterial {
-            base_color: Color::srgb(0.9, 0.75, 0.2),
-            emissive: LinearRgba::rgb(0.6, 0.4, 0.0),
-            ..default()
-        }),
-    };
-
-    // Level from the user's install, or the movement test map.
     let args: Vec<String> = std::env::args().collect();
     let level_arg = args.iter().position(|a| a == "--level").and_then(|i| args.get(i + 1)).cloned();
     let want_level = !args.iter().any(|a| a == "--sandbox");
-    let mut world = World::default();
-    let mut targets = Vec::new();
-    let (mut spawn, mut spawn_yaw, mut title) = (SANDBOX_SPAWN, 0.0, "movement sandbox".to_string());
-    let mut loaded_level = false;
     let tour_dir = args.iter().position(|a| a == "--tour").and_then(|i| args.get(i + 1)).map(std::path::PathBuf::from);
-    let mut rooms = Vec::new();
+
+    let mut loaded: Option<level::Loaded> = None;
     if want_level {
         let name = level_arg.unwrap_or_else(|| "0-1".into());
         match level::load(&name, &mut commands, &mut meshes, &mut materials, &mut images) {
             Ok(l) => {
                 info!("{}", l.summary);
-                world = l.world;
-                spawn = l.spawn;
-                spawn_yaw = l.yaw;
-                title = l.summary;
-                rooms = l.rooms;
-                loaded_level = true;
+                loaded = Some(l);
             }
             Err(e) => warn!("could not load level {name}: {e}; falling back to the sandbox"),
         }
     }
-    if !loaded_level {
-        targets = map::spawn(&mut commands, &mut meshes, &mats, &mut world);
-        world.build();
-    }
+    let is_level = loaded.is_some();
+    let (game, title, rooms, sandbox_targets) = match loaded {
+        Some(l) => {
+            commands.insert_resource(l.view);
+            (l.game, l.summary, l.rooms, Vec::new())
+        }
+        None => {
+            let tex = |images: &mut Assets<Image>, d: [u8; 3], l: [u8; 3], cells| images.add(map::checker(d, l, cells));
+            let mats = map::Materials {
+                floor: materials.add(StandardMaterial { base_color_texture: Some(tex(&mut images, [38, 36, 34], [52, 49, 46], 4)), perceptual_roughness: 0.95, ..default() }),
+                wall: materials.add(StandardMaterial { base_color_texture: Some(tex(&mut images, [60, 26, 24], [78, 34, 30], 2)), perceptual_roughness: 0.9, ..default() }),
+                accent: materials.add(StandardMaterial { base_color_texture: Some(tex(&mut images, [70, 70, 76], [96, 96, 104], 2)), perceptual_roughness: 0.8, ..default() }),
+                target: materials.add(StandardMaterial { base_color: Color::srgb(0.9, 0.75, 0.2), emissive: LinearRgba::rgb(0.6, 0.4, 0.0), ..default() }),
+            };
+            let mut world = World::default();
+            let targets = map::spawn(&mut commands, &mut meshes, &mats, &mut world);
+            world.build();
+            let mut game = Game::new(Arc::new(uk_assets::scenedef::SceneDef::default()));
+            game.world = world;
+            game.s.player = Player::new(SANDBOX_SPAWN);
+            game.s.has_revolver = true;
+            game.spawn_yaw = 0.0;
+            game.rebase_start();
+            (game, "movement sandbox".to_string(), Vec::new(), targets)
+        }
+    };
+    let spawn = game.s.player.pos;
+    let spawn_yaw = game.spawn_yaw;
 
     commands.spawn((
-        DirectionalLight { illuminance: 9000.0, shadow_maps_enabled: true, ..default() },
+        DirectionalLight { illuminance: 9000.0, shadow_maps_enabled: !is_level, ..default() },
         Transform::from_xyz(40.0, 120.0, 60.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
 
@@ -160,11 +168,7 @@ fn setup(
             Projection::from(PerspectiveProjection { fov: 105f32.to_radians(), near: 0.05, ..default() }),
             DistanceFog {
                 color: Color::srgb(0.02, 0.02, 0.03),
-                falloff: if loaded_level {
-                    FogFalloff::Linear { start: 250.0, end: 900.0 }
-                } else {
-                    FogFalloff::Linear { start: 120.0, end: 320.0 }
-                },
+                falloff: if is_level { FogFalloff::Linear { start: 250.0, end: 900.0 } } else { FogFalloff::Linear { start: 120.0, end: 320.0 } },
                 ..default()
             },
             Transform::from_translation(spawn),
@@ -179,7 +183,7 @@ fn setup(
             // Placeholder revolver: body + barrel + cylinder.
             let gun = materials.add(StandardMaterial { base_color: Color::srgb(0.55, 0.56, 0.6), metallic: 0.7, ..default() });
             let grip = materials.add(Color::srgb(0.25, 0.12, 0.06));
-            c.spawn((ViewModel, Transform::from_xyz(0.32, -0.3, -0.55), Visibility::default(), RenderLayers::layer(VIEW_LAYER)))
+            c.spawn((ViewModel, Transform::from_xyz(0.32, -0.3, -0.55), Visibility::Hidden, RenderLayers::layer(VIEW_LAYER)))
                 .with_children(|g| {
                     for (mesh, mat, t) in [
                         (Cuboid::new(0.07, 0.09, 0.22), gun.clone(), Transform::from_xyz(0.0, 0.0, 0.0)),
@@ -190,6 +194,16 @@ fn setup(
                         g.spawn((Mesh3d(meshes.add(mesh)), MeshMaterial3d(mat), t, RenderLayers::layer(VIEW_LAYER), NotShadowCaster));
                     }
                 });
+            // Placeholder blue fist (Feedbacker)
+            let fist = materials.add(StandardMaterial { base_color: Color::srgb(0.25, 0.45, 0.9), metallic: 0.5, ..default() });
+            c.spawn((
+                FistModel,
+                Mesh3d(meshes.add(Cuboid::new(0.07, 0.07, 0.18))),
+                MeshMaterial3d(fist),
+                Transform::from_xyz(-0.38, -0.42, -0.75),
+                RenderLayers::layer(VIEW_LAYER),
+                NotShadowCaster,
+            ));
         });
     commands.spawn((PointLight { intensity: 3000.0, range: 3.0, ..default() }, Transform::from_xyz(0.5, 0.5, 0.0), RenderLayers::layer(VIEW_LAYER)));
 
@@ -215,63 +229,77 @@ fn setup(
     commands.spawn((
         HudText,
         Text::new(""),
-        TextFont { font_size: bevy::text::FontSize::Px(18.0), ..default() },
-        TextColor(Color::srgb(0.95, 0.95, 0.95)),
-        Node { position_type: PositionType::Absolute, top: px(12), left: px(12), ..default() },
+        TextFont { font_size: FontSize::Px(15.0), ..default() },
+        TextColor(Color::srgba(0.95, 0.95, 0.95, 0.85)),
+        Node { position_type: PositionType::Absolute, top: px(10), left: px(12), ..default() },
     ));
     commands.spawn((
         Text::new("+"),
-        TextFont { font_size: bevy::text::FontSize::Px(28.0), ..default() },
+        TextFont { font_size: FontSize::Px(28.0), ..default() },
         Node { position_type: PositionType::Absolute, left: percent(50), top: percent(50), margin: UiRect { left: px(-8), top: px(-18), ..default() }, ..default() },
     ));
+    commands.spawn((
+        HintText,
+        Text::new(""),
+        TextFont { font_size: FontSize::Px(22.0), ..default() },
+        TextColor(Color::srgb(1.0, 1.0, 1.0)),
+        TextLayout::justify(Justify::Center),
+        Node { position_type: PositionType::Absolute, bottom: px(140), width: percent(100), justify_content: JustifyContent::Center, ..default() },
+    ));
+    commands.spawn((
+        BannerText,
+        Text::new(""),
+        TextFont { font_size: FontSize::Px(54.0), ..default() },
+        TextColor(Color::srgb(1.0, 0.25, 0.2)),
+        TextLayout::justify(Justify::Center),
+        Node { position_type: PositionType::Absolute, top: percent(30), width: percent(100), justify_content: JustifyContent::Center, ..default() },
+    ));
     commands
-        .spawn(Node {
-            position_type: PositionType::Absolute,
-            bottom: px(24),
-            left: px(24),
-            flex_direction: FlexDirection::Column,
-            row_gap: px(6),
-            ..default()
-        })
+        .spawn(Node { position_type: PositionType::Absolute, bottom: px(24), left: px(24), flex_direction: FlexDirection::Column, row_gap: px(6), ..default() })
         .with_children(|ui| {
+            ui.spawn((HpText, Text::new("100"), TextFont { font_size: FontSize::Px(26.0), ..default() }, TextColor(Color::srgb(1.0, 0.3, 0.2))));
+            ui.spawn((Node { width: px(282), height: px(16), ..default() }, BackgroundColor(Color::srgb(0.15, 0.15, 0.15)))).with_children(|b| {
+                b.spawn((HpBar, Node { width: percent(100), height: percent(100), ..default() }, BackgroundColor(Color::srgb(0.85, 0.15, 0.1))));
+            });
             ui.spawn(Node { flex_direction: FlexDirection::Row, column_gap: px(6), ..default() }).with_children(|row| {
                 for i in 0..3 {
-                    row.spawn((Node { width: px(90), height: px(14), ..default() }, BackgroundColor(Color::srgb(0.15, 0.15, 0.15))))
-                        .with_children(|b| {
-                            b.spawn((StaminaBar(i), Node { width: percent(100), height: percent(100), ..default() }, BackgroundColor(Color::srgb(0.2, 0.75, 1.0))));
-                        });
+                    row.spawn((Node { width: px(90), height: px(12), ..default() }, BackgroundColor(Color::srgb(0.15, 0.15, 0.15)))).with_children(|b| {
+                        b.spawn((StaminaBar(i), Node { width: percent(100), height: percent(100), ..default() }, BackgroundColor(Color::srgb(0.2, 0.75, 1.0))));
+                    });
                 }
             });
-            ui.spawn((Node { width: px(282), height: px(6), ..default() }, BackgroundColor(Color::srgb(0.15, 0.15, 0.15))))
-                .with_children(|b| {
-                    b.spawn((PierceBar, Node { width: percent(0), height: percent(100), ..default() }, BackgroundColor(Color::srgb(1.0, 0.85, 0.2))));
-                });
+            ui.spawn((Node { width: px(282), height: px(6), ..default() }, BackgroundColor(Color::srgb(0.15, 0.15, 0.15)))).with_children(|b| {
+                b.spawn((PierceBar, Node { width: percent(0), height: percent(100), ..default() }, BackgroundColor(Color::srgb(1.0, 0.85, 0.2))));
+            });
         });
 
+    if let Some(dir) = args.iter().position(|a| a == "--demo").and_then(|i| args.get(i + 1)).map(std::path::PathBuf::from) {
+        let _ = std::fs::create_dir_all(&dir);
+        commands.insert_resource(demo::Demo::new(dir));
+    }
     if let Some(dir) = tour_dir {
         let _ = std::fs::create_dir_all(&dir);
-        let t = tour::Tour::new(dir, spawn, spawn_yaw, &rooms);
+        let t = tour::Tour::new(dir, spawn_yaw, &rooms);
         info!("tour: {} shots", t.shots.len());
         commands.insert_resource(t);
     }
-    let mut player = Player::new(spawn);
     let mut cam = FpCamera::default();
     cam.rotation_y = spawn_yaw;
-    player.yaw_deg = cam.rotation_y;
     commands.insert_resource(Sim {
-        world,
-        player,
+        game,
         cam,
         revolver: Revolver::default(),
-        targets,
         fixed_input: PInput::default(),
         clock: 0.0,
         log: Vec::new(),
+        banner: None,
         recoil: 0.0,
-        spawn,
-        spawn_yaw,
+        punch_cd: 0.0,
+        punch_anim: 0.0,
         noclip: false,
         title,
+        sandbox_targets,
+        level_time: 0.0,
     });
 }
 
@@ -288,10 +316,18 @@ fn cursor_grab(mut cursor: Single<&mut CursorOptions>, mouse: Res<ButtonInput<Mo
 
 fn move_axis(keys: &ButtonInput<KeyCode>) -> Vec2 {
     let mut v = Vec2::ZERO;
-    if keys.pressed(KeyCode::KeyW) { v.y += 1.0; }
-    if keys.pressed(KeyCode::KeyS) { v.y -= 1.0; }
-    if keys.pressed(KeyCode::KeyD) { v.x += 1.0; }
-    if keys.pressed(KeyCode::KeyA) { v.x -= 1.0; }
+    if keys.pressed(KeyCode::KeyW) {
+        v.y += 1.0;
+    }
+    if keys.pressed(KeyCode::KeyS) {
+        v.y -= 1.0;
+    }
+    if keys.pressed(KeyCode::KeyD) {
+        v.x += 1.0;
+    }
+    if keys.pressed(KeyCode::KeyA) {
+        v.x -= 1.0;
+    }
     // Unity's composite Move action is normalized
     v.normalize_or_zero()
 }
@@ -302,7 +338,7 @@ fn fixed_sim(mut sim: ResMut<Sim>) {
         return;
     }
     let input = sim.fixed_input;
-    sim.player.fixed_update(&sim.world, &input);
+    sim.game.fixed_update(&input);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -315,114 +351,180 @@ fn frame_sim(
     time: Res<Time>,
     mut commands: Commands,
     beams: Res<BeamAssets>,
-    mut target_tf: Query<&mut Transform, Without<MainCam>>,
+    mut target_tf: Query<&mut Transform, (Without<MainCam>, Without<Beam>)>,
+    demo: Option<ResMut<demo::Demo>>,
+    mut exit: MessageWriter<AppExit>,
 ) {
     let dt = time.delta_secs();
     let sim = &mut *sim;
+    let bot = match demo {
+        Some(mut d) => d.tick(&mut sim.game, dt, &mut commands, &mut exit),
+        None => None,
+    };
     sim.clock += dt as f64;
     let captured = cursor.grab_mode != CursorGrabMode::None;
 
     if keys.just_pressed(KeyCode::KeyR) {
-        sim.player = Player::new(sim.spawn);
-        sim.cam.rotation_y = sim.spawn_yaw;
-        sim.player.yaw_deg = sim.spawn_yaw;
+        sim.game.respawn();
+        sim.cam.rotation_y = sim.game.s.player.yaw_deg;
     }
-    if keys.just_pressed(KeyCode::BracketLeft) { sim.cam.sensitivity *= 0.8; }
-    if keys.just_pressed(KeyCode::BracketRight) { sim.cam.sensitivity *= 1.25; }
-    if keys.just_pressed(KeyCode::KeyT) { sim.cam.tilt_enabled = !sim.cam.tilt_enabled; }
+    if keys.just_pressed(KeyCode::BracketLeft) {
+        sim.cam.sensitivity *= 0.8;
+    }
+    if keys.just_pressed(KeyCode::BracketRight) {
+        sim.cam.sensitivity *= 1.25;
+    }
+    if keys.just_pressed(KeyCode::KeyT) {
+        sim.cam.tilt_enabled = !sim.cam.tilt_enabled;
+    }
     if keys.just_pressed(KeyCode::KeyN) {
         sim.noclip = !sim.noclip;
-        sim.player.vel = Vec3::ZERO;
+        sim.game.s.player.vel = Vec3::ZERO;
     }
 
-    let axis = move_axis(&keys);
-    let input = PInput {
-        move_axis: axis,
-        jump_pressed: keys.just_pressed(KeyCode::Space),
-        jump_held: keys.pressed(KeyCode::Space),
-        slide_pressed: keys.just_pressed(KeyCode::ControlLeft),
-        slide_released: keys.just_released(KeyCode::ControlLeft),
-        dash_pressed: keys.just_pressed(KeyCode::ShiftLeft),
+    let axis = bot.map(|b| b.input.move_axis).unwrap_or_else(|| move_axis(&keys));
+    let input = match bot {
+        Some(b) => b.input,
+        None => PInput {
+            move_axis: axis,
+            jump_pressed: keys.just_pressed(KeyCode::Space),
+            jump_held: keys.pressed(KeyCode::Space),
+            slide_pressed: keys.just_pressed(KeyCode::ControlLeft),
+            slide_released: keys.just_released(KeyCode::ControlLeft),
+            dash_pressed: keys.just_pressed(KeyCode::ShiftLeft),
+        },
     };
     sim.fixed_input = PInput { move_axis: axis, jump_held: input.jump_held, ..default() };
 
-    if captured {
+    // Camera input is locked while V1 falls into the level (GameState "pit-falling").
+    let can_look = captured && (sim.game.s.player.activated || sim.noclip);
+    if let Some(b) = bot {
+        sim.cam.rotation_y = b.yaw_deg;
+        sim.cam.rotation_x = b.pitch_deg;
+    } else if can_look {
         sim.cam.look(motion.delta);
     }
-    sim.player.yaw_deg = sim.cam.rotation_y;
+    sim.game.s.player.yaw_deg = sim.cam.rotation_y;
     let clock = sim.clock;
     if sim.noclip {
-        // Free fly for looking around a level: camera-relative, Space up, Ctrl down, Shift fast.
         let rot = sim.cam.rotation();
         let mut d = rot * Vec3::new(axis.x, 0.0, -axis.y);
-        if keys.pressed(KeyCode::Space) { d.y += 1.0; }
-        if keys.pressed(KeyCode::ControlLeft) { d.y -= 1.0; }
+        if keys.pressed(KeyCode::Space) {
+            d.y += 1.0;
+        }
+        if keys.pressed(KeyCode::ControlLeft) {
+            d.y -= 1.0;
+        }
         let speed = if keys.pressed(KeyCode::ShiftLeft) { 120.0 } else { 35.0 };
-        let step = d.normalize_or_zero() * speed * dt;
-        sim.player.pos += step;
-        sim.player.prev_pos = sim.player.pos;
+        let p = &mut sim.game.s.player;
+        p.pos += d.normalize_or_zero() * speed * dt;
+        p.prev_pos = p.pos;
     } else {
-        sim.player.update(&sim.world, &input, dt, clock);
+        sim.game.update(&input, dt, clock);
     }
-    sim.cam.late_update(&mut sim.player, axis.x, dt);
+    if !sim.game.s.level_complete && sim.game.s.player.activated {
+        sim.level_time += dt;
+    }
+    let strafe = axis.x;
+    sim.cam.late_update(&mut sim.game.s.player, strafe, dt);
 
-    for e in sim.player.events.drain(..) {
+    for e in sim.game.s.player.events.drain(..) {
         let msg = match e {
             Event::Ssj { gained } => format!("SUPER SLIDE JUMP +{gained:.0} u/s"),
             Event::SlamJump => "SLAM JUMP".into(),
             Event::DashJump => "DASH JUMP".into(),
             Event::WallJump(n) => format!("WALL JUMP {n}/3"),
             Event::StaminaFail => "no stamina".into(),
-            Event::Land { impact: true } => "impact".into(),
             _ => continue,
         };
         sim.log.push((msg, 2.0));
+    }
+
+    // Weapons
+    let eye = sim.game.s.player.pos + sim.cam.local_pos;
+    let aim = sim.cam.rotation() * Vec3::NEG_Z;
+    let alive = !sim.game.s.dead && sim.game.s.player.activated && !sim.game.s.level_complete;
+    sim.recoil = (sim.recoil - dt * 6.0).max(0.0);
+    sim.punch_cd = (sim.punch_cd - dt).max(0.0);
+    sim.punch_anim = (sim.punch_anim - dt * 5.0).max(0.0);
+    if let Some(b) = bot {
+        if b.fire && sim.game.s.has_revolver && alive {
+            sim.recoil = 1.0;
+            sim.game.fire_revolver(eye, aim, false);
+        }
+        if b.punch && alive {
+            sim.punch_anim = 1.0;
+            sim.game.punch(eye, aim);
+        }
+    } else if sim.game.s.has_revolver && alive {
+        let fire1 = captured && mouse.pressed(MouseButton::Left);
+        let shot = sim.revolver.update(fire1, captured && mouse.pressed(MouseButton::Right), mouse.just_released(MouseButton::Right), dt);
+        if let Some(shot) = shot {
+            sim.recoil = 1.0;
+            sim.game.fire_revolver(eye, aim, shot == Shot::Pierce);
+        }
+    }
+    if alive && captured && keys.just_pressed(KeyCode::KeyF) && sim.punch_cd <= 0.0 {
+        // FistControl: fistCooldown = cooldownCost (2) * 0.25
+        sim.punch_cd = 0.5;
+        sim.punch_anim = 1.0;
+        sim.game.punch(eye, aim);
+    }
+
+    // Game events -> visuals / HUD
+    let events: Vec<GameEvent> = sim.game.events.drain(..).collect();
+    for ev in &events {
+        if matches!(ev, GameEvent::Hurt(_) | GameEvent::Died | GameEvent::Respawned | GameEvent::Checkpoint | GameEvent::LevelComplete) {
+            info!("game event {:?} hp={} pos={:?}", ev, sim.game.s.hp, sim.game.s.player.pos);
+        }
+    }
+    for ev in events {
+        match ev {
+            GameEvent::Shot { from: _, to, pierce } => {
+                let muzzle = eye + sim.cam.rotation() * Vec3::new(0.32, -0.25, -0.9);
+                let len = muzzle.distance(to).max(0.01);
+                let width = if pierce { 0.35 } else { 0.12 };
+                commands.spawn((
+                    Beam { life: 0.12, max: 0.12 },
+                    Mesh3d(beams.mesh.clone()),
+                    MeshMaterial3d(if pierce { beams.pierce.clone() } else { beams.normal.clone() }),
+                    Transform::from_translation((muzzle + to) * 0.5).looking_at(to, Vec3::Y).with_scale(Vec3::new(width, width, len)),
+                    NotShadowCaster,
+                ));
+                // sandbox targets
+                for t in sim.sandbox_targets.iter_mut() {
+                    if let Some(h) = sim.game.world.raycast(eye, aim, 1000.0) {
+                        if h.collider.index == t.collider.index && h.collider.group == t.collider.group {
+                            t.hits += if pierce { 2 } else { 1 };
+                            t.flash = 0.15;
+                        }
+                    }
+                }
+            }
+            GameEvent::EnemyHit { head: true, .. } => sim.log.push(("HEADSHOT".into(), 1.0)),
+            GameEvent::EnemyKilled { .. } => sim.log.push(("KILL".into(), 1.0)),
+            GameEvent::Checkpoint => sim.banner = Some(("CHECKPOINT".into(), 1.5)),
+            GameEvent::WeaponGot(w) => sim.banner = Some((format!("{w} ACQUIRED"), 2.5)),
+            GameEvent::Died => sim.banner = Some(("YOU DIED".into(), 1.6)),
+            GameEvent::Respawned => {
+                sim.cam.rotation_y = sim.game.s.player.yaw_deg;
+                sim.revolver = Revolver::default();
+            }
+            GameEvent::LevelComplete => sim.banner = Some(("LEVEL COMPLETE".into(), f32::MAX)),
+            _ => {}
+        }
     }
     sim.log.retain_mut(|(_, t)| {
         *t -= dt;
         *t > 0.0
     });
-
-    // Revolver
-    let fire1 = captured && mouse.pressed(MouseButton::Left);
-    let shot = sim.revolver.update(fire1, captured && mouse.pressed(MouseButton::Right), mouse.just_released(MouseButton::Right), dt);
-    sim.recoil = (sim.recoil - dt * 6.0).max(0.0);
-    if let Some(shot) = shot {
-        sim.recoil = 1.0;
-        let eye = sim.player.pos + sim.cam.local_pos;
-        let dir = sim.cam.rotation() * Vec3::NEG_Z;
-        let max = 1000.0;
-        // Normal beams stop at the first thing; piercing beams pass through targets until a wall.
-        let mut end = eye + dir * max;
-        let mut from = eye;
-        let mut remaining = max;
-        loop {
-            let Some(hit) = sim.world.raycast(from, dir, remaining) else { break };
-            if let Some(t) = sim.targets.iter_mut().find(|t| t.collider == hit.collider) {
-                t.hits += if shot == Shot::Pierce { 2 } else { 1 };
-                t.flash = 0.15;
-                if shot == Shot::Pierce {
-                    let step = hit.distance + 2.5;
-                    from += dir * step;
-                    remaining -= step;
-                    if remaining > 0.0 { continue; }
-                }
-            }
-            end = from + dir * hit.distance;
-            break;
+    if let Some((_, t)) = &mut sim.banner {
+        *t -= dt;
+        if *t <= 0.0 {
+            sim.banner = None;
         }
-        let muzzle = eye + sim.cam.rotation() * Vec3::new(0.32, -0.25, -0.9);
-        let len = muzzle.distance(end);
-        let width = if shot == Shot::Pierce { 0.35 } else { 0.12 };
-        commands.spawn((
-            Beam { life: 0.12, max: 0.12 },
-            Mesh3d(beams.mesh.clone()),
-            MeshMaterial3d(if shot == Shot::Pierce { beams.pierce.clone() } else { beams.normal.clone() }),
-            Transform::from_translation((muzzle + end) * 0.5).looking_at(end, Vec3::Y).with_scale(Vec3::new(width, width, len)),
-            NotShadowCaster,
-        ));
     }
-    for t in sim.targets.iter_mut() {
+    for t in sim.sandbox_targets.iter_mut() {
         t.flash = (t.flash - dt).max(0.0);
         if let Ok(mut tf) = target_tf.get_mut(t.entity) {
             tf.scale = Vec3::splat(1.0 + t.flash * 2.0);
@@ -430,21 +532,33 @@ fn frame_sim(
     }
 }
 
+fn sync_level(
+    mut sim: ResMut<Sim>,
+    mut view: ResMut<level::LevelView>,
+    mut commands: Commands,
+    mut vis: Query<&mut Visibility>,
+    mut tfs: Query<&mut Transform, (Without<MainCam>, Without<ViewModel>, Without<FistModel>)>,
+) {
+    let sim = &mut *sim;
+    level::sync(&mut sim.game, &mut view, &mut commands, &mut vis, &mut tfs);
+}
+
+#[allow(clippy::type_complexity)]
 fn apply_view(
     sim: Res<Sim>,
-    tour: Option<Res<tour::Tour>>,
     fixed: Res<Time<Fixed>>,
+    tour: Option<Res<tour::Tour>>,
     mut cam: Single<(&mut Transform, &mut Projection), With<MainCam>>,
-    mut vm: Single<&mut Transform, (With<ViewModel>, Without<MainCam>)>,
+    mut vm: Single<(&mut Transform, &mut Visibility), (With<ViewModel>, Without<MainCam>)>,
+    mut fist: Single<&mut Transform, (With<FistModel>, Without<MainCam>, Without<ViewModel>)>,
 ) {
     let alpha = fixed.overstep_fraction();
-    let pos = sim.player.interpolated_pos(alpha) + sim.cam.local_pos;
+    let pos = sim.game.s.player.interpolated_pos(alpha) + sim.cam.local_pos;
     cam.0.translation = pos;
     cam.0.rotation = sim.cam.rotation();
     if let Projection::Perspective(p) = cam.1.as_mut() {
         p.fov = sim.cam.fov.to_radians();
     }
-    // Revolver kick
     if let Some((eye, yaw, pitch)) = tour.as_ref().and_then(|t| t.camera()) {
         cam.0.translation = eye;
         cam.0.rotation = Quat::from_rotation_y(-yaw.to_radians()) * Quat::from_rotation_x(pitch.to_radians());
@@ -452,8 +566,13 @@ fn apply_view(
             p.fov = 75f32.to_radians();
         }
     }
-    vm.translation = Vec3::new(0.32, -0.3, -0.55 + sim.recoil * 0.08);
-    vm.rotation = Quat::from_rotation_x(sim.recoil * 0.35);
+    // Revolver kick
+    vm.0.translation = Vec3::new(0.32, -0.3, -0.55 + sim.recoil * 0.08);
+    vm.0.rotation = Quat::from_rotation_x(sim.recoil * 0.35);
+    *vm.1 = if sim.game.s.has_revolver && !sim.game.s.dead { Visibility::Inherited } else { Visibility::Hidden };
+    // Punch jab
+    let j = (sim.punch_anim * std::f32::consts::PI).sin();
+    fist.translation = Vec3::new(-0.38 + j * 0.2, -0.42 + j * 0.15, -0.75 - j * 0.5);
 }
 
 fn update_beams(mut commands: Commands, time: Res<Time>, mut q: Query<(Entity, &mut Beam, &mut Transform)>) {
@@ -469,45 +588,71 @@ fn update_beams(mut commands: Commands, time: Res<Time>, mut q: Query<(Entity, &
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn update_hud(
     sim: Res<Sim>,
     diag: Res<Time<Real>>,
-    mut text: Single<&mut Text, With<HudText>>,
-    mut bars: Query<(&StaminaBar, &mut Node, &mut BackgroundColor), Without<PierceBar>>,
-    mut pierce: Single<&mut Node, With<PierceBar>>,
+    mut text: Single<&mut Text, (With<HudText>, Without<HintText>, Without<BannerText>, Without<HpText>)>,
+    mut hint: Single<&mut Text, (With<HintText>, Without<HudText>, Without<BannerText>, Without<HpText>)>,
+    mut banner: Single<&mut Text, (With<BannerText>, Without<HudText>, Without<HintText>, Without<HpText>)>,
+    mut hp_text: Single<&mut Text, (With<HpText>, Without<HudText>, Without<HintText>, Without<BannerText>)>,
+    mut bars: Query<(&StaminaBar, &mut Node, &mut BackgroundColor), (Without<PierceBar>, Without<HpBar>)>,
+    mut pierce: Single<&mut Node, (With<PierceBar>, Without<HpBar>)>,
+    mut hp_bar: Single<&mut Node, (With<HpBar>, Without<PierceBar>)>,
 ) {
-    let p = &sim.player;
+    let g = &sim.game;
+    let p = &g.s.player;
     let mut state = Vec::new();
-    if p.gc.on_ground { state.push("GROUND") } else { state.push("AIR") }
-    if p.sliding { state.push("SLIDE") }
-    if p.boost && !p.sliding { state.push("DASH") }
-    if p.gc.heavy_fall { state.push("SLAM") }
-    if p.wall.on_wall { state.push("WALL") }
-    if p.slow_mode { state.push("CROUCH") }
-    let hits: u32 = sim.targets.iter().map(|t| t.hits).sum();
+    if p.gc.on_ground {
+        state.push("GROUND")
+    } else {
+        state.push("AIR")
+    }
+    if p.sliding {
+        state.push("SLIDE")
+    }
+    if p.boost && !p.sliding {
+        state.push("DASH")
+    }
+    if p.gc.heavy_fall {
+        state.push("SLAM")
+    }
+    if p.wall.on_wall {
+        state.push("WALL")
+    }
+    if p.slow_mode {
+        state.push("CROUCH")
+    }
+    let alive_enemies = g.s.enemies.iter().filter(|e| e.alive && g.active(e.node)).count();
     let mut s = format!(
-        "ULTRAKRUST   {:.0} fps{}\n{}\n\nspeed  {:6.2} u/s  (vertical {:+.1})\nstate  {}\nwall jumps left  {}\nslam force  {:.2}   pre-slide x{:.2}\ntarget hits  {}\n\nWASD move  SPACE jump  SHIFT dash  CTRL slide/slam\nLMB fire  hold RMB pierce  R respawn  N noclip  T tilt  [ ] sens {:.3}\n",
+        "ULTRAKRUST  {:.0} fps{}\n{}\nspeed {:5.1} u/s  {}  |  kills {}  enemies here {}  |  time {:.1}s\n",
         1.0 / diag.delta_secs().max(1e-4),
-        if sim.noclip { "   [NOCLIP]" } else { "" },
+        if sim.noclip { "  [NOCLIP]" } else { "" },
         sim.title,
         p.speed_h(),
-        p.vel.y,
         state.join(" "),
-        3 - p.current_wall_jumps.min(3),
-        p.slam_force,
-        p.pre_slide_speed.max(1.0),
-        hits,
-        sim.cam.sensitivity,
+        g.s.kills,
+        alive_enemies,
+        sim.level_time,
     );
+    s.push_str("WASD SPACE SHIFT CTRL move | LMB fire, hold RMB pierce | F punch/parry | R checkpoint | N noclip\n");
     for (msg, _) in sim.log.iter().rev().take(4) {
         s.push_str(&format!("\n{msg}"));
     }
     text.0 = s;
+    hint.0 = g.s.messages.last().map(|m| m.text.clone()).unwrap_or_default();
+    banner.0 = match &sim.banner {
+        Some((b, _)) if b == "LEVEL COMPLETE" => format!("LEVEL COMPLETE\n{:.1}s  -  {} kills", sim.level_time, g.s.kills),
+        Some((b, _)) => b.clone(),
+        None => String::new(),
+    };
+    hp_text.0 = format!("{}", g.s.hp);
+    hp_bar.width = percent(g.s.hp.clamp(0, 100) as f32);
     for (bar, mut node, mut bg) in &mut bars {
         let fill = ((p.boost_charge - bar.0 as f32 * 100.0) / 100.0).clamp(0.0, 1.0);
         node.width = percent(fill * 100.0);
         bg.0 = if fill >= 1.0 { Color::srgb(0.2, 0.75, 1.0) } else { Color::srgb(0.35, 0.4, 0.45) };
     }
     let r = &sim.revolver;
-    pierce.width = percent(if r.pierce_ready { r.pierce_shot_charge } else { r.pierce_charge });
+    pierce.width = percent(if !g.s.has_revolver { 0.0 } else if r.pierce_ready { r.pierce_shot_charge } else { r.pierce_charge });
 }

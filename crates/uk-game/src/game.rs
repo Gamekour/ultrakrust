@@ -1429,6 +1429,13 @@ impl Game {
         }
     }
 
+    pub fn hurt_player_ignoring_invincibility(&mut self, damage: i32) {
+        let saved = self.s.player.invincible_layer;
+        self.s.player.invincible_layer = false;
+        self.hurt_player(damage, false);
+        self.s.player.invincible_layer = saved;
+    }
+
     pub fn heal_player(&mut self, amount: i32) {
         if self.s.dead || self.s.hp >= 100 {
             return;
@@ -1450,6 +1457,12 @@ impl Game {
         self.full_refresh = true;
         self.events.push(GameEvent::Respawned);
         self.sync_world();
+    }
+
+    /// Re-takes the level-start snapshot (after the caller customised the initial state).
+    pub fn rebase_start(&mut self) {
+        self.checkpoint = None;
+        self.start = Some(Box::new(self.s.clone()));
     }
 
     pub fn restart_level(&mut self) {

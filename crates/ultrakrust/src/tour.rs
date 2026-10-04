@@ -23,7 +23,7 @@ pub struct Tour {
 }
 
 impl Tour {
-    pub fn new(dir: PathBuf, _spawn: Vec3, spawn_yaw: f32, rooms: &[uk_assets::scene::Room]) -> Self {
+    pub fn new(dir: PathBuf, spawn_yaw: f32, rooms: &[crate::level::Room]) -> Self {
         let mut shots = vec![];
         let f = Vec3::new(spawn_yaw.to_radians().sin(), 0.0, -spawn_yaw.to_radians().cos());
         // index 0 is special: the live first-person view after V1 lands
