@@ -65,7 +65,7 @@ Status 0–1 is what `crates/uk-game/src/parity.rs` declares; the harness turns 
 | Pillar | Original (instances in install) | Now | Approach | Verified by |
 |---|---|---|---|---|
 | **Asset reading** | 81 bundles | Meshes, textures (not BC7), materials (main tex), scene graph | + BC7, AudioClip (FSB5/Vorbis), AnimationClip, AnimatorController, Avatar, ParticleSystem, Sprite, Font/TMP, NavMeshData, Shader blobs, VideoClip, LightmapSettings | round-trip vs UnityPy per type |
-| **Rendering** | 416 shaders, 4,474 materials, 14,703 lights, 54 lightmap sets, 97 cubemaps | Bevy PBR stand-in, main texture | SPIR-V → naga → WGSL; emulate Unity's built-in uniforms (`unity_ObjectToWorld`, `_Time`, `UnityPerDraw`, lightmap ST); vertex-lit forward path as Unity's; lightmaps on UV2; fog and RenderSettings; post-process (PostProcessV2, palette/dither options) | shader compiles 100%; per-material uniform audit; frame-capture numeric diff vs oracle |
+| **Rendering** | 416 shaders, 4,474 materials, 14,703 lights, 54 lightmap sets, 97 cubemaps | `--unity-shaders`: ULTRAKILL's own Vulkan programs (SMOL-V → SPIR-V → naga → WGSL) draw 99.9% of renderers on the levels tested; Unity built-ins filled by name (matrices, `_Time`, fog, the 8 `Vertex`-mode lights); gamma-space offscreen target composited to linear. Not yet: skybox, PostProcessV2 (dither/palette/outlines from the shader's second and third render targets), lightmaps (0-1 has none), light probes, stencil/portals | keep the remaining renderers translating; per-material uniform audit; skybox + PostProcessV2 next | `uk-harness` `shaders` (variants validate, buffers at exact binding+size, vertex channels = SPIR-V inputs) and `--render` (GPU errors, coverage, read-back frame stats per level) |
 | **Animation** | 9,202 Animators, 116 controllers, 775 clips, 116 avatars | none (static poses) | Mecanim interpreter: state machines, transitions, blend trees, layers/masks, root motion, animation events (scripts rely on these for hit timing), humanoid retargeting | state/time traces vs oracle; event timing tests |
 | **Audio** | 29,878 sources, 1,606 clips, mixers + 5 filter kinds, 80 reverb zones, 12 music bundles | none | FSB5 Vorbis decode (rebuild Vorbis headers), AudioSource 3D rolloff and priority, mixer groups/snapshots, filters, MusicManager layering (clean/battle/boss crossfade) | decode checksums; per-event "sound played" traces vs oracle |
 | **Particles / FX** | 10,675 ParticleSystems, 3,115 trails, 1,429 lines, 6,289 sprites | none | Shuriken module interpreter (emission, shape, velocity/limit, colour/size over life, noise, collision, sub-emitters, texture sheet) | particle-count/lifetime traces |
@@ -92,7 +92,16 @@ Status 0–1 is what `crates/uk-game/src/parity.rs` declares; the harness turns 
    audio mixer DSP (FMOD inside Unity), uGUI layout rounding. These are reimplemented from Unity's documented behaviour
    and verified against the oracle. Expect small numeric differences, for example in filter curves, particle noise
    sequences, and crowd avoidance.
-3. **Shader translation.** The original SPIR-V runs through naga, which can reject some constructs. If it does, that
+3. **Shader translation.** Found while doing it:
+   - Unity strips DXBC RDEF reflection from builds and its parameter lists name only members a variant references, so a
+     few fixed-layout members are never named anywhere (`StandardProperties` @0 and @32). They are named by how the
+     shader uses them (`uk_assets::shader::KNOWN_MEMBERS`, each entry with its evidence). `_Color` @16 is named by the
+     D3D11 lists.
+   - Unity's Vulkan stage pairs may read fragment inputs the vertex stage never writes (undefined in Vulkan); WebGPU
+     forbids that, so the missing outputs are added and written as zero.
+   - Global buffers whose producers aren't ported yet (`_CausticVolumeData`) are bound zeroed.
+   - Combined image-samplers (sprites, legacy particles) are split into image + sampler before naga.
+   Original text: The original SPIR-V runs through naga, which can reject some constructs. If it does, that
    shader gets a hand-written WGSL port, verified by numeric frame diff. Exact rasterisation differences between D3D11
    and wgpu backends (MSAA resolve, derivative precision) are out of our control.
 4. **Steam / platform services** (achievements, leaderboards, Cyber Grind scores, Workshop maps, Discord presence) need
@@ -132,6 +141,10 @@ Each phase ends when its harness metrics are green and added to the baseline. Co
    Filth and Strays re-path with `TrackTick`/`SetDestination`). Still open here: agent avoidance (enemies can stack),
    NavMeshObstacle carving, area costs, sibling order fix, Animator + AnimationClip (enemy attack timing depends on
    animation events), Rigidbody dynamics (gibs, physics props, knockback).
+3. **Look (next):** PostProcessV2 as ULTRAKILL wires it (`PostProcessV2_Handler`): the main camera renders into
+   color (ARGB32) + RG16 + view normal (the Master shader's 3 outputs) + depth; command buffers run the heat-wave blit and
+   the 4-pass outline shader; the PostProcessV2 shader composites with `_Dither`, `_PaletteTex`, `_ColorPrecision` 2048,
+   `_VignetteTex`, `_VirtualRes` (pixelization). Our gamma target + composite already has this shape.
 3. **Senses:** audio pipeline + MusicManager; SPIR-V shaders + lightmaps + lights + fog; ParticleSystem.
 4. **Player complete:** every weapon/variant/arm, coins, style meter, ranks, HUD as uGUI.
 5. **UI + flow:** uGUI/TMP interpreter, main menu, options, level select, results, saves (read), cheats, sandbox, Cyber Grind.

@@ -8,6 +8,7 @@
 //! Output: `parity/report.tsv` (all metrics) and a printed list of failures/regressions only.
 mod checks;
 mod coverage;
+mod render;
 mod shaders;
 
 use std::collections::BTreeMap;
@@ -59,6 +60,7 @@ fn main() {
     }
     if run("level0-1") { checks::level_0_1(&install, &mut r) }
     if run("shaders") { shaders::level(&install, "level0-1", &mut r) }
+    if args.iter().any(|a| a == "--render") { render::levels(&install, only.as_deref().filter(|o| o.contains('-')), &mut r) }
     if full && run("coverage") { coverage::all_scenes(&install, &mut r) }
 
     std::fs::create_dir_all("parity").unwrap();

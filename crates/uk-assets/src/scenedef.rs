@@ -26,6 +26,8 @@ const CLASS_SKINNED_MESH_RENDERER: i32 = 137;
 const CLASS_SPHERE_COLLIDER: i32 = 135;
 const CLASS_CAPSULE_COLLIDER: i32 = 136;
 const CLASS_RECT_TRANSFORM: i32 = 224;
+const CLASS_LIGHT: i32 = 108;
+const CLASS_RENDER_SETTINGS: i32 = 104;
 
 /// Tag ids from TagManager (globalgamemanagers): custom tags start at 20000.
 pub mod tags {
@@ -78,6 +80,38 @@ pub enum ShapeDef {
     Mesh(Vec<[Vec3; 3]>),
 }
 
+/// A Unity Light. kind: 0 spot, 1 directional, 2 point, 3 area. render_mode: 0 auto, 1 important, 2 not important.
+#[derive(Clone, Debug)]
+pub struct LightDef {
+    pub node: u32,
+    pub kind: u8,
+    /// Linear-space floats as serialized (the project renders in gamma, so used as-is).
+    pub color: [f32; 4],
+    pub intensity: f32,
+    pub range: f32,
+    pub spot_angle: f32,
+    pub enabled: bool,
+    pub render_mode: u8,
+    pub culling_mask: u32,
+}
+
+/// RenderSettings (class 104). fog_mode: 1 linear, 2 exponential, 3 exp2. ambient_mode: 0 skybox,
+/// 1 trilight, 3 flat, 4 custom.
+#[derive(Clone, Debug, Default)]
+pub struct RenderSettingsDef {
+    pub fog: bool,
+    pub fog_color: [f32; 4],
+    pub fog_mode: i64,
+    pub fog_density: f32,
+    pub fog_start: f32,
+    pub fog_end: f32,
+    pub ambient_mode: i64,
+    pub ambient_sky: [f32; 4],
+    pub ambient_equator: [f32; 4],
+    pub ambient_ground: [f32; 4],
+    pub ambient_intensity: f32,
+}
+
 #[derive(Clone, Debug)]
 pub struct ColliderDef {
     pub node: u32,
@@ -114,6 +148,10 @@ pub struct SceneDef {
     pub warnings: Vec<String>,
     /// Baked navmeshes (one per agent type / surface).
     pub navmeshes: Vec<crate::navmesh::NavMeshData>,
+    /// Light components (Unity space values; position/direction come from the node).
+    pub lights: Vec<LightDef>,
+    /// The scene's RenderSettings (fog, ambient).
+    pub render_settings: RenderSettingsDef,
 }
 
 impl SceneDef {
@@ -263,6 +301,26 @@ pub fn load_scene(db: &mut AssetDb, bundle: &std::path::Path) -> Result<SceneDef
                     o.path_id,
                     RawTr { go: v.get("m_GameObject").pptr().1, father: v.get("m_Father").pptr().1, trs: unity_trs(&v) },
                 );
+            }
+            CLASS_RENDER_SETTINGS => {
+                let v = scene.read(o)?;
+                let col = |k: &str| {
+                    let c = v.get(k);
+                    [c.get("r").f32(), c.get("g").f32(), c.get("b").f32(), c.get("a").f32()]
+                };
+                def.render_settings = RenderSettingsDef {
+                    fog: v.get("m_Fog").bool(),
+                    fog_color: col("m_FogColor"),
+                    fog_mode: v.get("m_FogMode").i64(),
+                    fog_density: v.get("m_FogDensity").f32(),
+                    fog_start: v.get("m_LinearFogStart").f32(),
+                    fog_end: v.get("m_LinearFogEnd").f32(),
+                    ambient_mode: v.get("m_AmbientMode").i64(),
+                    ambient_sky: col("m_AmbientSkyColor"),
+                    ambient_equator: col("m_AmbientEquatorColor"),
+                    ambient_ground: col("m_AmbientGroundColor"),
+                    ambient_intensity: v.get("m_AmbientIntensity").f32(),
+                };
             }
             _ => {}
         }
@@ -425,6 +483,22 @@ pub fn load_scene(db: &mut AssetDb, bundle: &std::path::Path) -> Result<SceneDef
                 CLASS_RIGIDBODY => {
                     def.obj_to_node.insert(id, node);
                     def.rigidbodies.insert(node);
+                }
+                CLASS_LIGHT => {
+                    def.obj_to_node.insert(id, node);
+                    let Ok(v) = scene.read(o) else { continue };
+                    let c = v.get("m_Color");
+                    def.lights.push(LightDef {
+                        node,
+                        kind: v.get("m_Type").i64() as u8,
+                        color: [c.get("r").f32(), c.get("g").f32(), c.get("b").f32(), c.get("a").f32()],
+                        intensity: v.get("m_Intensity").f32(),
+                        range: v.get("m_Range").f32(),
+                        spot_angle: v.get("m_SpotAngle").f32(),
+                        enabled: v.get("m_Enabled").bool(),
+                        render_mode: v.get("m_RenderMode").i64() as u8,
+                        culling_mask: v.get("m_CullingMask").get("m_Bits").i64() as u32,
+                    });
                 }
                 _ => {
                     def.obj_to_node.insert(id, node);

@@ -45,6 +45,8 @@ pub struct Loaded {
     pub view: LevelView,
     pub summary: String,
     pub rooms: Vec<Room>,
+    /// The level drawn with ULTRAKILL's own shaders (`--unity-shaders`).
+    pub unity: Option<crate::unity_render::SceneData>,
 }
 
 pub fn load(
@@ -53,6 +55,7 @@ pub fn load(
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
     images: &mut Assets<Image>,
+    unity_shaders: Option<&mut Assets<bevy::shader::Shader>>,
 ) -> Result<Loaded, String> {
     let t0 = std::time::Instant::now();
     let install = uk_assets::find_install().ok_or("ULTRAKILL install not found (set ULTRAKILL_DIR)")?;
@@ -67,8 +70,15 @@ pub fn load(
     let mut view = LevelView { mover_entities: vec![Vec::new(); game.movers.len()], mover_last: vec![Affine3A::IDENTITY; game.movers.len()], ..default() };
     let mut rooms: HashMap<u32, (Vec3, Vec3)> = HashMap::new();
     let (mut tris, mut textured, mut ents) = (0usize, 0usize, 0usize);
+    let player = game.player_node;
+    let unity = unity_shaders.map(|shaders| {
+        let t = std::time::Instant::now();
+        let (scene, summary) = crate::unity_render::build(&mut db, &def, |n| player.is_some_and(|p| def.is_descendant(n, p)), shaders, 1);
+        info!("{summary} ({:.2}s)", t.elapsed().as_secs_f32());
+        scene
+    });
     for r in &def.renderers {
-        if r.batch.indices.is_empty() {
+        if r.batch.indices.is_empty() || unity.is_some() {
             continue;
         }
         if game.player_node.is_some_and(|p| def.is_descendant(r.node, p)) {
@@ -143,7 +153,7 @@ pub fn load(
         game.s.enemies.len(),
         t0.elapsed().as_secs_f32()
     );
-    Ok(Loaded { game, view, summary, rooms })
+    Ok(Loaded { game, view, summary, rooms, unity })
 }
 
 fn material(

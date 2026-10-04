@@ -5198,9 +5198,12 @@ name = "ultrakrust"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "bytemuck",
+ "naga",
  "uk-assets",
  "uk-core",
  "uk-game",
+ "wgpu-types",
 ]
 
 [[package]]

@@ -8,6 +8,7 @@
 //! Left Ctrl slide / slam, LMB fire, hold RMB to charge a piercing shot, F punch (parries).
 //! R restart from checkpoint, N noclip, [ ] sensitivity, T camera tilt, Esc release mouse.
 
+mod unity_render;
 mod demo;
 mod level;
 mod map;
@@ -98,9 +99,11 @@ fn main() {
         .insert_resource(ClearColor(Color::srgb(0.02, 0.02, 0.03)))
         .insert_resource(GlobalAmbientLight { brightness: 350.0, ..default() })
         .init_resource::<level::LevelView>()
+        .add_plugins(unity_render::UnityRenderPlugin)
         .add_systems(Startup, setup)
+        .add_systems(Last, exit_after)
         .add_systems(FixedUpdate, fixed_sim)
-        .add_systems(Update, (cursor_grab, frame_sim, sync_level, apply_view, update_beams, update_hud, tour::run_tour).chain())
+        .add_systems(Update, (cursor_grab, frame_sim, sync_level, unity_frame, apply_view, update_beams, update_hud, tour::run_tour).chain())
         .run();
 }
 
@@ -109,8 +112,10 @@ fn setup(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
+    mut shaders: ResMut<Assets<bevy::shader::Shader>>,
 ) {
     let args: Vec<String> = std::env::args().collect();
+    let unity_shaders = args.iter().any(|a| a == "--unity-shaders");
     let level_arg = args.iter().position(|a| a == "--level").and_then(|i| args.get(i + 1)).cloned();
     let want_level = !args.iter().any(|a| a == "--sandbox");
     let tour_dir = args.iter().position(|a| a == "--tour").and_then(|i| args.get(i + 1)).map(std::path::PathBuf::from);
@@ -118,7 +123,7 @@ fn setup(
     let mut loaded: Option<level::Loaded> = None;
     if want_level {
         let name = level_arg.unwrap_or_else(|| "0-1".into());
-        match level::load(&name, &mut commands, &mut meshes, &mut materials, &mut images) {
+        match level::load(&name, &mut commands, &mut meshes, &mut materials, &mut images, unity_shaders.then_some(&mut *shaders)) {
             Ok(l) => {
                 info!("{}", l.summary);
                 loaded = Some(l);
@@ -130,6 +135,9 @@ fn setup(
     let (game, title, rooms, sandbox_targets) = match loaded {
         Some(l) => {
             commands.insert_resource(l.view);
+            if let Some(scene) = l.unity {
+                commands.insert_resource(unity_render::UnityScene(Some(std::sync::Arc::new(scene))));
+            }
             (l.game, l.summary, l.rooms, Vec::new())
         }
         None => {
@@ -173,6 +181,12 @@ fn setup(
             },
             Transform::from_translation(spawn),
         ))
+        .insert_if(
+            // ULTRAKILL's own shaders: no tonemapping or MSAA (the game has neither), and the view is
+            // composited from the gamma-space scene target.
+            (unity_render::UnityCamera, bevy::core_pipeline::tonemapping::Tonemapping::None, Msaa::Off),
+            || unity_shaders && is_level,
+        )
         .with_children(|c| {
             c.spawn((
                 Camera3d::default(),
@@ -655,4 +669,26 @@ fn update_hud(
     }
     let r = &sim.revolver;
     pierce.width = percent(if !g.s.has_revolver { 0.0 } else if r.pierce_ready { r.pierce_shot_charge } else { r.pierce_charge });
+}
+
+/// Per-frame game state for the Unity-shader renderer: visibility, movers, lights.
+fn unity_frame(sim: Res<Sim>, scene: Res<unity_render::UnityScene>, time: Res<Time>, mut out: ResMut<unity_render::UnityFrame>, mut n: Local<u32>) {
+    let Some(scene) = scene.0.as_ref() else { return };
+    let t = std::time::Instant::now();
+    *out = unity_render::frame(&sim.game, scene, time.elapsed_secs());
+    *n += 1;
+    if *n == 120 && std::env::var_os("UNITY_FRAME_STATS").is_some() {
+        info!("unity frame state (main world): {:.2} ms", t.elapsed().as_secs_f64() * 1e3);
+    }
+}
+
+/// `--exit-after <seconds>`: quit after a while (headless-ish smoke runs that only read the log).
+fn exit_after(time: Res<Time>, mut exit: MessageWriter<AppExit>, mut limit: Local<Option<f32>>) {
+    let l = limit.get_or_insert_with(|| {
+        let args: Vec<String> = std::env::args().collect();
+        args.iter().position(|a| a == "--exit-after").and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(f32::INFINITY)
+    });
+    if time.elapsed_secs() > *l {
+        exit.write(AppExit::Success);
+    }
 }

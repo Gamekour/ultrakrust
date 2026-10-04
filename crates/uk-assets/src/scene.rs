@@ -51,6 +51,8 @@ pub struct Batch {
     pub positions: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
     pub uvs: Vec<[f32; 2]>,
+    /// Vertex colors (white when the mesh has none).
+    pub colors: Vec<[f32; 4]>,
     pub indices: Vec<u32>,
 }
 
@@ -383,6 +385,7 @@ pub(crate) fn bake(b: &mut Batch, mesh: &MeshData, indices: &[u32], m: Mat4) {
             let n = mesh.normals.get(i as usize).map(|n| nm.transform_vector3(Vec3::from(*n)).normalize_or_zero()).unwrap_or(Vec3::Y);
             b.normals.push(to_bevy_point(n).to_array());
             b.uvs.push(mesh.uv0.get(i as usize).copied().unwrap_or([0.0, 0.0]));
+            b.colors.push(mesh.colors.get(i as usize).copied().unwrap_or([1.0; 4]));
             next
         });
         local.push(idx);

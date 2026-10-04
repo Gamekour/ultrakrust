@@ -13,6 +13,7 @@ pub mod scenedef;
 pub mod serialized;
 pub mod shader;
 pub mod smolv;
+pub mod spirv;
 pub mod texture;
 
 #[derive(Debug, Clone)]

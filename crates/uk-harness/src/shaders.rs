@@ -25,7 +25,8 @@ fn uniform_sizes(m: &naga::Module) -> BTreeMap<(u32, u32), u32> {
 }
 
 fn validate(words: &[u32]) -> Result<naga::Module, String> {
-    let m = naga::front::spv::parse_u8_slice(&spirv_bytes(words), &naga::front::spv::Options::default()).map_err(|e| format!("parse: {e}"))?;
+    let words = uk_assets::spirv::prepare(words);
+    let m = naga::front::spv::parse_u8_slice(&spirv_bytes(&words), &naga::front::spv::Options::default()).map_err(|e| format!("parse: {e}"))?;
     naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
         .validate(&m)
         .map_err(|e| format!("validate: {}", e.into_inner()))?;
@@ -78,15 +79,43 @@ pub fn level(install: &Path, level: &str, r: &mut Report) {
         let res = (|| -> Result<(), String> {
             let pass = sh.passes.first().ok_or("no pass")?;
             let vs = sh.select(&pass.vertex, &enabled).ok_or("no vertex variant")?;
-            let fs = sh.select(&pass.fragment, &enabled).ok_or("no fragment variant")?;
             // On Vulkan the vertex variant's entry carries both stages (linked as a pair) and its parameter
             // blob covers both; the fragment list's blob indices point at parameter blobs.
-            let _ = fs;
             for (sub, slot) in [(vs, 0usize), (vs, 1usize)] {
                 let prog = sh.program(sub.blob).map_err(|e| format!("slot {slot} program blob {}: {}", sub.blob, e.0))?;
                 let words = prog.stages.get(slot).cloned().flatten().ok_or(format!("{} stage missing", if slot == 0 { "vertex" } else { "fragment" }))?;
+                if slot == 0 {
+                    // bind channels must cover exactly the SPIR-V vertex inputs
+                    let mut want: Vec<u32> = uk_assets::shader::input_locations(&words).iter().map(|x| x.0).collect();
+                    let mut have: Vec<u32> = prog.channels.iter().map(|c| c.1).collect();
+                    want.sort();
+                    have.sort();
+                    if want != have {
+                        return Err(format!("{}: bind channels {:?} vs SPIR-V inputs {want:?}", sh.name, prog.channels));
+                    }
+                }
                 let module = validate(&words).map_err(|e| { if let Ok(p) = std::env::var("DUMP_SPV") { std::fs::write(format!("{p}/{}_{}_{slot}.spv", sh.name.replace("/", "_").replace(" ", "_"), sub.blob), spirv_bytes(&words)).ok(); } format!("{} slot {slot}: {e}", sh.name) })?;
                 let params = sh.params(sub.params).map_err(|e| format!("slot {slot} params {}: {}", sub.params, e.0))?;
+                if std::env::var_os("ENTRY_ARGS").is_some() && sh.name == "ULTRAKILL/Master" {
+                    if slot == 0 { eprintln!("INPUTS {:?}", uk_assets::shader::input_locations(&words)); }
+                    for ep in &module.entry_points {
+                        let args: Vec<String> = ep.function.arguments.iter().map(|a| format!("{:?}@{:?}", a.name, a.binding)).collect();
+                        eprintln!("EP {:?} {} args {:?}", ep.stage, ep.name, args);
+                    }
+                    for (_, g) in module.global_variables.iter().filter(|(_, g)| g.binding.is_some()) {
+                        eprintln!("   global {:?} {:?} {:?}", g.name, g.space, g.binding);
+                    }
+                }
+                if slot == 0 && std::env::var_os("PARAM_NAMES").is_some() {
+                    for cb in &params.constant_buffers {
+                        for p in &cb.params {
+                            eprintln!("PARAM {}\t{}\t{}x{}{}", p.name, cb.name.trim_end_matches(char::is_numeric), p.rows, p.cols, if p.array_size > 0 { format!("[{}]", p.array_size) } else { String::new() });
+                        }
+                    }
+                    for b in &params.bindings {
+                        eprintln!("BIND {}\tkind {}", b.name, b.kind);
+                    }
+                }
                 // Packed binding: stage mask in the top byte (0x04 vertex, 0x08 fragment), descriptor set
                 // in the next byte, binding in the low 16 bits. Every constant buffer bound to this stage
                 // must sit at exactly that (set, binding) in the SPIR-V with the same size (SPIR-V pads to 16).

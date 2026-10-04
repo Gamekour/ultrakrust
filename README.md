@@ -26,6 +26,9 @@ wall cling, super slide jumps and the piercer revolver, on a test map built to e
   from *your* ULTRAKILL install at runtime (set `ULTRAKILL_DIR` if it isn't in the default Steam folder).
 
 ## Parity
+`cargo run --release -p ultrakrust -- --unity-shaders` draws levels with ULTRAKILL's own compiled shaders (translated at load
+from your install; nothing is stored). `cargo run --release -p uk-harness -- --render` checks every level that way.
+
 See [PARITY.md](PARITY.md) for the measured gap analysis and work order. Run the headless harness with
 `cargo run --release -p uk-harness -- --full`. It prints only failures, regressions and gaps.
 

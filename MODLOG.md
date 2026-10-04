@@ -113,3 +113,31 @@ CPU-skinned enemies, 3,393 colliders/569 triggers, 11,758 MonoBehaviours with ty
   door 7). `ultrakrust --demo <dir>`: scripted run to LEVEL COMPLETE with screenshots; recorded with `um win record`.
 - Not done: navmesh pathing, animations (enemies are posed statically), sound/music, lighting/lightmaps, BC7 textures,
   style meter/ranks, other weapons, parry nuances.
+
+## Parity pass — harness, NavMesh, winding, ULTRAKILL's own shaders (2026-10-04)
+- Harness (`uk-harness`): checks + coverage + perf + determinism vs `parity/baseline.tsv`; `--full` all scenes, `--render`
+  runs the game per level (GPU errors, renderer coverage, read-back frame stats, frame time). See PARITY.md.
+- Scene load iterated a HashMap -> nondeterministic script/collider order. Fixed (node order).
+- NavMeshData = Detour "DNAV" v16 tiles: header 72 B (counts: polys, verts, detail meshes, detail verts, detail tris,
+  bv nodes), verts 12 B, polys 32 B (u16 verts[6], neis[6], u32 flags, u8 count, u8 area), detail mesh 12 B, detail verts
+  12 B, detail tris 8 B (4 × u16), bv 16 B. All 6,811 tiles in the install match the size formula. 6-2's bake is stale.
+- Winding: mirroring z (Unity -> Bevy) reverses the geometric face normal, so baked triangles must be reversed (kept for
+  det<0 transforms). Skinned: inverse-transpose normals, per-triangle flip where the dominant bone matrix mirrors.
+- Project: gamma color space, pixelLightCount 0, no AA, no shadows. ULTRAKILL/Master = one pass, LightMode=Vertex
+  (legacy vertex lights: unity_LightPosition/Color/Atten/SpotDirection[8] in view space; ambient enters doubled).
+- Shader blob (per platform, LZ4 chunks): chunk 0 = index (count, then offset/length/chunk per entry). Program entry:
+  version 202012090, gpu type (25 = SPIR-V), 4 stats, keywords, code (u32 flags + 6 stage slots of SMOL-V), then one
+  u32 + bind channels (ShaderChannel -> attribute location = target - 13). Parameter entry: cbuffers (first is an
+  unnamed empty block) with members (name, type, rows, cols, is_matrix, array, offset), then bindings (name, kind
+  0 tex/1 cb/4 sampler, packed = stage mask (0x04 VS, 0x08 PS) << 24 | set << 16 | binding).
+- The player subprogram list interleaves platforms (m_GpuProgramType 6 Metal?, 15 D3D11 VS, 25 Vulkan; fragment list is
+  D3D11 PS only = 17). On Vulkan one vertex-variant entry holds both linked stages.
+- Unity strips DXBC RDEF; parameter lists name only referenced members. StandardProperties: @0 _MainTex_ST (deduced),
+  @16 _Color (D3D11 lists), @32 _TextureWarping (deduced), @36 _VertexWarping, @40 _VertexWarpScale, @44 _HeightFog,
+  @48/52 unity_FogStart/End, @64 _ScreenRatio = (w,h)/max(w,h).
+- Master's fragment writes 3 targets: color, vec2, packed normal (n*0.5+0.5, for outlines). UVs are uv*w / w (PSX affine
+  warp controlled by _TextureWarping). Final color = lerp(fogColor, texture * vertexLight, fogFactor).
+- naga: rejects combined image-samplers (split pass in uk_assets::spirv), Unity stage pairs can leave fragment inputs
+  unwritten (vertex outputs added as zero), `_CausticVolumeData` is a read-only storage buffer (bound zeroed).
+- Bevy 0.19: custom Core3d system + own passes; pipeline layout = Vec<BindGroupLayoutDescriptor>; ViewTarget
+  get_color_attachment() clears on first use; wgpu Color/types from wgpu-types 29.0.4.

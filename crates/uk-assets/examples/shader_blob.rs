@@ -180,6 +180,7 @@ fn translate(smol: &[u8], name: &str) {
         Ok(src) => {
             let p = format!("{}/{name}.wgsl", std::env::var("OUT").expect("set OUT to a directory outside the repo (translated game shaders must not be committed)"));
             std::fs::write(&p, &src).unwrap();
+            std::fs::write(p.replace(".wgsl", ".spv"), bytemuck_cast(&words)).unwrap();
             println!("WGSL {} bytes -> {p}", src.len());
         }
         Err(err) => println!("wgsl error: {err:?}"),
