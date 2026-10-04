@@ -55,17 +55,22 @@ pub fn level_0_1(install: &Path, r: &mut Report) {
             return;
         }
     };
-    r.lower("perf.0-1.scene_load_ms", t.elapsed().as_secs_f64() * 1e3, 0.35);
+    let first_load_ms = t.elapsed().as_secs_f64() * 1e3;
     let t = Instant::now();
     let _ = Game::new(def.clone());
     r.lower("perf.0-1.game_build_ms", t.elapsed().as_secs_f64() * 1e3, 0.35);
     r.pass("0-1.load", true, "");
+    // A second, independent load: every HashMap gets a fresh random seed, so any load-order
+    // dependence on hash iteration shows up as a divergence. Load time = the faster of the two,
+    // so a cold disk cache on the first one doesn't read as a regression.
+    let t = Instant::now();
+    let def2 = scenedef::load_scene(&mut AssetDb::open(install).unwrap(), &path);
+    r.lower("perf.0-1.scene_load_ms", first_load_ms.min(t.elapsed().as_secs_f64() * 1e3), 0.35);
+    navmesh(&def, r);
     doors(&def, r);
     arenas(&def, r);
     boss_to_exit(&def, r);
-    // A second, independent load: every HashMap gets a fresh random seed, so any load-order
-    // dependence on hash iteration shows up as a divergence here.
-    match scenedef::load_scene(&mut AssetDb::open(install).unwrap(), &path) {
+    match def2 {
         Ok(d2) => determinism(&def, &Arc::new(d2), r),
         Err(e) => r.pass("0-1.determinism", false, e.to_string()),
     }
@@ -121,6 +126,93 @@ fn determinism(def: &Arc<SceneDef>, def2: &Arc<SceneDef>, r: &mut Report) {
     let b = trace(def2);
     let first = a.iter().zip(&b).position(|(x, y)| x != y);
     r.pass("0-1.determinism", first.is_none(), format!("runs diverge at tick {:?}", first));
+}
+
+/// The baked navmesh: decoded polygons lie on the level's collision geometry, string-pulled paths
+/// stay on the mesh and are no longer than the portal-midpoint chain, and the Fan Room is reachable.
+pub fn nav_checks(prefix: &str, g: &Game, r: &mut Report) {
+    let Some(nav) = &g.nav else {
+        r.pass(&format!("{prefix}.navmesh"), false, "no navmesh");
+        return;
+    };
+    r.info(&format!("nav.{prefix}.polys"), nav.polys.len() as f64);
+    r.info(&format!("nav.{prefix}.components"), nav.components() as f64);
+    r.info(&format!("nav.{prefix}.external_edges_joined_pct"), 100.0 * nav.external_matched as f64 / nav.external_edges.max(1) as f64);
+    // 1. on geometry: from each polygon's surface point, the environment is right below. The navmesh is
+    // baked over the whole level, so test against every collider, not just the rooms active at start.
+    let mut world = g.world.clone();
+    world.owner_enabled.iter_mut().for_each(|e| *e = true);
+    let mut on = 0;
+    for (i, p) in nav.polys.iter().enumerate() {
+        let s = nav.closest_on_poly(i as u32, p.center);
+        if world.raycast(s + Vec3::Y * 1.0, Vec3::NEG_Y, 2.0).is_some() {
+            on += 1
+        }
+    }
+    let on_pct = 100.0 * on as f64 / nav.polys.len().max(1) as f64;
+    r.higher(&format!("nav.{prefix}.polys_on_geometry_pct"), on_pct);
+    // 2. path quality on deterministic pseudo-random pairs
+    let mut seed = 0x9e3779b9u32;
+    let mut rnd = |n: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed as usize % n
+    };
+    let (mut tried, mut good, mut reached) = (0, 0, 0);
+    for _ in 0..300 {
+        let (a, b) = (rnd(nav.polys.len()), rnd(nav.polys.len()));
+        let (pa, pb) = (nav.closest_on_poly(a as u32, nav.polys[a].center), nav.closest_on_poly(b as u32, nav.polys[b].center));
+        let (Some((_, _, portals, ok)), Some((path, _))) = (nav.corridor(pa, pb), nav.find_path(pa, pb)) else { continue };
+        tried += 1;
+        reached += ok as usize;
+        // The smoothed path must pass through every walking portal of its corridor (in xz). Polygons are
+        // convex, so that keeps it inside the corridor. (Sampling heights along a 3D line is not a valid
+        // test: on stairs the line floats above the steps and "nearest" picks a neighbour.)
+        let segs: Vec<(Vec3, Vec3)> = path.windows(2).filter(|w| !w[1].offmesh).map(|w| (w[0].pos, w[1].pos)).collect();
+        let through = portals.iter().filter(|l| l.offmesh.is_none()).all(|l| segs.iter().any(|&(p, q)| crosses_xz(p, q, l.a, l.b)));
+        good += through as usize;
+    }
+    r.higher(&format!("nav.{prefix}.paths_through_corridor_pct"), 100.0 * good as f64 / tried.max(1) as f64);
+    r.info(&format!("nav.{prefix}.random_pairs_reached_pct"), 100.0 * reached as f64 / tried.max(1) as f64);
+    // Polygons-on-geometry is tracked per level against the baseline rather than gated on an absolute
+    // threshold: some shipped navmeshes are stale bakes (6-2's lies where the level has no geometry at
+    // all, in the original too), so a fixed cut-off would flag the data, not our reader.
+    r.pass(&format!("{prefix}.navmesh"), good == tried, format!("paths through their corridor {good}/{tried} (polys on geometry {on_pct:.1}%)"));
+}
+
+/// Segment p-q meets portal a-b in xz (touching or running along it counts).
+fn crosses_xz(p: Vec3, q: Vec3, a: Vec3, b: Vec3) -> bool {
+    use bevy_math::Vec2;
+    let (p, q, a, b) = (Vec2::new(p.x, p.z), Vec2::new(q.x, q.z), Vec2::new(a.x, a.z), Vec2::new(b.x, b.z));
+    let on = |x: Vec2| {
+        let e = b - a;
+        let t = if e.length_squared() > 0.0 { ((x - a).dot(e) / e.length_squared()).clamp(0.0, 1.0) } else { 0.0 };
+        (a + e * t).distance(x) < 1e-2
+    };
+    if on(p) || on(q) {
+        return true;
+    }
+    let (d, e) = (q - p, b - a);
+    let den = d.perp_dot(e);
+    if den.abs() < 1e-9 {
+        return false;
+    }
+    let t = (a - p).perp_dot(e) / den;
+    let u = (a - p).perp_dot(d) / den;
+    (-1e-3..=1.0 + 1e-3).contains(&t) && (-1e-3..=1.0 + 1e-3).contains(&u)
+}
+
+fn navmesh(def: &Arc<SceneDef>, r: &mut Report) {
+    let g = Game::new(def.clone());
+    nav_checks("0-1", &g, r);
+    let Some(nav) = &g.nav else { return };
+    // The Fan Room Filth that used to stall the autopilot must be able to come down to the walkway.
+    let filth = Vec3::new(40.7, 3.26, -571.4);
+    let walkway = Vec3::new(40.7, -10.4, -567.2);
+    let res = nav.find_path(filth, walkway);
+    r.pass("0-1.nav_fan_room", res.as_ref().is_some_and(|(_, ok)| *ok),
+        format!("Fan Room ledge -> walkway: {:?}", res.map(|(p, ok)| (p.len(), ok))));
 }
 
 /// Every DoorController: stand in its trigger -> door opens (or is locked by an arena); leave -> it closes.

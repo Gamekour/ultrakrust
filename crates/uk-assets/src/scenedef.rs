@@ -112,6 +112,8 @@ pub struct SceneDef {
     /// Nodes that carry a Rigidbody.
     pub rigidbodies: std::collections::HashSet<u32>,
     pub warnings: Vec<String>,
+    /// Baked navmeshes (one per agent type / surface).
+    pub navmeshes: Vec<crate::navmesh::NavMeshData>,
 }
 
 impl SceneDef {
@@ -456,6 +458,7 @@ pub fn load_scene(db: &mut AssetDb, bundle: &std::path::Path) -> Result<SceneDef
             }
         }
     }
+    def.navmeshes = crate::navmesh::load_scene_navmeshes(ld.db, bundle).unwrap_or_default();
     Ok(def)
 }
 

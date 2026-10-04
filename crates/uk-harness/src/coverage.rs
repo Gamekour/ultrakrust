@@ -17,6 +17,7 @@ pub fn all_scenes(install: &Path, r: &mut Report) {
         .collect();
     bundles.sort();
     let (mut loaded, mut total, mut ported, mut full) = (0, 0usize, 0usize, 0usize);
+    let mut games_built = 0;
     let mut classes = BTreeSet::new();
     let mut native: BTreeMap<i32, usize> = BTreeMap::new();
     let mut load_ms = 0.0;
@@ -27,6 +28,20 @@ pub fn all_scenes(install: &Path, r: &mut Report) {
             Ok(def) => {
                 loaded += 1;
                 load_ms += t.elapsed().as_secs_f64() * 1e3;
+                let short = name.split(".bundle").next().unwrap_or(&name).replace("campaign_scenes_", "").replace("specialscenes_scenes_", "");
+                let short = short.split('_').next().unwrap_or(&short).to_string();
+                // the level runtime must build for every scene, and every baked navmesh must check out
+                let def = std::sync::Arc::new(def);
+                let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| uk_game::Game::new(def.clone())));
+                match built {
+                    Ok(g) => {
+                        games_built += 1;
+                        if g.nav.is_some() {
+                            crate::checks::nav_checks(&short, &g, r);
+                        }
+                    }
+                    Err(_) => r.note(format!("FAIL game build {short}: panicked")),
+                }
                 for s in def.scripts.iter().filter(|s| !s.class.is_empty()) {
                     total += 1;
                     match status(&s.class) {
@@ -51,6 +66,7 @@ pub fn all_scenes(install: &Path, r: &mut Report) {
         }
     }
     r.higher("cov.scenes_loading", loaded as f64);
+    r.pass("all.games_build", games_built == loaded, format!("{games_built}/{loaded} scenes build a Game"));
     r.info("cov.scenes_total", bundles.len() as f64);
     r.pass("all.scenes_load", loaded == bundles.len(), format!("{loaded}/{} scenes load", bundles.len()));
     r.lower("perf.all.scene_load_ms_total", load_ms, 0.35);

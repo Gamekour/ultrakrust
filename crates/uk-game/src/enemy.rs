@@ -69,6 +69,11 @@ pub struct Enemy {
     pub beam_fire_t: f32,
     pub beam_target: Vec3,
     pub rng: u32,
+    // NavMeshAgent (Zombie TrackTick / Enemy.SetDestination)
+    pub nav_dest: Option<Vec3>,
+    pub path: Vec<crate::nav::Corner>,
+    pub path_i: usize,
+    pub track_t: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -186,6 +191,10 @@ impl Enemy {
             beam_fire_t: -1.0,
             beam_target: Vec3::ZERO,
             rng: node.wrapping_mul(2654435761).max(1),
+            nav_dest: None,
+            path: Vec::new(),
+            path_i: 0,
+            track_t: 0.0,
         })
     }
 
@@ -273,9 +282,60 @@ fn player_target(g: &Game) -> Vec3 {
     g.s.player.pos + Vec3::Y * 0.5
 }
 
+/// ZombieMelee.TrackTick + Enemy.SetDestination: re-path to the floor point under the player every
+/// 0.2 s (0.5 s while 10+ units of path remain), sampling the goal onto the navmesh within 1 unit and
+/// keeping the old destination if the new one is within 0.5 units of it.
+fn track_tick(g: &mut Game, dt: f32) {
+    let Some(nav) = g.nav.as_ref() else { return };
+    // EnemyTarget.GetNavPoint: raycast down from the target onto the environment
+    let p = g.s.player.pos;
+    let nav_point = g.world.raycast(p + Vec3::Y * 0.1, Vec3::NEG_Y, f32::INFINITY).map_or(p, |h| h.point);
+    for en in g.s.enemies.iter_mut() {
+        if !en.alive || !g.s.active[en.node as usize] || en.spawn_t > 0.0 || !matches!(en.kind, Kind::Filth | Kind::Stray) {
+            continue;
+        }
+        en.track_t -= dt;
+        if en.track_t > 0.0 {
+            continue;
+        }
+        let remaining: f32 = en.path.get(en.path_i..).map_or(0.0, |rest| {
+            std::iter::once(en.pos).chain(rest.iter().map(|c| c.pos)).collect::<Vec<_>>().windows(2).map(|w| w[0].distance(w[1])).sum()
+        });
+        en.track_t = if remaining >= 10.0 { 0.5 } else { 0.2 };
+        if !en.grounded || en.attacking {
+            continue;
+        }
+        let dest = nav.sample_position(nav_point, 1.0).unwrap_or(nav_point);
+        if en.nav_dest.is_some_and(|d| (dest - d).length_squared() <= 0.25) {
+            continue;
+        }
+        // the agent stands on the navmesh at its feet
+        let feet = en.pos + Vec3::Y * (en.center_y - en.half_height.max(en.radius));
+        if let Some((path, _)) = nav.find_path(feet, dest) {
+            en.path = path;
+            en.path_i = 1;
+            en.nav_dest = Some(dest);
+        }
+    }
+}
+
+/// Next corner the agent walks toward (NavMeshAgent.steeringTarget), advancing past reached corners.
+fn steering_target(en: &mut Enemy) -> Option<Vec3> {
+    while let Some(c) = en.path.get(en.path_i) {
+        let d = Vec3::new(c.pos.x - en.pos.x, 0.0, c.pos.z - en.pos.z).length();
+        if d < 0.5 && en.path_i + 1 < en.path.len() {
+            en.path_i += 1;
+        } else {
+            return Some(c.pos);
+        }
+    }
+    None
+}
+
 /// Movement + collisions at the fixed rate.
 pub fn fixed_update(g: &mut Game) {
     let dt = FIXED_DT;
+    track_tick(g, dt);
     let target = player_target(g);
     let mut out_of_world = Vec::new();
     for i in 0..g.s.enemies.len() {
@@ -299,12 +359,17 @@ pub fn fixed_update(g: &mut Game) {
             Kind::Stray => (10.0, 30.0),
             _ => (0.0, 0.0),
         };
+        // walk the navmesh path when there is one; straight at the player otherwise
+        let has_nav = g.nav.is_some();
+        let en = &mut g.s.enemies[i];
+        let path_dir = steering_target(en).map(|c| Vec3::new(c.x - en.pos.x, 0.0, c.z - en.pos.z).normalize_or_zero());
+        let chase = if has_nav { path_dir.unwrap_or(Vec3::ZERO) } else { dir };
         let desired = match en.kind {
             _ if en.attacking => Vec3::ZERO,
-            Kind::Filth if dist > 2.5 => dir * speed,
+            Kind::Filth if dist > 2.5 => chase * speed,
             // Strays keep their distance: back off inside flee range, close in beyond shoot range
             Kind::Stray if dist < 15.0 => -dir * speed,
-            Kind::Stray if dist > 30.0 => dir * speed,
+            Kind::Stray if dist > 30.0 => chase * speed,
             _ => Vec3::ZERO,
         };
         let h = Vec3::new(en.vel.x, 0.0, en.vel.z);

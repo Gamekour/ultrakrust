@@ -96,6 +96,8 @@ pub struct Game {
     pub def: Arc<SceneDef>,
     pub s: State,
     pub world: World,
+    /// The level's baked navmesh (humanoid agent type), if it has one.
+    pub nav: Option<crate::nav::NavGraph>,
     /// node -> mover index (nearest mover ancestor, including itself)
     pub node_mover: Vec<Option<u32>>,
     pub movers: Vec<Mover>,
@@ -270,6 +272,7 @@ impl Game {
             def: def.clone(),
             s,
             world,
+            nav: crate::nav::NavGraph::build(&def.navmeshes),
             node_mover,
             movers,
             triggers,

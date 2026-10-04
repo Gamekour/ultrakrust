@@ -42,7 +42,7 @@ pub const PORTED: &[(&str, Port)] = &[
     ("Punch", Port::Partial("Feedbacker basics; no Knuckleblaster, no anim")),
     // enemies (enemy.rs)
     ("EnemyIdentifier", Port::Partial("damage/limb multipliers; no buffs, blessing, radiance, sand")),
-    ("Zombie", Port::Partial("direct pursuit, no navmesh/anim")),
+    ("Zombie", Port::Partial("navmesh pursuit (TrackTick); no anim, no agent avoidance")),
     ("ZombieMelee", Port::Partial("no anim timing")),
     ("ZombieProjectiles", Port::Partial("no anim timing")),
     ("SpiderBody", Port::Partial("Malicious Face: no anim, no enraged phase visuals")),
@@ -84,9 +84,9 @@ pub const NATIVE: &[(i32, &str, f64)] = &[
     (95, "Animator", 0.0),
     (74, "AnimationClip", 0.0),
     (91, "AnimatorController", 0.0),
-    (195, "NavMeshAgent", 0.0),
+    (195, "NavMeshAgent", 0.3), // path following via TrackTick/SetDestination; no avoidance, off-mesh links walked, no autoBraking
     (208, "NavMeshObstacle", 0.0),
-    (238, "NavMeshData", 0.0),
+    (238, "NavMeshData", 0.8),  // tiles + off-mesh links decoded and queried; area costs/masks not applied
     (224, "RectTransform", 0.0),
     (222, "CanvasRenderer", 0.0),
     (223, "Canvas", 0.0),

@@ -23,11 +23,16 @@ All numbers below are measured by tooling (`uk-harness --full`, `parity_scripts`
 | Enemy types (`EnemyType`) | 43 | 3, all partial (Filth, Stray, Malicious Face) | 7% |
 | Weapons | 5 guns × 3 variants + 3 arms + coins | Piercer revolver, Feedbacker (partial) | ~10% |
 | Style bonuses (`AddPoints`) | 61 distinct, 156 call sites | 0 | 0% |
-| Engine systems (unweighted mean, 37 tracked) | — | **22.7%** | see §3 |
-| Level 0-1 autopilot (deterministic) | 56 waypoints | **25/56** | stalls at Fan Room: enemies can't path (no NavMesh) |
+| Engine systems (unweighted mean, 37 tracked) | — | **25.7%** (was 22.7% at the gap analysis) | see §3 |
+| Level 0-1 autopilot (deterministic) | 56 waypoints | **43/56** (was 25 before NavMesh) | stalls at the Combo Hallway east stairs: the hand-written route asks for a 2-high step under a 3-high lintel; a bot route problem, not a game one |
+| Scenes that build a level runtime | 54 | 54 | every scene builds a `Game` without panicking |
 
 **0-1 checks passing:** load, all 11 live door controllers, all 14 arenas, boss → final door → final pit, checkpoint respawn,
-tick-for-tick determinism, sim under budget (p99 1.3 ms/tick).
+tick-for-tick determinism, sim under budget (p99 1.3 ms/tick), navmesh, Fan Room path.
+
+**NavMesh (all levels):** all 6,811 tiles in the install decode (size formula exact). Smoothed paths pass through every
+portal of their corridor on all 45 navmeshes (300 random pairs each). 0-1: 411/412 polygons sit on collision geometry.
+6-2 ships a stale bake (2.8% on geometry; no colliders or renderers within 535 units of it, in the original too).
 
 ## 2. Misunderstandings in the previous plan, corrected
 
@@ -122,9 +127,11 @@ folder is untouched today, and BepInEx is easy to remove.
 
 Each phase ends when its harness metrics are green and added to the baseline. Coverage numbers only go up.
 
-1. **Foundation (done in this commit):** harness, determinism fix, coverage registry, baseline.
-2. **Unblock play:** NavMesh reader + agents (bot past the Fan Room, enemies path), sibling order fix, Animator +
-   AnimationClip (enemy attack timing depends on animation events), Rigidbody dynamics (gibs, physics props, knockback).
+1. **Foundation (done):** harness, determinism fix, coverage registry, baseline.
+2. **Unblock play:** ~~NavMesh reader + agents~~ (done: Detour v16 reader, polygon graph, A*, funnel, off-mesh links;
+   Filth and Strays re-path with `TrackTick`/`SetDestination`). Still open here: agent avoidance (enemies can stack),
+   NavMeshObstacle carving, area costs, sibling order fix, Animator + AnimationClip (enemy attack timing depends on
+   animation events), Rigidbody dynamics (gibs, physics props, knockback).
 3. **Senses:** audio pipeline + MusicManager; SPIR-V shaders + lightmaps + lights + fog; ParticleSystem.
 4. **Player complete:** every weapon/variant/arm, coins, style meter, ranks, HUD as uGUI.
 5. **UI + flow:** uGUI/TMP interpreter, main menu, options, level select, results, saves (read), cheats, sandbox, Cyber Grind.
