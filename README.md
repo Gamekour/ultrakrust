@@ -23,7 +23,7 @@ wall cling, super slide jumps and the piercer revolver, on a test map built to e
 ## Layout
 | Crate | What |
 |---|---|
-| `crates/uk-core` | Engine-agnostic simulation: collision world (oriented boxes), player movement, camera, revolver. Headless tests check it against values derived from the original formulas. |
+| `crates/uk-core` | Engine-agnostic simulation: collision world (oriented boxes + triangle meshes with a BVH), player movement, camera, revolver. Headless tests check it against values derived from the original formulas. |
 | `crates/uk-assets` | Runtime reader for your install: UnityFS bundles (LZ4/LZMA), SerializedFiles via typetrees, meshes, textures (RGB24/RGBA32/DXT1/DXT5), materials, and level scene extraction. |
 | `crates/ultrakrust` | Bevy 0.19 frontend: level loading, input, test map, view model, HUD, `--tour` screenshots. |
 
