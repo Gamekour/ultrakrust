@@ -115,7 +115,8 @@ fn setup(
     mut shaders: ResMut<Assets<bevy::shader::Shader>>,
 ) {
     let args: Vec<String> = std::env::args().collect();
-    let unity_shaders = args.iter().any(|a| a == "--unity-shaders");
+    // ULTRAKILL's own shaders by default; `--legacy-render` keeps the old Bevy-PBR stand-in
+    let unity_shaders = !args.iter().any(|a| a == "--legacy-render");
     let level_arg = args.iter().position(|a| a == "--level").and_then(|i| args.get(i + 1)).cloned();
     let want_level = !args.iter().any(|a| a == "--sandbox");
     let tour_dir = args.iter().position(|a| a == "--tour").and_then(|i| args.get(i + 1)).map(std::path::PathBuf::from);
