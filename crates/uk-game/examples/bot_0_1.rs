@@ -31,22 +31,7 @@ fn main() {
     let mut deaths = 0;
     let mut last_report = 0.0;
     while (t as f32) < limit && !bot.done() && !g.s.level_complete {
-        let f = bot.think(&g, FIXED_DT);
-        g.s.player.yaw_deg = f.yaw_deg;
-        let eye = g.s.player.pos + bevy_math::Vec3::Y * 1.4;
-        let pitch = f.pitch_deg.to_radians();
-        let yaw = f.yaw_deg.to_radians();
-        let aim = bevy_math::Vec3::new(yaw.sin() * pitch.cos(), pitch.sin(), -yaw.cos() * pitch.cos());
-        let fixed = uk_core::player::Input { move_axis: f.input.move_axis, jump_held: f.input.jump_held, ..Default::default() };
-        g.fixed_update(&fixed);
-        t += FIXED_DT as f64;
-        g.update(&f.input, FIXED_DT, t);
-        if f.fire && g.s.has_revolver {
-            g.fire_revolver(eye, aim, false);
-        }
-        if f.punch {
-            g.punch(eye, aim);
-        }
+        uk_game::bot::drive(&mut g, &mut bot, &mut t);
         for e in g.events.drain(..) {
             match e {
                 uk_game::GameEvent::Died => {

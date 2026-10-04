@@ -268,7 +268,8 @@ pub fn load_level(db: &mut AssetDb, bundle: &std::path::Path, opts: LevelOptions
     let mut ctx = Ctx { db, scene: scene.clone(), gos, trs, active: HashMap::new(), world: HashMap::new(), meshes: HashMap::new(), opts };
 
     let mut rooms: HashMap<String, (Vec3, Vec3)> = HashMap::new();
-    let go_ids: Vec<i64> = ctx.gos.keys().copied().collect();
+    let mut go_ids: Vec<i64> = ctx.gos.keys().copied().collect();
+    go_ids.sort_unstable(); // deterministic order across processes
     for gid in go_ids {
         let tr = ctx.gos[&gid].transform;
         if tr == 0 || !ctx.active_in_hierarchy(tr) {

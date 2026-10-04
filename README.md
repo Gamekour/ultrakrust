@@ -25,12 +25,17 @@ wall cling, super slide jumps and the piercer revolver, on a test map built to e
 - No game files, textures, models or sounds ship with this project. Levels and textures are read
   from *your* ULTRAKILL install at runtime (set `ULTRAKILL_DIR` if it isn't in the default Steam folder).
 
+## Parity
+See [PARITY.md](PARITY.md) for the measured gap analysis and work order. Run the headless harness with
+`cargo run --release -p uk-harness -- --full`. It prints only failures, regressions and gaps.
+
 ## Layout
 | Crate | What |
 |---|---|
 | `crates/uk-core` | Engine-agnostic simulation: collision world (oriented boxes + triangle meshes with a BVH), player movement, camera, revolver. Headless tests check it against values derived from the original formulas. |
 | `crates/uk-assets` | Runtime reader for your install: UnityFS bundles (LZ4/LZMA), SerializedFiles via typetrees, meshes, textures (RGB24/RGBA32/DXT1/DXT5), materials, and level scene extraction. |
 | `crates/uk-game` | Level runtime: Unity-like object model (activation, triggers, timers, UnityEvents) running ports of the progression scripts, enemies, combat, checkpoints. Headless probes + an autopilot in `examples/`. |
+| `crates/uk-harness` | Headless parity, regression and performance harness: probes as checks, coverage of every scene, determinism, baseline in `parity/baseline.tsv`. |
 | `crates/ultrakrust` | Bevy 0.19 frontend: level loading, input, test map, view model, HUD, `--tour` screenshots. |
 
 ## Run

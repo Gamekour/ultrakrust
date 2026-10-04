@@ -6,6 +6,7 @@
 pub mod bot;
 pub mod enemy;
 pub mod game;
+pub mod parity;
 pub mod scripts;
 
 pub use game::{Game, GameEvent};

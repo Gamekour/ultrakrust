@@ -7,3 +7,6 @@
 *.bundle
 *.resS
 *.dll
+parity/report.tsv
+parity/native.tsv
+parity/scenes.tsv

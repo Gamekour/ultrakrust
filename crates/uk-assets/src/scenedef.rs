@@ -317,7 +317,9 @@ pub fn load_scene(db: &mut AssetDb, bundle: &std::path::Path) -> Result<SceneDef
     }
 
     // --- components ---
-    let go_ids: Vec<i64> = raw_go.keys().copied().collect();
+    // Node order, not HashMap order: script/collider indices drive Awake/Start/Update order, so this must
+    // be the same in every process for runs to be reproducible.
+    let go_ids: Vec<i64> = node_tr.iter().map(|t| raw_tr[t].go).collect();
     for gid in go_ids {
         let Some(&node) = def.obj_to_node.get(&gid) else { continue };
         let comps: Vec<(i32, i64)> = raw_go[&gid].get("m_Component").array().iter().map(|c| c.get("component").pptr()).collect();

@@ -56,7 +56,7 @@ fn main() {
     if let uk_game::scripts::Script::FinalDoor(f) = &g.s.scripts[fd] {
         println!("final door: about_to_open={} opened={} (node active {})", f.about_to_open, f.opened, g.active(def.scripts[fd].node));
     }
-    let pit = def.scripts.iter().position(|s| s.class == "FinalPit").unwrap();
+    let pit = def.scripts.iter().position(|s| s.class == "FinalPit" && g.active(s.node)).expect("active FinalPit");
     let pnode = def.scripts[pit].node;
     println!("final pit active={} at {}", g.active(pnode), def.path(pnode));
     if let Some(pc) = def.colliders.iter().find(|c| c.node == pnode) {

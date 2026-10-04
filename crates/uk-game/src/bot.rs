@@ -322,3 +322,26 @@ pub fn route_0_1() -> Vec<Waypoint> {
         w(202.0, -15.0, -354.0, "final pit", 6.0),
     ]
 }
+
+/// One fixed tick driven by the bot: think, move, then fire/punch from the post-tick eye.
+/// Every probe and the harness use this, so their runs are the same run.
+pub fn drive(g: &mut Game, bot: &mut Bot, t: &mut f64) -> BotFrame {
+    let dt = uk_core::consts::FIXED_DT;
+    let f = bot.think(g, dt);
+    g.s.player.yaw_deg = f.yaw_deg;
+    let fixed = Input { move_axis: f.input.move_axis, jump_held: f.input.jump_held, ..Default::default() };
+    g.fixed_update(&fixed);
+    *t += dt as f64;
+    g.update(&f.input, dt, *t);
+    let eye = g.s.player.pos + Vec3::Y * 1.4;
+    let (y, p) = (f.yaw_deg.to_radians(), f.pitch_deg.to_radians());
+    let aim = Vec3::new(y.sin() * p.cos(), p.sin(), -y.cos() * p.cos());
+    if f.fire && g.s.has_revolver {
+        g.fire_revolver(eye, aim, false)
+    }
+    if f.punch {
+        g.punch(eye, aim)
+    }
+    g.s.player.events.clear();
+    f
+}

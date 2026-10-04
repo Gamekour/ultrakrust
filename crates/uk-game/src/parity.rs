@@ -1,0 +1,104 @@
+//! Parity registry: which ULTRAKILL script classes have a port in this crate, and how far.
+//! The `parity_scripts` probe checks every scene in the install against this list.
+
+/// How complete a port is. `Partial` = runs, but known behaviour is missing (see note).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Port {
+    Full,
+    Partial(&'static str),
+    /// Read for data only (e.g. tuning values); the behaviour itself is not ported.
+    DataOnly,
+}
+
+pub const PORTED: &[(&str, Port)] = &[
+    // progression / level scripts (scripts.rs)
+    ("ObjectActivator", Port::Full),
+    ("ObjectActivationCheck", Port::Full),
+    ("Door", Port::Partial("Normal door type only; no sounds")),
+    ("DoorController", Port::Full),
+    ("DoorOpener", Port::Full),
+    ("ActivateArena", Port::Full),
+    ("ActivateNextWave", Port::Full),
+    ("Breakable", Port::Partial("no debris/particles/sound")),
+    ("Glass", Port::Partial("no shards/sound")),
+    ("CheckPoint", Port::Partial("no rooms reset beyond snapshot; no sound/anim")),
+    ("DeathZone", Port::Full),
+    ("TeleportPlayer", Port::Full),
+    ("PlayerActivator", Port::Full),
+    ("FinalDoor", Port::Partial("no animation/sound")),
+    ("FinalDoorOpener", Port::Full),
+    ("FinalPit", Port::Partial("no results screen")),
+    ("HudMessage", Port::Partial("text only")),
+    ("WeaponPickUp", Port::Partial("revolver only")),
+    ("OutOfBoundsTargetSetter", Port::Full),
+    ("UltrakillEvent", Port::Full),
+    ("ClimbStep", Port::Full),
+    // player (uk-core)
+    ("NewMovement", Port::Partial("no hurt/death anim, sounds, slope/water/jump pad interplay")),
+    ("GroundCheck", Port::Full),
+    ("WallCheck", Port::Full),
+    ("CameraController", Port::Partial("no screenshake, no options")),
+    ("Revolver", Port::Partial("piercer variant only; no coin/alt variants, no anim/sound")),
+    ("Punch", Port::Partial("Feedbacker basics; no Knuckleblaster, no anim")),
+    // enemies (enemy.rs)
+    ("EnemyIdentifier", Port::Partial("damage/limb multipliers; no buffs, blessing, radiance, sand")),
+    ("Zombie", Port::Partial("direct pursuit, no navmesh/anim")),
+    ("ZombieMelee", Port::Partial("no anim timing")),
+    ("ZombieProjectiles", Port::Partial("no anim timing")),
+    ("SpiderBody", Port::Partial("Malicious Face: no anim, no enraged phase visuals")),
+    ("MaliciousFace", Port::Partial("see SpiderBody")),
+    ("Projectile", Port::Partial("basic straight projectile")),
+    ("SwingCheck2", Port::DataOnly),
+];
+
+pub fn status(class: &str) -> Option<Port> {
+    PORTED.iter().find(|(c, _)| *c == class).map(|(_, p)| *p)
+}
+
+/// Unity native component/asset types that matter for parity, with how much of each is implemented (0..1).
+/// Weighted by instance count in the harness `--full` run.
+pub const NATIVE: &[(i32, &str, f64)] = &[
+    (4, "Transform", 1.0),
+    (23, "MeshRenderer", 0.6),         // drawn; no Unity shaders, lightmaps or light probes
+    (33, "MeshFilter", 1.0),
+    (137, "SkinnedMeshRenderer", 0.3), // CPU-skinned in the scene pose, no animation
+    (65, "BoxCollider", 1.0),
+    (64, "MeshCollider", 1.0),
+    (135, "SphereCollider", 0.8),
+    (136, "CapsuleCollider", 0.8),
+    (54, "Rigidbody", 0.1), // only the player; no rigidbody dynamics
+    (153, "ConfigurableJoint", 0.0),
+    (82, "AudioSource", 0.0),
+    (83, "AudioClip", 0.0),
+    (169, "AudioLowPassFilter", 0.0),
+    (170, "AudioDistortionFilter", 0.0),
+    (165, "AudioHighPassFilter", 0.0),
+    (167, "AudioReverbZone", 0.0),
+    (108, "Light", 0.05),
+    (157, "LightmapSettings", 0.0),
+    (104, "RenderSettings", 0.1),
+    (198, "ParticleSystem", 0.0),
+    (96, "TrailRenderer", 0.0),
+    (120, "LineRenderer", 0.05),
+    (212, "SpriteRenderer", 0.0),
+    (95, "Animator", 0.0),
+    (74, "AnimationClip", 0.0),
+    (91, "AnimatorController", 0.0),
+    (195, "NavMeshAgent", 0.0),
+    (208, "NavMeshObstacle", 0.0),
+    (238, "NavMeshData", 0.0),
+    (224, "RectTransform", 0.0),
+    (222, "CanvasRenderer", 0.0),
+    (223, "Canvas", 0.0),
+    (225, "CanvasGroup", 0.0),
+    (20, "Camera", 0.3),
+    (48, "Shader", 0.0),
+    (21, "Material", 0.4), // main texture + colour only
+    (28, "Texture2D", 0.9), // no BC7
+    (89, "Cubemap", 0.0),
+    (328, "VideoPlayer", 0.0),
+];
+
+pub fn native_status(class_id: i32) -> Option<f64> {
+    NATIVE.iter().find(|(id, _, _)| *id == class_id).map(|(_, _, w)| *w)
+}
