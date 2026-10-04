@@ -1,0 +1,9 @@
+[package]
+name = "uk-core"
+description = "Engine-agnostic ULTRAKILL movement simulation (clean-room Rust reimplementation)"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+bevy_math.workspace = true

@@ -1,0 +1,9 @@
+/target
+*.pdb
+# never commit game-derived data
+/decomp/
+/extracted/
+*.assets
+*.bundle
+*.resS
+*.dll

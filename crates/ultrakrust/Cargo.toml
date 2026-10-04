@@ -1,0 +1,10 @@
+[package]
+name = "ultrakrust"
+description = "ULTRAKILL movement sandbox in Bevy"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+uk-core = { path = "../uk-core" }
+bevy.workspace = true
