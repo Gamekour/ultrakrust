@@ -81,3 +81,35 @@ The repo contains only original Rust code. Constants are facts read from the ins
   Visual: `ultrakrust --tour <dir>` saves spawn + per-room screenshots (27 for 0-1) — no input injection needed.
 - Tooling note: `um win drive` failed (WinDrive.ps1 missing after `um win setup`); in-app tour used instead.
 - Next: doors (first-room door blocks the exit — needs Door/ObjectActivator logic or a "doors open" option), lights/lightmaps, enemies.
+
+## Milestone 3 — 0-1 playable (2026-10-04)
+New crate `uk-game` (engine-agnostic runtime) + `uk-assets::scenedef` (full scene graph: 13,884 nodes, 5,708 renderers incl.
+CPU-skinned enemies, 3,393 colliders/569 triggers, 11,758 MonoBehaviours with typetree fields; loads in ~3 s).
+- Unity object model: activeSelf/activeInHierarchy, Awake/OnEnable/Start/OnDisable, Invoke timers, trigger enter/exit
+  (incl. messages to the attached Rigidbody's GameObject — compound colliders like CheckPoint + child "Hitbox"),
+  OnCollisionEnter-style contacts (DeathZone), UnityEvent persistent calls (SetActive, set_enabled, Activate, Break, Door.*, ...).
+- Ported scripts: ObjectActivator(+ObjectActivationCheck), UltrakillEvent, Door (Normal type: all 33 in 0-1),
+  DoorController, DoorOpener, ActivateArena, ActivateNextWave (enemy deaths -> nearest parent wave, linked waves),
+  Breakable, Glass (shot / punch / windState sweep), CheckPoint (state snapshot; respawn at transform + up*1.25),
+  DeathZone (instakill / damage + respawn target), OutOfBoundsTargetSetter, TeleportPlayer, PlayerActivator (intro: V1
+  frozen while falling in), FinalDoor, FinalDoorOpener, FinalPit (level end), HudMessage.
+- ClimbStep (player auto-step up to 2.1) — the rig had it, stairs need it.
+- Enemies: Filth (speed 20/accel 30, swing range 3, bite = SwingCheck2.damage 30, cooldown 0.5 @0.4/s), Stray (speed 10,
+  flee < 15, shoot 1-2.5 s, Projectile prefab: 65 u/s, 25 dmg, r 0.5), Malicious Face (25 HP; Standard: 6-shot bursts aimed
+  at the head, 1 s cooldown; beam: 2 s charge, predicted aim, 50 dmg ignoring dash i-frames). Damage = m + m*limb*crit
+  (head x2, limb x1.5), airborne zombies x1.5. Hitboxes = collider tags Head/Limb/EndLimb. Death zones kill enemies.
+  Movement is direct pursuit (no navmesh yet). Health on blood: approximation (+3 hit, +10 head/kill within 9 u).
+- Weapons: revolver from RevolverPickUp (the real unlock is save-progress driven), punch (Feedbacker, range 4, parries
+  projectiles: reflected, full heal).
+- Camera culling mask (0x8fd2dfd7) hides layers 3,5,13,16,18,19,21,28,29,30 — trigger volumes are layer 16 cubes.
+- Gotchas: 1) trigger events go to the attached Rigidbody's object too; 2) DeathZone also fires OnCollisionEnter;
+  3) DeathZone notInstakill => damage + teleport to respawnTarget (set by OutOfBoundsTargetSetter triggers);
+  4) windState sweep must ignore the floor already touched (Unity SweepTest skips contacts) or glass floors break underfoot;
+  5) MF burst spread only on difficulty >= 4; 6) GunRoom arena trigger appears 8.867 s after the pickup (title card).
+- Verified: probes (`crates/uk-game/examples/probe_*`): all 14 arenas spawn waves and unlock their doors; 11/11 live
+  DoorControllers open/close (5 decorative ones have no door); boss -> FinalDoor -> FinalPit = level complete; checkpoint
+  respawn restores state. Autopilot (`bot_0_1`) walks from the start through ~70% of 0-1 on foot (planks, slide corridor,
+  Gun Room, 4 Hallway, glass drop, 2 checkpoints, Glass Hallway, Fan Room incl. gap jump, Projectile Arena, Combo Hallway,
+  door 7). `ultrakrust --demo <dir>`: scripted run to LEVEL COMPLETE with screenshots; recorded with `um win record`.
+- Not done: navmesh pathing, animations (enemies are posed statically), sound/music, lighting/lightmaps, BC7 textures,
+  style meter/ranks, other weapons, parry nuances.

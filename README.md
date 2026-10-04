@@ -2,6 +2,11 @@
 
 A Rust (Bevy) reimplementation of ULTRAKILL, starting with V1's movement.
 
+**Milestone 3: 0-1 is playable.** Start to finish: the drop-in intro, punching through the planks, the revolver
+pickup and title card, every arena and wave, doors, glass floors, fans, checkpoints and respawns, Filth, Strays,
+the Malicious Face, and the final pit. Gameplay scripts are ports of ULTRAKILL's own (see MODLOG.md), running on
+the level data read from your install.
+
 **Milestone 2: real levels.** `ultrakrust` loads level 0-1 straight from your Steam install at
 runtime (geometry, textures, collision, spawn point) with a Rust reader for Unity's bundle format.
 `--level 1-1` picks another level, `--sandbox` opens the movement test map, `N` toggles noclip.
@@ -25,6 +30,7 @@ wall cling, super slide jumps and the piercer revolver, on a test map built to e
 |---|---|
 | `crates/uk-core` | Engine-agnostic simulation: collision world (oriented boxes + triangle meshes with a BVH), player movement, camera, revolver. Headless tests check it against values derived from the original formulas. |
 | `crates/uk-assets` | Runtime reader for your install: UnityFS bundles (LZ4/LZMA), SerializedFiles via typetrees, meshes, textures (RGB24/RGBA32/DXT1/DXT5), materials, and level scene extraction. |
+| `crates/uk-game` | Level runtime: Unity-like object model (activation, triggers, timers, UnityEvents) running ports of the progression scripts, enemies, combat, checkpoints. Headless probes + an autopilot in `examples/`. |
 | `crates/ultrakrust` | Bevy 0.19 frontend: level loading, input, test map, view model, HUD, `--tour` screenshots. |
 
 ## Run
@@ -40,15 +46,16 @@ cargo run --release -p uk-assets --example dump_level -- level0-1
 
 Controls (ULTRAKILL defaults): **WASD** move, **Space** jump, **Left Shift** dash,
 **Left Ctrl** slide (in the air: ground slam), **LMB** fire, **hold RMB** charge a piercing shot,
-**R** respawn, **T** toggle camera tilt, **[ ]** mouse sensitivity, **Esc** release the mouse.
+**F** punch (also parries projectiles), **R** restart from checkpoint, **N** noclip, **T** camera tilt,
+**[ ]** mouse sensitivity, **Esc** release the mouse. `--demo <dir>` plays a scripted run and saves screenshots.
 
 ## Faithfulness notes
 - Physics runs at the game's 125 Hz fixed step. Per-frame logic (inputs, slide state, cling, slam)
   runs every rendered frame, as it does in Unity.
 - Quirks are kept on purpose. Wall cling calls `Clamp(-1, 1, x)` with the arguments in the wrong order, so the result
   is always 1. The stamina-fail dash jump scales by the frame delta.
-- Not yet ported: enemies, parry/punch, other weapons, water, moving platforms, gravity volumes,
-  portals, and sound.
+- Not yet ported: navmesh pathing (enemies chase directly), animations (enemies are posed statically),
+  sound/music, the level's lights and lightmaps, other weapons, style meter and ranks.
 
 Built with AI assistance (Claude), using ILSpy and UnityPy for inspection. ULTRAKILL is © New Blood
 Interactive / Arsi "Hakita" Patala. This is an unofficial fan project, and you need to own the game.
