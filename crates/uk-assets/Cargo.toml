@@ -1,0 +1,11 @@
+[package]
+name = "uk-assets"
+description = "Reads Unity bundles/levels from the user's own ULTRAKILL install at runtime"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+bevy_math.workspace = true
+lz4_flex = "0.11"
+lzma-rs = "0.3"

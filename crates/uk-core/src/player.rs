@@ -929,7 +929,7 @@ impl Player {
     fn update_triggers(&mut self, world: &World) {
         // GroundCheck: scaled trigger capsule below the feet.
         let gc_cap = Capsule::unity(self.gc_pos(), GC_HEIGHT, GC_RADIUS);
-        let now: Vec<ColliderId> = world.overlap_capsule(gc_cap).collect();
+        let now = world.overlap_capsule(gc_cap);
         let entered: Vec<ColliderId> = now.iter().copied().filter(|c| !self.gc.cols.contains(c)).collect();
         for _ in &entered {
             if self.gc.heavy_fall {
@@ -942,12 +942,12 @@ impl Player {
         self.gc.cols = now;
 
         let slope_cap = Capsule::unity(self.pos + SLOPE_CHECK_POS + Vec3::Y * COLLIDER_CENTER_Y, STAND_HEIGHT, SLOPE_RADIUS);
-        let now: Vec<ColliderId> = world.overlap_capsule(slope_cap).collect();
+        let now = world.overlap_capsule(slope_cap);
         self.slope.touching = !now.is_empty();
         self.slope.cols = now;
 
         let wc = self.pos + WALL_CHECK_POS;
-        let cols: Vec<ColliderId> = world.overlap_sphere(wc, WALL_RADIUS).filter(|c| !world.get(*c).slippery).collect();
+        let cols: Vec<ColliderId> = world.overlap_sphere(wc, WALL_RADIUS).into_iter().filter(|c| !world.get(*c).slippery()).collect();
         if cols.iter().any(|c| !self.wall.cols.contains(c)) {
             self.wall.on_wall = true;
         }

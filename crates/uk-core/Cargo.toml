@@ -7,3 +7,6 @@ license.workspace = true
 
 [dependencies]
 bevy_math.workspace = true
+
+[dev-dependencies]
+uk-assets = { path = "../uk-assets" }

@@ -1,10 +1,15 @@
-//! ULTRAKRUST movement sandbox: Bevy frontend for `uk-core`.
+//! ULTRAKRUST: Bevy frontend for `uk-core`.
+//!
+//! `ultrakrust` loads level 0-1 from your ULTRAKILL install (if found);
+//! `ultrakrust --level 1-1` picks another level; `ultrakrust --sandbox` opens the test map.
 //!
 //! Controls (ULTRAKILL defaults): WASD move, Space jump, Left Shift dash,
 //! Left Ctrl slide / slam, LMB fire, hold RMB to charge a piercing shot.
-//! R respawn, [ ] sensitivity, T toggle camera tilt, Esc release mouse, click to grab.
+//! R respawn, N noclip, [ ] sensitivity, T toggle camera tilt, Esc release mouse, click to grab.
 
+mod level;
 mod map;
+mod tour;
 
 use bevy::camera::visibility::RenderLayers;
 use bevy::input::mouse::AccumulatedMouseMotion;
@@ -18,7 +23,7 @@ use uk_core::consts::FIXED_DT;
 use uk_core::player::{Event, Input as PInput, Player};
 use uk_core::revolver::{Revolver, Shot};
 
-const SPAWN: Vec3 = Vec3::new(0.0, 1.5, 100.0);
+const SANDBOX_SPAWN: Vec3 = Vec3::new(0.0, 1.5, 100.0);
 const VIEW_LAYER: usize = 1;
 
 #[derive(Resource)]
@@ -33,6 +38,10 @@ struct Sim {
     clock: f64,
     log: Vec<(String, f32)>,
     recoil: f32,
+    spawn: Vec3,
+    spawn_yaw: f32,
+    noclip: bool,
+    title: String,
 }
 
 #[derive(Component)]
@@ -62,7 +71,7 @@ fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
-                title: "ULTRAKRUST — movement sandbox".into(),
+                title: "ULTRAKRUST".into(),
                 resolution: WindowResolution::new(1600, 900),
                 present_mode: PresentMode::AutoNoVsync,
                 ..default()
@@ -74,7 +83,7 @@ fn main() {
         .insert_resource(GlobalAmbientLight { brightness: 350.0, ..default() })
         .add_systems(Startup, setup)
         .add_systems(FixedUpdate, fixed_sim)
-        .add_systems(Update, (cursor_grab, frame_sim, apply_view, update_beams, update_hud).chain())
+        .add_systems(Update, (cursor_grab, frame_sim, apply_view, update_beams, update_hud, tour::run_tour).chain())
         .run();
 }
 
@@ -108,8 +117,35 @@ fn setup(
         }),
     };
 
+    // Level from the user's install, or the movement test map.
+    let args: Vec<String> = std::env::args().collect();
+    let level_arg = args.iter().position(|a| a == "--level").and_then(|i| args.get(i + 1)).cloned();
+    let want_level = !args.iter().any(|a| a == "--sandbox");
     let mut world = World::default();
-    let targets = map::spawn(&mut commands, &mut meshes, &mats, &mut world);
+    let mut targets = Vec::new();
+    let (mut spawn, mut spawn_yaw, mut title) = (SANDBOX_SPAWN, 0.0, "movement sandbox".to_string());
+    let mut loaded_level = false;
+    let tour_dir = args.iter().position(|a| a == "--tour").and_then(|i| args.get(i + 1)).map(std::path::PathBuf::from);
+    let mut rooms = Vec::new();
+    if want_level {
+        let name = level_arg.unwrap_or_else(|| "0-1".into());
+        match level::load(&name, &mut commands, &mut meshes, &mut materials, &mut images) {
+            Ok(l) => {
+                info!("{}", l.summary);
+                world = l.world;
+                spawn = l.spawn;
+                spawn_yaw = l.yaw;
+                title = l.summary;
+                rooms = l.rooms;
+                loaded_level = true;
+            }
+            Err(e) => warn!("could not load level {name}: {e}; falling back to the sandbox"),
+        }
+    }
+    if !loaded_level {
+        targets = map::spawn(&mut commands, &mut meshes, &mats, &mut world);
+        world.build();
+    }
 
     commands.spawn((
         DirectionalLight { illuminance: 9000.0, shadow_maps_enabled: true, ..default() },
@@ -124,10 +160,14 @@ fn setup(
             Projection::from(PerspectiveProjection { fov: 105f32.to_radians(), near: 0.05, ..default() }),
             DistanceFog {
                 color: Color::srgb(0.02, 0.02, 0.03),
-                falloff: FogFalloff::Linear { start: 120.0, end: 320.0 },
+                falloff: if loaded_level {
+                    FogFalloff::Linear { start: 250.0, end: 900.0 }
+                } else {
+                    FogFalloff::Linear { start: 120.0, end: 320.0 }
+                },
                 ..default()
             },
-            Transform::from_translation(SPAWN),
+            Transform::from_translation(spawn),
         ))
         .with_children(|c| {
             c.spawn((
@@ -208,8 +248,15 @@ fn setup(
                 });
         });
 
-    let mut player = Player::new(SPAWN);
-    let cam = FpCamera::default();
+    if let Some(dir) = tour_dir {
+        let _ = std::fs::create_dir_all(&dir);
+        let t = tour::Tour::new(dir, spawn, spawn_yaw, &rooms);
+        info!("tour: {} shots", t.shots.len());
+        commands.insert_resource(t);
+    }
+    let mut player = Player::new(spawn);
+    let mut cam = FpCamera::default();
+    cam.rotation_y = spawn_yaw;
     player.yaw_deg = cam.rotation_y;
     commands.insert_resource(Sim {
         world,
@@ -221,6 +268,10 @@ fn setup(
         clock: 0.0,
         log: Vec::new(),
         recoil: 0.0,
+        spawn,
+        spawn_yaw,
+        noclip: false,
+        title,
     });
 }
 
@@ -247,6 +298,9 @@ fn move_axis(keys: &ButtonInput<KeyCode>) -> Vec2 {
 
 fn fixed_sim(mut sim: ResMut<Sim>) {
     let sim = &mut *sim;
+    if sim.noclip {
+        return;
+    }
     let input = sim.fixed_input;
     sim.player.fixed_update(&sim.world, &input);
 }
@@ -269,13 +323,17 @@ fn frame_sim(
     let captured = cursor.grab_mode != CursorGrabMode::None;
 
     if keys.just_pressed(KeyCode::KeyR) {
-        let yaw = sim.cam.rotation_y;
-        sim.player = Player::new(SPAWN);
-        sim.player.yaw_deg = yaw;
+        sim.player = Player::new(sim.spawn);
+        sim.cam.rotation_y = sim.spawn_yaw;
+        sim.player.yaw_deg = sim.spawn_yaw;
     }
     if keys.just_pressed(KeyCode::BracketLeft) { sim.cam.sensitivity *= 0.8; }
     if keys.just_pressed(KeyCode::BracketRight) { sim.cam.sensitivity *= 1.25; }
     if keys.just_pressed(KeyCode::KeyT) { sim.cam.tilt_enabled = !sim.cam.tilt_enabled; }
+    if keys.just_pressed(KeyCode::KeyN) {
+        sim.noclip = !sim.noclip;
+        sim.player.vel = Vec3::ZERO;
+    }
 
     let axis = move_axis(&keys);
     let input = PInput {
@@ -293,7 +351,19 @@ fn frame_sim(
     }
     sim.player.yaw_deg = sim.cam.rotation_y;
     let clock = sim.clock;
-    sim.player.update(&sim.world, &input, dt, clock);
+    if sim.noclip {
+        // Free fly for looking around a level: camera-relative, Space up, Ctrl down, Shift fast.
+        let rot = sim.cam.rotation();
+        let mut d = rot * Vec3::new(axis.x, 0.0, -axis.y);
+        if keys.pressed(KeyCode::Space) { d.y += 1.0; }
+        if keys.pressed(KeyCode::ControlLeft) { d.y -= 1.0; }
+        let speed = if keys.pressed(KeyCode::ShiftLeft) { 120.0 } else { 35.0 };
+        let step = d.normalize_or_zero() * speed * dt;
+        sim.player.pos += step;
+        sim.player.prev_pos = sim.player.pos;
+    } else {
+        sim.player.update(&sim.world, &input, dt, clock);
+    }
     sim.cam.late_update(&mut sim.player, axis.x, dt);
 
     for e in sim.player.events.drain(..) {
@@ -362,6 +432,7 @@ fn frame_sim(
 
 fn apply_view(
     sim: Res<Sim>,
+    tour: Option<Res<tour::Tour>>,
     fixed: Res<Time<Fixed>>,
     mut cam: Single<(&mut Transform, &mut Projection), With<MainCam>>,
     mut vm: Single<&mut Transform, (With<ViewModel>, Without<MainCam>)>,
@@ -374,6 +445,13 @@ fn apply_view(
         p.fov = sim.cam.fov.to_radians();
     }
     // Revolver kick
+    if let Some((eye, yaw, pitch)) = tour.as_ref().and_then(|t| t.camera()) {
+        cam.0.translation = eye;
+        cam.0.rotation = Quat::from_rotation_y(-yaw.to_radians()) * Quat::from_rotation_x(pitch.to_radians());
+        if let Projection::Perspective(p) = cam.1.as_mut() {
+            p.fov = 75f32.to_radians();
+        }
+    }
     vm.translation = Vec3::new(0.32, -0.3, -0.55 + sim.recoil * 0.08);
     vm.rotation = Quat::from_rotation_x(sim.recoil * 0.35);
 }
@@ -408,8 +486,10 @@ fn update_hud(
     if p.slow_mode { state.push("CROUCH") }
     let hits: u32 = sim.targets.iter().map(|t| t.hits).sum();
     let mut s = format!(
-        "ULTRAKRUST  movement sandbox   {:.0} fps\n\nspeed  {:6.2} u/s  (vertical {:+.1})\nstate  {}\nwall jumps left  {}\nslam force  {:.2}   pre-slide x{:.2}\ntarget hits  {}\n\nWASD move  SPACE jump  SHIFT dash  CTRL slide/slam\nLMB fire  hold RMB pierce  R respawn  T tilt  [ ] sens {:.3}\n",
+        "ULTRAKRUST   {:.0} fps{}\n{}\n\nspeed  {:6.2} u/s  (vertical {:+.1})\nstate  {}\nwall jumps left  {}\nslam force  {:.2}   pre-slide x{:.2}\ntarget hits  {}\n\nWASD move  SPACE jump  SHIFT dash  CTRL slide/slam\nLMB fire  hold RMB pierce  R respawn  N noclip  T tilt  [ ] sens {:.3}\n",
         1.0 / diag.delta_secs().max(1e-4),
+        if sim.noclip { "   [NOCLIP]" } else { "" },
+        sim.title,
         p.speed_h(),
         p.vel.y,
         state.join(" "),

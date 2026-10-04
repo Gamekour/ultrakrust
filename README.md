@@ -2,6 +2,10 @@
 
 A Rust (Bevy) reimplementation of ULTRAKILL, starting with V1's movement.
 
+**Milestone 2: real levels.** `ultrakrust` loads level 0-1 straight from your Steam install at
+runtime (geometry, textures, collision, spawn point) with a Rust reader for Unity's bundle format.
+`--level 1-1` picks another level, `--sandbox` opens the movement test map, `N` toggles noclip.
+
 **Milestone 1: movement sandbox.** Walk, jump, dash, slide, slam, slam-jump, wall-jump (×3),
 wall cling, super slide jumps and the piercer revolver, on a test map built to exercise each of them.
 
@@ -13,21 +17,25 @@ wall cling, super slide jumps and the piercer revolver, on a test map built to e
   the 125 Hz physics step, gravity -40, collider sizes, the frictionless player material) was read
   from the game's own data files. See [MODLOG.md](MODLOG.md) and
   [`crates/uk-core/src/consts.rs`](crates/uk-core/src/consts.rs).
-- No game files, textures, models or sounds ship with this project. A later milestone will load
-  levels and assets from *your* ULTRAKILL install at runtime.
+- No game files, textures, models or sounds ship with this project. Levels and textures are read
+  from *your* ULTRAKILL install at runtime (set `ULTRAKILL_DIR` if it isn't in the default Steam folder).
 
 ## Layout
 | Crate | What |
 |---|---|
 | `crates/uk-core` | Engine-agnostic simulation: collision world (oriented boxes), player movement, camera, revolver. Headless tests check it against values derived from the original formulas. |
-| `crates/ultrakrust` | Bevy 0.19 frontend: window, input, test map, view model, HUD. |
+| `crates/uk-assets` | Runtime reader for your install: UnityFS bundles (LZ4/LZMA), SerializedFiles via typetrees, meshes, textures (RGB24/RGBA32/DXT1/DXT5), materials, and level scene extraction. |
+| `crates/ultrakrust` | Bevy 0.19 frontend: level loading, input, test map, view model, HUD, `--tour` screenshots. |
 
 ## Run
 ```bash
 cargo run --release -p ultrakrust
 ```
 ```bash
-cargo test -p uk-core
+cargo test --release --workspace
+```
+```bash
+cargo run --release -p uk-assets --example dump_level -- level0-1
 ```
 
 Controls (ULTRAKILL defaults): **WASD** move, **Space** jump, **Left Shift** dash,

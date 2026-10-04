@@ -8,3 +8,4 @@ license.workspace = true
 [dependencies]
 uk-core = { path = "../uk-core" }
 bevy.workspace = true
+uk-assets = { path = "../uk-assets" }
