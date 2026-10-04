@@ -61,6 +61,12 @@ impl FpCamera {
             self.local_pos = self.default_pos;
             self.target_pos = self.default_pos - Vec3::Y * 0.1;
         }
+        // ClimbStep keeps the camera's world position and lets defaultPos ease back
+        if nm.eye_offset != 0.0 {
+            self.default_pos.y -= nm.eye_offset;
+            self.local_pos.y -= nm.eye_offset;
+            nm.eye_offset = 0.0;
+        }
         if dt > 0.0 {
             self.tilt_z = smooth_damp_angle(self.tilt_z, 0.0, &mut self.tilt_vel, 0.5, dt);
         }

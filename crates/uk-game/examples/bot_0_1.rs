@@ -11,8 +11,22 @@ fn main() {
     let mut db = AssetDb::open(&install).unwrap();
     let path = AssetDb::bundle_dir(&install).join("campaign_scenes_level0-1.bundle");
     let def = Arc::new(scenedef::load_scene(&mut db, &path).unwrap());
-    let mut g = Game::new(def);
+    let mut g = Game::new(def.clone());
     let mut bot = Bot::new(route_0_1());
+    // optional section start: START_WP=<waypoint label> ACTIVATE="root1;root2" START=x,y,z
+    if let Ok(list) = std::env::var("ACTIVATE") {
+        for _ in 0..300 { g.fixed_update(&uk_core::player::Input::default()); g.update(&uk_core::player::Input::default(), FIXED_DT, 0.0); }
+        for p in list.split(';') { if let Some(n) = (0..def.nodes.len() as u32).find(|&n| def.path(n) == p) { g.set_active(n, true); } }
+        g.s.has_revolver = true;
+    }
+    if let Ok(start) = std::env::var("START") {
+        let v: Vec<f32> = start.split(',').map(|x| x.parse().unwrap()).collect();
+        g.s.player.pos = bevy_math::Vec3::new(v[0], v[1], v[2]);
+        g.s.player.prev_pos = g.s.player.pos;
+    }
+    if let Ok(label) = std::env::var("START_WP") {
+        bot.idx = bot.route.iter().position(|w| w.label == label).expect("waypoint label");
+    }
     let mut t = 0.0f64;
     let mut deaths = 0;
     let mut last_report = 0.0;

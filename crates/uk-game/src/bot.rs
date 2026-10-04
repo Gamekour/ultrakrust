@@ -189,6 +189,14 @@ impl Bot {
             return out;
         }
         let fwd = Vec3::new(to.x, 0.0, to.z).normalize_or_zero();
+        // running jump over gaps: no floor just ahead but the target is further away
+        let ahead = p.pos + fwd * 1.6;
+        let floor_ahead = g.world.raycast(ahead, Vec3::NEG_Y, 10.0).is_some();
+        if !floor_ahead && p.gc.on_ground && flat.length() > 3.0 && to.y > -2.0 {
+            out.input.jump_pressed = true;
+            out.input.jump_held = true;
+            return out;
+        }
         let feet = p.pos - Vec3::Y * 1.2;
         let chest = p.pos + Vec3::Y * 0.8;
         let low_clear = g.world.raycast(feet, fwd, 2.5).is_none();
@@ -280,12 +288,13 @@ pub fn route_0_1() -> Vec<Waypoint> {
         w(40.0, -8.0, -551.5, "door 3", 3.0),
         w(40.0, -12.0, -560.0, "fan room walkway", 1.5),
         w(41.0, -12.0, -567.0, "walkway end", 1.2),
-        w(51.0, -8.0, -567.0, "stairs 1", 1.5),
-        w(52.0, -5.0, -576.0, "stairs 2", 1.5),
-        w(55.0, -2.0, -585.0, "stairs 3", 1.5),
-        w(42.0, 1.0, -586.0, "stairs 4", 1.5),
-        hold(33.0, 4.0, -586.0, "fan room platform", 2.0, 3.0),
-        w(22.0, 7.0, -588.0, "upper ledge", 1.5),
+        w(51.0, -8.0, -568.0, "stairs 1", 1.5),
+        w(62.0, -8.0, -569.0, "stairs 1b", 1.5),
+        w(62.0, -5.0, -576.0, "stairs 2", 1.5),
+        w(62.0, -2.0, -585.0, "stairs 3", 1.5),
+        w(42.0, 3.0, -586.0, "stairs 4", 1.5),
+        hold(39.0, 4.0, -586.0, "fan room platform", 2.0, 3.0),
+        w(22.0, 7.5, -588.0, "upper ledge (jump the gap)", 1.5),
         w(21.0, 7.0, -605.0, "ledge south", 1.5),
         w(35.0, 7.0, -606.0, "ledge east", 1.5),
         w(35.0, 8.0, -619.5, "bridge", 1.2),
@@ -297,7 +306,11 @@ pub fn route_0_1() -> Vec<Waypoint> {
         w(157.0, 28.0, -640.0, "checkpoint 1", 4.0),
         w(180.0, 30.0, -640.0, "combo hallway", 6.0),
         w(192.0, 30.0, -594.5, "door 7", 3.0),
-        w(182.0, 56.0, -579.0, "projectile zombies room", 6.0),
+        w(192.0, 30.0, -599.0, "past door 7", 1.5),
+        w(201.0, 37.0, -597.0, "east stairs", 1.5),
+        w(205.0, 52.0, -593.0, "upper corridor", 2.0),
+        hold(205.0, 52.0, -575.0, "upper corridor north", 2.0, 2.0),
+        w(205.0, 52.0, -555.0, "upper corridor 2", 2.0),
         w(202.0, 53.0, -542.0, "checkpoint 5", 4.0),
         w(202.0, 54.0, -533.5, "door 8", 3.0),
         w(202.0, 53.0, -493.0, "boss hallway", 5.0),

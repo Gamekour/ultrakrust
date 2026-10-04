@@ -139,6 +139,12 @@ pub struct Player {
     pub invincible_layer: bool,
     pub hurt_invincibility: f32,
 
+    // ClimbStep
+    climb_cooldown: f32,
+    move_dir: Vec3,
+    /// Height the player was just lifted by ClimbStep; the camera absorbs it smoothly.
+    pub eye_offset: f32,
+
     pub events: Vec<Event>,
     contact_normals: Vec<Vec3>,
 }
@@ -206,6 +212,9 @@ impl Player {
             cam_reset_requested: false,
             invincible_layer: false,
             hurt_invincibility: 0.0,
+            climb_cooldown: 0.0,
+            move_dir: Vec3::ZERO,
+            eye_offset: 0.0,
             events: Vec::new(),
             contact_normals: Vec::new(),
         }
@@ -716,6 +725,13 @@ impl Player {
     /// Unity `FixedUpdate` + one physics step (dt = [`FIXED_DT`]).
     pub fn fixed_update(&mut self, world: &World, input: &Input) {
         let dt = FIXED_DT;
+        // ClimbStep.FixedUpdate
+        self.climb_cooldown = (self.climb_cooldown - dt).max(0.0);
+        self.move_dir = if self.activated {
+            clamp_magnitude(input.move_axis.x * self.right() + input.move_axis.y * self.forward(), 1.0)
+        } else {
+            Vec3::ZERO
+        };
         self.prev_pos = self.pos;
         self.friction = 1.0;
         if self.sliding {
@@ -923,6 +939,8 @@ impl Player {
         let travel = self.vel.length() * dt;
         let steps = ((travel / 0.2).ceil() as usize).clamp(1, 64);
         let sub = dt / steps as f32;
+        let pre_vel = self.vel;
+        let mut walls: Vec<Vec3> = Vec::new();
         for _ in 0..steps {
             self.pos += self.vel * sub;
             let mut cap = self.capsule();
@@ -935,9 +953,62 @@ impl Player {
                 if into < 0.0 {
                     self.vel -= *n * into;
                 }
+                if n.y.abs() < 0.1 && !walls.iter().any(|w| w.dot(*n) > 0.99) {
+                    walls.push(*n);
+                }
+            }
+        }
+        for n in walls {
+            if self.climb_step(world, n, pre_vel) {
+                break;
             }
         }
         self.update_triggers(world);
+    }
+
+    /// ClimbStep.HandleCollision: walking (or dashing) into a near-vertical surface with
+    /// almost no vertical speed lifts the player onto ledges up to 2.1 high.
+    fn climb_step(&mut self, world: &World, normal: Vec3, pre_vel: Vec3) -> bool {
+        const STEP: f32 = 2.1;
+        const DELTA_H: f32 = 0.6;
+        let up = Vec3::Y;
+        if self.gc.forced_off > 0 || self.climb_cooldown > 0.0 {
+            return false;
+        }
+        let vertical_speed = self.vel.dot(up).abs();
+        if vertical_speed >= 0.1 || normal.dot(up).abs() >= 0.1 {
+            return false;
+        }
+        let nh = project_on_plane(normal, up).normalize_or_zero();
+        let wants = if self.boost { self.dodge_direction.dot(-nh) > 0.5 } else { self.move_dir.dot(-nh) > 0.5 };
+        if !wants {
+            return false;
+        }
+        let mut position = self.pos + up * STEP + up * 0.25;
+        if self.sliding {
+            position += up * 1.125;
+        }
+        let free1 = world.overlap_capsule(Capsule { a: position - up * STEP, b: position + up * 1.25, radius: 0.499_999 }).is_empty();
+        let free2 = world
+            .overlap_capsule(Capsule { a: position - up * 1.25 - nh * 0.5, b: position + up * 1.25 - nh * 0.5, radius: 0.5 })
+            .is_empty();
+        if !(free1 && free2) {
+            return false;
+        }
+        self.climb_cooldown = 0.1;
+        let probe = position - up * 1.75 - nh * DELTA_H;
+        let delta = match world.raycast(probe, -up, STEP) {
+            None => up * STEP - nh * DELTA_H,
+            Some(h) => {
+                self.vel -= up * self.vel.dot(up);
+                up * (STEP - h.distance) - nh * DELTA_H
+            }
+        };
+        self.shift(delta);
+        self.eye_offset += delta.y;
+        // rb.velocity = -relativeVelocity: keep the pre-contact velocity
+        self.vel = Vec3::new(pre_vel.x, self.vel.y, pre_vel.z);
+        true
     }
 
     fn update_triggers(&mut self, world: &World) {

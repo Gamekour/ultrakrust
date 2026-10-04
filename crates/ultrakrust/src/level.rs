@@ -168,7 +168,10 @@ fn material(
             })
             .clone()
     });
+    // Light shafts / additive effects glow instead of covering what's behind them.
+    let additive = m.name.contains("LightPillar") || m.name.contains("Additive") || m.name.contains("Glow");
     let alpha_mode = match &tex {
+        _ if additive => AlphaMode::Add,
         _ if m.transparent => AlphaMode::Blend,
         Some((_, true)) => AlphaMode::Mask(0.5),
         _ => AlphaMode::Opaque,
@@ -182,6 +185,7 @@ fn material(
         base_color_texture: tex.map(|t| t.0),
         uv_transform: Affine2::from_scale_angle_translation(Vec2::from(m.tex_scale), 0.0, Vec2::from(m.tex_offset)),
         alpha_mode,
+        unlit: additive,
         perceptual_roughness: 1.0,
         reflectance: 0.1,
         ..default()

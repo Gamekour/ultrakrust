@@ -204,3 +204,23 @@ fn coyote_time_is_0_2s() {
     s.frame(Input { jump_pressed: true, jump_held: true, ..default() });
     assert!(s.p.events.contains(&Event::Jump), "coyote jump should work");
 }
+
+#[test]
+fn climb_step_onto_low_ledge() {
+    // ClimbStep: walking into a 1.0-high step lifts V1 onto it.
+    let mut w = flat();
+    w.add(BoxCollider::new(Vec3::new(0.0, 0.5, -10.0), Vec3::new(10.0, 1.0, 10.0)));
+    let mut s = Sim::new(w, Vec3::new(0.0, 1.5, 0.0));
+    s.run(100, fwd());
+    assert!(s.p.pos.z < -6.0, "should have walked onto the step: {:?}", s.p.pos);
+    assert!((s.p.pos.y - 2.5).abs() < 0.2, "should stand on the step top (y=1 -> 2.5): {:?}", s.p.pos);
+}
+
+#[test]
+fn climb_step_not_onto_tall_wall() {
+    let mut w = flat();
+    w.add(BoxCollider::new(Vec3::new(0.0, 2.5, -10.0), Vec3::new(10.0, 5.0, 10.0)));
+    let mut s = Sim::new(w, Vec3::new(0.0, 1.5, 0.0));
+    s.run(100, fwd());
+    assert!(s.p.pos.z > -5.6, "a 5-high wall must block: {:?}", s.p.pos);
+}
