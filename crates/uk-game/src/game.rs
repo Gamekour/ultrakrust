@@ -83,6 +83,7 @@ pub struct State {
     pub level_complete: bool,
     pub kills: u32,
     pub checkpoint_pos: Option<Vec3>,
+    pub checkpoint_yaw: f32,
 }
 
 pub struct Mover {
@@ -263,6 +264,7 @@ impl Game {
             level_complete: false,
             kills: 0,
             checkpoint_pos: None,
+            checkpoint_yaw: 0.0,
         };
         let mut g = Game {
             def: def.clone(),
@@ -1124,6 +1126,12 @@ impl Game {
 
     pub fn glass_shatter(&mut self, sc: u32) {
         let node = self.def.scripts[sc as usize].node;
+        if std::env::var("DEBUG_BREAK").is_ok() && matches!(&self.s.scripts[sc as usize], Script::Glass(g) if !g.broken) {
+            eprintln!("glass shatter {} at t={:.2} player {:?} wind {:.2}
+{}", self.def.path(node), self.s.time, self.s.player.pos, self.s.player.wind_state,
+                std::backtrace::Backtrace::force_capture().to_string().lines().filter(|l| l.contains("uk_game::")).take(4).collect::<Vec<_>>().join("
+"));
+        }
         let Script::Glass(g) = &mut self.s.scripts[sc as usize] else { return };
         if g.broken {
             return;
@@ -1196,7 +1204,12 @@ impl Game {
         for d in doors {
             self.door_unlock(d);
         }
-        self.s.checkpoint_pos = Some(self.s.player.pos);
+        // CheckPoint.OnRespawn: player at checkpoint position + up * 1.25, facing its forward
+        let node = self.def.scripts[sc as usize].node;
+        let (_, rot, pos) = self.def.nodes[node as usize].world0.to_scale_rotation_translation();
+        self.s.checkpoint_pos = Some(pos + rot * Vec3::Y * 1.25);
+        let fwd = rot * Vec3::NEG_Z;
+        self.s.checkpoint_yaw = fwd.x.atan2(-fwd.z).to_degrees();
         self.events.push(GameEvent::Checkpoint);
         self.checkpoint = Some(Box::new(self.s.clone()));
     }
@@ -1207,7 +1220,7 @@ impl Game {
             return;
         }
         let ev = dz.on_hit_player.clone();
-        let (insta, damage) = (!dz.not_instakill, dz.damage);
+        let (insta, damage, target) = (!dz.not_instakill, dz.damage, dz.respawn_target);
         if insta {
             dz.disabled = true;
         }
@@ -1221,6 +1234,37 @@ impl Game {
             } else if self.s.hp > 1 {
                 let d = self.s.hp - 1;
                 self.hurt_player(d, true);
+            }
+            // send the player back to safety
+            let node = self.def.scripts[sc as usize].node;
+            let up = self.def.nodes[node as usize].world0.transform_vector3(Vec3::Y).normalize_or(Vec3::Y);
+            let dest = match (target, self.s.checkpoint_pos) {
+                (Some(t), _) => t + up * 1.25,
+                (None, Some(c)) => c + Vec3::Y * 1.25,
+                (None, None) => self.start.as_ref().map(|s| s.player.pos).unwrap_or(self.s.player.pos),
+            };
+            self.s.player.vel = Vec3::ZERO;
+            self.s.player.pos = dest;
+            self.s.player.prev_pos = dest;
+        }
+    }
+
+    /// OutOfBoundsTargetSetter.Activate: point death zones' respawn target here.
+    fn oob_target_setter(&mut self, sc: u32) {
+        let Script::OobTargetSetter { death_zones } = &self.s.scripts[sc as usize] else { return };
+        let explicit = !death_zones.is_empty();
+        let list: Vec<u32> = if explicit {
+            death_zones.clone()
+        } else {
+            (0..self.s.scripts.len() as u32).filter(|&i| matches!(self.s.scripts[i as usize], Script::DeathZone(_))).collect()
+        };
+        let node = self.def.scripts[sc as usize].node;
+        let pos = self.def.nodes[node as usize].world0.w_axis.truncate();
+        for d in list {
+            if let Script::DeathZone(dz) = &mut self.s.scripts[d as usize] {
+                if !dz.dont_change_respawn_target || explicit {
+                    dz.respawn_target = Some(pos);
+                }
             }
         }
     }
@@ -1291,6 +1335,12 @@ impl Game {
         }
     }
 
+    /// Is a world point inside a trigger collider (at its current pose)?
+    pub fn point_in_trigger(&self, ci: u32, p: Vec3) -> bool {
+        let cap = Capsule { a: p, b: p, radius: 0.0 };
+        self.trigger_contains(ci, &cap)
+    }
+
     fn update_triggers(&mut self) {
         let cap = self.s.player.capsule();
         let mut now = Vec::new();
@@ -1319,9 +1369,54 @@ impl Game {
         }
     }
 
+    /// OnCollisionEnter for solid colliders the player touches (DeathZone's
+    /// `OnCollisionEnter -> GotHit`, e.g. the fan blades).
+    fn update_contacts(&mut self) {
+        let mut cap = self.s.player.capsule();
+        cap.radius += 0.05;
+        let mut touched = Vec::new();
+        for id in self.world.overlap_capsule(cap) {
+            let o = self.world.owner(id);
+            if o == uk_core::collide::ALWAYS {
+                continue;
+            }
+            let node = self.def.colliders[o as usize].node;
+            if !touched.contains(&node) {
+                touched.push(node);
+            }
+        }
+        for node in touched {
+            let scs: Vec<u32> = self.scripts_by_node[node as usize].clone();
+            for sc in scs {
+                if matches!(self.s.scripts[sc as usize], Script::DeathZone(_)) {
+                    self.death_zone(sc);
+                }
+            }
+        }
+    }
+
+    /// The GameObject of a collider's attached Rigidbody (itself or nearest ancestor with one).
+    fn attached_rigidbody(&self, node: u32) -> Option<u32> {
+        let mut n = node;
+        loop {
+            if self.def.rigidbodies.contains(&n) {
+                return Some(n);
+            }
+            n = self.def.nodes[n as usize].parent?;
+        }
+    }
+
     fn trigger_event(&mut self, ci: u32, enter: bool) {
         let node = self.def.colliders[ci as usize].node;
-        for sc in self.scripts_by_node[node as usize].clone() {
+        // Unity sends trigger messages to the collider's GameObject and to its attached
+        // Rigidbody's GameObject (compound colliders, e.g. CheckPoint + child "Hitbox").
+        let mut targets = self.scripts_by_node[node as usize].clone();
+        if let Some(rb) = self.attached_rigidbody(node) {
+            if rb != node {
+                targets.extend(self.scripts_by_node[rb as usize].iter().copied());
+            }
+        }
+        for sc in targets {
             // Trigger messages reach disabled MonoBehaviours too.
             if !self.s.active[node as usize] && enter {
                 continue;
@@ -1370,6 +1465,7 @@ impl Game {
                 Script::Teleport(_) if enter => self.teleport(sc),
                 Script::PlayerActivator { .. } if enter => self.player_activator(sc),
                 Script::FinalPit if enter => self.complete_level(),
+                Script::OobTargetSetter { .. } if enter => self.oob_target_setter(sc),
                 Script::HudMessage(_) => self.hud_message(sc, enter),
                 _ => {}
             }
@@ -1451,6 +1547,7 @@ impl Game {
         if let Some(p) = self.s.checkpoint_pos {
             self.s.player = Player::new(p);
             self.s.player.activated = true;
+            self.s.player.yaw_deg = self.s.checkpoint_yaw;
         }
         self.s.hp = 100;
         self.s.dead = false;
@@ -1472,16 +1569,57 @@ impl Game {
 
     // ---------------------------------------------------------------- frame stepping
 
+    /// NewMovement.FixedUpdate: while windState > 0, whatever the player is about to
+    /// sweep into this step breaks (weak Breakables, Glass on layers 8/24).
+    fn wind_sweep(&mut self) {
+        let p = &self.s.player;
+        if p.wind_state <= 0.0 {
+            return;
+        }
+        let dist = p.vel.length() * uk_core::consts::FIXED_DT;
+        if dist <= 0.0 {
+            return;
+        }
+        let cap = p.capsule();
+        let dir = p.vel / p.vel.length();
+        let mut hit_nodes = Vec::new();
+        // Unity's SweepTest ignores colliders already in contact (contact offset 0.01),
+        // so the floor under the player's feet must not count.
+        for c in [cap.a, (cap.a + cap.b) * 0.5, cap.b] {
+            if let Some(h) = self.world.sphere_cast(c, cap.radius - 0.03, dir, dist + 0.01) {
+                let owner = self.world.owner(h.collider);
+                if owner != uk_core::collide::ALWAYS {
+                    let col = &self.def.colliders[owner as usize];
+                    if col.layer == 8 || col.layer == 24 {
+                        hit_nodes.push(col.node);
+                    }
+                }
+            }
+        }
+        for n in hit_nodes {
+            let scs: Vec<u32> = self.def.scripts_on(n).map(|(i, _)| i).collect();
+            for sc in scs {
+                match &self.s.scripts[sc as usize] {
+                    Script::Breakable(b) if !b.precision_only => self.breakable_break(sc, 99999.0),
+                    Script::Glass(_) => self.glass_shatter(sc),
+                    _ => {}
+                }
+            }
+        }
+    }
+
     /// Unity FixedUpdate + physics at 125 Hz.
     pub fn fixed_update(&mut self, input: &Input) {
         if self.s.dead || self.s.level_complete {
             return;
         }
         self.sync_world();
+        self.wind_sweep();
         let world = std::mem::take(&mut self.world);
         self.s.player.fixed_update(&world, input);
         self.world = world;
         self.update_triggers();
+        self.update_contacts();
         for sc in 0..self.s.scripts.len() as u32 {
             if matches!(self.s.scripts[sc as usize], Script::Wave(_)) && self.script_live(sc) {
                 self.wave_fixed(sc);

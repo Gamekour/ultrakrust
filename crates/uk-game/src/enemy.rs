@@ -277,6 +277,7 @@ fn player_target(g: &Game) -> Vec3 {
 pub fn fixed_update(g: &mut Game) {
     let dt = FIXED_DT;
     let target = player_target(g);
+    let mut out_of_world = Vec::new();
     for i in 0..g.s.enemies.len() {
         let node = g.s.enemies[i].node;
         if !g.s.active[node as usize] {
@@ -336,7 +337,43 @@ pub fn fixed_update(g: &mut Game) {
             }
         }
         if en.pos.y < -1000.0 {
-            en.alive = false;
+            out_of_world.push(i);
+        }
+    }
+    // enemies that fell out of the level still count as dead for their wave
+    for i in out_of_world {
+        kill_enemy(g, i);
+    }
+    // DeathZones affect enemies too (AffectedSubjects All / EnemiesOnly)
+    let zones: Vec<(u32, u32)> = g
+        .triggers
+        .iter()
+        .copied()
+        .filter_map(|ci| {
+            let node = g.def.colliders[ci as usize].node;
+            if !g.s.active[node as usize] || !g.s.collider_enabled[ci as usize] {
+                return None;
+            }
+            g.def.scripts_on(node).find(|(_, s)| s.class == "DeathZone").map(|(sc, _)| (ci, sc))
+        })
+        .collect();
+    if !zones.is_empty() {
+        let mut doomed = Vec::new();
+        for (i, en) in g.s.enemies.iter().enumerate() {
+            if !en.alive || !g.s.active[en.node as usize] || en.kind == Kind::MaliciousFace {
+                continue;
+            }
+            let c = en.center();
+            for &(ci, sc) in &zones {
+                let affects_enemies = matches!(&g.s.scripts[sc as usize], Script::DeathZone(dz) if dz.enemy_affected);
+                if affects_enemies && g.point_in_trigger(ci, c) {
+                    doomed.push(i);
+                    break;
+                }
+            }
+        }
+        for i in doomed {
+            kill_enemy(g, i);
         }
     }
     // projectiles
@@ -659,6 +696,26 @@ impl Game {
         self.events.push(GameEvent::Shot { from: eye, to: end, pierce });
     }
 
+    /// Does this ray hit a Glass object first?
+    pub fn ray_hits_glass(&self, eye: Vec3, dir: Vec3, max: f32) -> bool {
+        let Some(h) = self.world.raycast(eye, dir, max) else { return false };
+        let owner = self.world.owner(h.collider);
+        if owner == uk_core::collide::ALWAYS {
+            return false;
+        }
+        let node = self.def.colliders[owner as usize].node;
+        self.def.scripts_on(node).any(|(sc, _)| matches!(self.s.scripts[sc as usize], Script::Glass(_)))
+    }
+
+    /// Would a revolver shot along this ray hit an enemy before the environment?
+    pub fn aim_hits_enemy(&self, eye: Vec3, dir: Vec3) -> bool {
+        let dir = dir.normalize_or_zero();
+        let env_t = self.world.raycast(eye, dir, 1000.0).map(|h| h.distance).unwrap_or(1000.0);
+        self.s.enemies.iter().any(|en| {
+            en.alive && self.s.active[en.node as usize] && en.spawn_t <= 0.0 && en.raycast(eye, dir, env_t).is_some()
+        })
+    }
+
     fn hit_environment(&mut self, hit: Option<uk_core::collide::RayHit>, damage: f32) {
         let Some(h) = hit else { return };
         let owner = self.world.owner(h.collider);
@@ -726,6 +783,8 @@ impl Game {
                 for sc in scs {
                     if matches!(self.s.scripts[sc as usize], Script::Breakable(_)) {
                         self.breakable_break(sc, 1.0);
+                    } else if matches!(self.s.scripts[sc as usize], Script::Glass(_)) {
+                        self.glass_shatter(sc);
                     }
                 }
             }

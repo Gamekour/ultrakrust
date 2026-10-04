@@ -39,7 +39,7 @@ pub struct Demo {
 }
 
 fn wp(x: f32, y: f32, z: f32, label: &'static str, r: f32) -> Waypoint {
-    Waypoint { pos: Vec3::new(x, y, z), label, radius: r }
+    Waypoint { pos: Vec3::new(x, y, z), label, radius: r, hold: 0.0 }
 }
 
 pub fn script_0_1() -> Vec<Step> {

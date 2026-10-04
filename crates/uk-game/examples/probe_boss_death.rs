@@ -18,7 +18,7 @@ fn main() {
         let n = (0..def.nodes.len() as u32).find(|&n| def.path(n) == r).unwrap(); g.set_active(n, true);
     }
     g.s.player.pos = Vec3::new(202.0, 54.5, -425.0); g.s.player.prev_pos = g.s.player.pos; g.s.player.yaw_deg = 180.0;
-    let mut bot = Bot::new(vec![Waypoint { pos: Vec3::new(202.0, 54.5, -416.0), label: "in", radius: 1.5 }]);
+    let mut bot = Bot::new(vec![Waypoint { pos: Vec3::new(202.0, 54.5, -416.0), label: "in", radius: 1.5, hold: 0.0 }]);
     for i in 0..(125 * 20) {
         let f = bot.think(&g, FIXED_DT);
         g.s.player.yaw_deg = f.yaw_deg;

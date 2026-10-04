@@ -202,8 +202,12 @@ pub struct CheckPoint {
 #[derive(Clone, Debug)]
 pub struct DeathZone {
     pub not_instakill: bool,
+    /// Where a non-lethal hit sends the player (None = Unity's Vector3.zero).
+    pub respawn_target: Option<Vec3>,
+    pub dont_change_respawn_target: bool,
     pub damage: i32,
     pub player_affected: bool,
+    pub enemy_affected: bool,
     pub on_hit_player: UEvent,
     pub disabled: bool,
 }
@@ -262,6 +266,8 @@ pub enum Script {
     /// Index into `State::enemies`.
     Enemy(usize),
     WeaponPickUp,
+    /// OutOfBoundsTargetSetter: explicit death zones (empty = all that allow it).
+    OobTargetSetter { death_zones: Vec<u32> },
     Other,
 }
 
@@ -363,9 +369,12 @@ pub fn parse(def: &SceneDef, idx: usize) -> Script {
         }),
         "DeathZone" => Script::DeathZone(Box::new(DeathZone {
             not_instakill: b("notInstakill"),
+            respawn_target: { let r = v.get("respawnTarget").vec3(); (r != [0.0, 0.0, 0.0]).then(|| uvec(v.get("respawnTarget"))) },
+            dont_change_respawn_target: b("dontChangeRespawnTarget"),
             damage: v.get("damage").i64() as i32,
             // AffectedSubjects: 0 All, 1 EnemiesOnly, 2 PlayerOnly
             player_affected: v.get("affected").i64() != 1,
+            enemy_affected: v.get("affected").i64() != 2,
             on_hit_player: parse_uevent(def, v.get("onHitPlayer")),
             disabled: false,
         })),
@@ -399,6 +408,7 @@ pub fn parse(def: &SceneDef, idx: usize) -> Script {
             shown: false,
         })),
         "WeaponPickUp" => Script::WeaponPickUp,
+        "OutOfBoundsTargetSetter" => Script::OobTargetSetter { death_zones: scripts(def, v.get("deathZones")) },
         _ => Script::Other,
     }
 }

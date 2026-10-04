@@ -14,6 +14,10 @@ fn main() {
     let def = Arc::new(scenedef::load_scene(&mut db, &path).unwrap());
     let mut g = Game::new(def.clone());
     // show everything (inactive rooms too) so the full layout is visible
+    if let Ok(list) = std::env::var("ACTIVATE") {
+        for p in list.split(';') { if let Some(n) = (0..def.nodes.len() as u32).find(|&n| def.path(n) == p) { g.set_active(n, true); } }
+        g.fixed_update(&uk_core::player::Input::default());
+    }
     if std::env::var("ALLROOMS").is_ok() { for o in g.world.owner_enabled.iter_mut() { *o = true; } }
     let mut z = z1;
     print!("      ");
@@ -32,7 +36,9 @@ fn main() {
                     let head = g.world.raycast(Vec3::new(x, fy + 0.1, z), Vec3::Y, 3.6).map(|h2| h2.distance);
                     let body_blocked = !g.world.overlap_sphere(Vec3::new(x, fy + 0.65, z), 0.45).is_empty();
                     if fy > ytop - 1.0 || body_blocked { '#' } else if head.is_some_and(|d| d < 1.3) { '#' } else if head.is_some_and(|d| d < 3.5) { '_' } else {
-                        let band = ((fy + 50.0) / 5.0).floor() as i32;
+                        let base: f32 = std::env::var("BAND_BASE").ok().and_then(|v| v.parse().ok()).unwrap_or(-50.0);
+                        let size: f32 = std::env::var("BAND").ok().and_then(|v| v.parse().ok()).unwrap_or(5.0);
+                        let band = ((fy - base) / size).floor() as i32;
                         std::char::from_digit((band.rem_euclid(10)) as u32, 10).unwrap()
                     }
                 }
