@@ -5172,6 +5172,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "uk-game"
+version = "0.1.0"
+dependencies = [
+ "bevy_math",
+ "uk-assets",
+ "uk-core",
+]
+
+[[package]]
 name = "ultrakrust"
 version = "0.1.0"
 dependencies = [

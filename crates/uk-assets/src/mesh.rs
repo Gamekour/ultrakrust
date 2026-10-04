@@ -17,12 +17,18 @@ pub struct MeshData {
     pub uv0: Vec<[f32; 2]>,
     pub colors: Vec<[f32; 4]>,
     pub submeshes: Vec<SubMesh>,
+    /// Per-vertex (bone indices, weights) for skinned meshes.
+    pub skin: Vec<([u32; 4], [f32; 4])>,
+    /// Inverse bind matrices (Unity space), one per bone.
+    pub bind_poses: Vec<bevy_math::Mat4>,
 }
 
 const CH_POS: usize = 0;
 const CH_NORMAL: usize = 1;
 const CH_COLOR: usize = 3;
 const CH_UV0: usize = 4;
+const CH_WEIGHT: usize = 12;
+const CH_INDEX: usize = 13;
 
 fn format_size(f: i64) -> usize {
     match f {
@@ -138,6 +144,44 @@ pub fn decode(v: &Value, stream_data: Option<&[u8]>) -> Result<MeshData> {
         .map(|n| n.into_iter().map(|c| [c[0], c[1], c[2], *c.get(3).unwrap_or(&1.0)]).collect())
         .unwrap_or_default();
 
+    let weights = read_channel(CH_WEIGHT);
+    let bones = read_channel(CH_INDEX);
+    let skin = match (weights, bones) {
+        (Some(w), Some(b)) => w
+            .into_iter()
+            .zip(b)
+            .map(|(w, b)| {
+                let mut wi = [0.0f32; 4];
+                let mut bi = [0u32; 4];
+                for k in 0..4 {
+                    wi[k] = *w.get(k).unwrap_or(&0.0);
+                    bi[k] = *b.get(k).unwrap_or(&0.0) as u32;
+                }
+                // a single-weight channel means weight 1 for the first bone
+                if w.len() == 1 {
+                    wi[0] = 1.0;
+                }
+                (bi, wi)
+            })
+            .collect(),
+        (None, Some(b)) => b.into_iter().map(|b| ([*b.first().unwrap_or(&0.0) as u32, 0, 0, 0], [1.0, 0.0, 0.0, 0.0])).collect(),
+        _ => Vec::new(),
+    };
+    let bind_poses = v
+        .get("m_BindPose")
+        .array()
+        .iter()
+        .map(|m| {
+            let e = |r: usize, c: usize| m.get(&format!("e{r}{c}")).f32();
+            bevy_math::Mat4::from_cols_array(&[
+                e(0, 0), e(1, 0), e(2, 0), e(3, 0),
+                e(0, 1), e(1, 1), e(2, 1), e(3, 1),
+                e(0, 2), e(1, 2), e(2, 2), e(3, 2),
+                e(0, 3), e(1, 3), e(2, 3), e(3, 3),
+            ])
+        })
+        .collect();
+
     let ib = v.get("m_IndexBuffer").bytes();
     let wide = v.get("m_IndexFormat").i64() == 1;
     let index = |i: usize| -> u32 {
@@ -160,5 +204,5 @@ pub fn decode(v: &Value, stream_data: Option<&[u8]>) -> Result<MeshData> {
         }
         submeshes.push(SubMesh { indices });
     }
-    Ok(MeshData { name: v.get("m_Name").str().to_string(), positions, normals, uv0, colors, submeshes })
+    Ok(MeshData { name: v.get("m_Name").str().to_string(), positions, normals, uv0, colors, submeshes, skin, bind_poses })
 }

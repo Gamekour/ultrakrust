@@ -137,6 +137,50 @@ impl Value {
         [self.get("x").f32(), self.get("y").f32(), self.get("z").f32(), self.get("w").f32()]
     }
 
+    /// Compact JSON-like rendering (byte arrays summarized), for debugging.
+    pub fn compact(&self) -> String {
+        let mut out = String::new();
+        self.write_compact(&mut out);
+        out
+    }
+
+    fn write_compact(&self, o: &mut String) {
+        use std::fmt::Write;
+        match self {
+            Value::Bool(b) => write!(o, "{b}").unwrap(),
+            Value::Int(v) => write!(o, "{v}").unwrap(),
+            Value::UInt(v) => write!(o, "{v}").unwrap(),
+            Value::Float(v) => write!(o, "{v}").unwrap(),
+            Value::Str(s) => write!(o, "{s:?}").unwrap(),
+            Value::Bytes(b) => write!(o, "<{} bytes>", b.len()).unwrap(),
+            Value::Array(a) => {
+                o.push('[');
+                for (i, v) in a.iter().enumerate() {
+                    if i > 0 {
+                        o.push(',');
+                    }
+                    v.write_compact(o);
+                }
+                o.push(']');
+            }
+            Value::Struct(f) => {
+                if f.len() == 2 && &*f[0].0 == "m_FileID" {
+                    write!(o, "@{}:{}", f[0].1.i64(), f[1].1.i64()).unwrap();
+                    return;
+                }
+                o.push('{');
+                for (i, (k, v)) in f.iter().enumerate() {
+                    if i > 0 {
+                        o.push(',');
+                    }
+                    write!(o, "{k}:").unwrap();
+                    v.write_compact(o);
+                }
+                o.push('}');
+            }
+        }
+    }
+
     /// PPtr -> (file_id, path_id).
     pub fn pptr(&self) -> (i32, i64) {
         (self.get("m_FileID").i64() as i32, self.get("m_PathID").i64())

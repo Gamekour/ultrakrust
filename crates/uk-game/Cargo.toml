@@ -1,0 +1,11 @@
+[package]
+name = "uk-game"
+description = "ULTRAKILL level runtime: object activation, triggers, doors, arenas, checkpoints, enemies"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+uk-core = { path = "../uk-core" }
+uk-assets = { path = "../uk-assets" }
+bevy_math.workspace = true

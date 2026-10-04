@@ -134,6 +134,11 @@ pub struct Player {
     pub cam_default_target: Vec3,
     pub cam_reset_requested: bool,
 
+    /// GameObject layer 15 ("Invincible"): set while dashing or just hurt; blocks hits
+    /// that are flagged invincible (most enemy attacks).
+    pub invincible_layer: bool,
+    pub hurt_invincibility: f32,
+
     pub events: Vec<Event>,
     contact_normals: Vec<Vec3>,
 }
@@ -199,6 +204,8 @@ impl Player {
             cam_dodge_direction: 0,
             cam_default_target: CAMERA_POS,
             cam_reset_requested: false,
+            invincible_layer: false,
+            hurt_invincibility: 0.0,
             events: Vec::new(),
             contact_normals: Vec::new(),
         }
@@ -334,6 +341,9 @@ impl Player {
         }
         if self.slam_cooldown > 0.0 {
             self.slam_cooldown = move_towards(self.slam_cooldown, 0.0, dt);
+        }
+        if self.hurt_invincibility >= 0.0 {
+            self.hurt_invincibility = move_towards(self.hurt_invincibility, 0.0, dt);
         }
     }
 
@@ -764,6 +774,9 @@ impl Player {
     fn do_move(&mut self) {
         let dt = FIXED_DT;
         self.slide_ending = false;
+        if self.hurt_invincibility <= 0.0 {
+            self.invincible_layer = false;
+        }
         if self.gc.on_ground && !self.jumping {
             self.current_wall_jumps = 0;
         }
@@ -876,6 +889,7 @@ impl Player {
             self.dashed_from_ground = true;
         }
         self.target_vel = self.dodge_direction * WALK_SPEED * dt * 2.75 + -self.gravity_dir() * num3;
+        self.invincible_layer = true;
         if self.slide_ending {
             self.slide_ending = false;
             if !self.gc.on_ground || self.friction == 0.0 {
@@ -953,7 +967,7 @@ impl Player {
         }
         let mut best = f32::MAX;
         for c in &cols {
-            let p = world.get(*c).closest_point(wc);
+            let p = world.closest_point(*c, wc);
             let d = p.distance(wc);
             if d < best && d < 5.0 {
                 best = d;

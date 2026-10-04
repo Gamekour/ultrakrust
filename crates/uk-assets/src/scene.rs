@@ -369,7 +369,7 @@ pub fn load_level(db: &mut AssetDb, bundle: &std::path::Path, opts: LevelOptions
     Ok(level)
 }
 
-fn bake(b: &mut Batch, mesh: &MeshData, indices: &[u32], m: Mat4) {
+pub(crate) fn bake(b: &mut Batch, mesh: &MeshData, indices: &[u32], m: Mat4) {
     let flip = m.determinant() < 0.0;
     let nm = m.inverse().transpose();
     let mut remap: HashMap<u32, u32> = HashMap::new();

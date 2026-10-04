@@ -2,10 +2,7 @@
 //! a BVH over them, and the queries the movement code needs (raycast, sphere
 //! cast, overlaps, capsule depenetration).
 
-use bevy_math::{Quat, Vec3};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct ColliderId(pub u32);
+use bevy_math::{Affine3A, Quat, Vec3};
 
 #[derive(Clone, Debug)]
 pub struct BoxCollider {
@@ -363,7 +360,7 @@ impl Bvh {
         Self { nodes, order }
     }
 
-    fn query(&self, q: &Aabb, mut f: impl FnMut(u32)) {
+    fn query(&self, q: &Aabb, f: &mut impl FnMut(u32)) {
         if self.nodes.is_empty() {
             return;
         }
@@ -384,7 +381,7 @@ impl Bvh {
         }
     }
 
-    fn query_ray(&self, o: Vec3, d: Vec3, max: f32, mut f: impl FnMut(u32)) {
+    fn query_ray(&self, o: Vec3, d: Vec3, max: f32, f: &mut impl FnMut(u32)) {
         if self.nodes.is_empty() {
             return;
         }
@@ -407,68 +404,173 @@ impl Bvh {
     }
 }
 
+/// Where a shape sits: its group (static level = 0, or a moving body) and index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ColliderId {
+    pub group: u32,
+    pub index: u32,
+}
+
+/// Owner value for shapes that are always enabled.
+pub const ALWAYS: u32 = u32::MAX;
+
+/// A set of shapes sharing one rigid transform (local -> world). Group 0 is the
+/// static level; doors and other moving bodies get their own group.
 #[derive(Default, Clone, Debug)]
-pub struct World {
+pub struct Group {
     pub shapes: Vec<Shape>,
+    /// Per-shape owner (index into `World::owner_enabled`) or [`ALWAYS`].
+    pub owners: Vec<u32>,
     bvh: Bvh,
     built_for: usize,
+    pub xf: Affine3A,
+    pub inv: Affine3A,
+}
+
+impl Group {
+    fn candidates(&self, q: Aabb, f: &mut impl FnMut(u32)) {
+        if self.built_for == self.shapes.len() && !self.shapes.is_empty() {
+            self.bvh.query(&q, f);
+        } else {
+            (0..self.shapes.len() as u32).for_each(f);
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct World {
+    pub groups: Vec<Group>,
+    /// Enabled flag per owner; the game toggles these as objects (de)activate.
+    pub owner_enabled: Vec<bool>,
+}
+
+impl Default for World {
+    fn default() -> Self {
+        Self {
+            groups: vec![Group { xf: Affine3A::IDENTITY, inv: Affine3A::IDENTITY, ..Default::default() }],
+            owner_enabled: Vec::new(),
+        }
+    }
+}
+
+fn aabb_xf(q: Aabb, m: &Affine3A) -> Aabb {
+    let c = m.transform_point3((q.min + q.max) * 0.5);
+    let h = (q.max - q.min) * 0.5;
+    let r = bevy_math::Mat3::from(m.matrix3);
+    let e = Vec3::new(r.row(0).abs().dot(h), r.row(1).abs().dot(h), r.row(2).abs().dot(h));
+    Aabb { min: c - e, max: c + e }
 }
 
 impl World {
     pub fn add(&mut self, b: BoxCollider) -> ColliderId {
-        self.shapes.push(Shape::Box(b));
-        ColliderId(self.shapes.len() as u32 - 1)
+        self.add_shape(0, Shape::Box(b), ALWAYS)
     }
 
     pub fn add_triangle(&mut self, a: Vec3, b: Vec3, c: Vec3) -> ColliderId {
-        self.shapes.push(Shape::Tri(Triangle::new(a, b, c)));
-        ColliderId(self.shapes.len() as u32 - 1)
+        self.add_shape(0, Shape::Tri(Triangle::new(a, b, c)), ALWAYS)
     }
 
-    /// Builds the BVH. Queries before this (or after more adds) fall back to brute force.
+    pub fn add_shape(&mut self, group: usize, shape: Shape, owner: u32) -> ColliderId {
+        let g = &mut self.groups[group];
+        g.shapes.push(shape);
+        g.owners.push(owner);
+        if owner != ALWAYS && owner as usize >= self.owner_enabled.len() {
+            self.owner_enabled.resize(owner as usize + 1, true);
+        }
+        ColliderId { group: group as u32, index: g.shapes.len() as u32 - 1 }
+    }
+
+    /// New moving group; its shapes are given in its local space (the pose at load time).
+    pub fn new_group(&mut self) -> usize {
+        self.groups.push(Group { xf: Affine3A::IDENTITY, inv: Affine3A::IDENTITY, ..Default::default() });
+        self.groups.len() - 1
+    }
+
+    pub fn set_group_transform(&mut self, group: usize, xf: Affine3A) {
+        let g = &mut self.groups[group];
+        g.xf = xf;
+        g.inv = xf.inverse();
+    }
+
+    /// Builds the BVHs. Queries before this (or after more adds) fall back to brute force.
     pub fn build(&mut self) {
-        self.bvh = Bvh::build(&self.shapes);
-        self.built_for = self.shapes.len();
+        for g in &mut self.groups {
+            g.bvh = Bvh::build(&g.shapes);
+            g.built_for = g.shapes.len();
+        }
     }
 
     pub fn get(&self, id: ColliderId) -> &Shape {
-        &self.shapes[id.0 as usize]
+        &self.groups[id.group as usize].shapes[id.index as usize]
     }
 
-    fn candidates(&self, q: Aabb, mut f: impl FnMut(u32)) {
-        if self.built_for == self.shapes.len() && !self.shapes.is_empty() {
-            self.bvh.query(&q, f);
-        } else {
-            (0..self.shapes.len() as u32).for_each(&mut f);
+    pub fn owner(&self, id: ColliderId) -> u32 {
+        self.groups[id.group as usize].owners[id.index as usize]
+    }
+
+    /// Closest point on a shape, in world space.
+    pub fn closest_point(&self, id: ColliderId, p: Vec3) -> Vec3 {
+        let g = &self.groups[id.group as usize];
+        g.xf.transform_point3(g.shapes[id.index as usize].closest_point(g.inv.transform_point3(p)))
+    }
+
+    fn enabled(&self, g: &Group, i: u32) -> bool {
+        let o = g.owners[i as usize];
+        o == ALWAYS || self.owner_enabled.get(o as usize).copied().unwrap_or(true)
+    }
+
+    /// Calls `f(group index, group, shape index)` for enabled shapes whose bounds touch the world-space box.
+    fn each(&self, q: Aabb, mut f: impl FnMut(usize, &Group, u32)) {
+        for (gi, g) in self.groups.iter().enumerate() {
+            let lq = if gi == 0 { q } else { aabb_xf(q, &g.inv) };
+            g.candidates(lq, &mut |i| {
+                if self.enabled(g, i) {
+                    f(gi, g, i)
+                }
+            });
         }
     }
 
     pub fn raycast(&self, origin: Vec3, dir: Vec3, max: f32) -> Option<RayHit> {
+        self.raycast_filtered(origin, dir, max, |_| true)
+    }
+
+    /// Raycast that only considers shapes for which `keep(id)` is true.
+    pub fn raycast_filtered(&self, origin: Vec3, dir: Vec3, max: f32, keep: impl Fn(ColliderId) -> bool) -> Option<RayHit> {
         let dir = dir.normalize_or_zero();
         if dir == Vec3::ZERO {
             return None;
         }
         let mut best: Option<RayHit> = None;
-        let mut test = |i: u32| {
-            if let Some((t, n)) = self.shapes[i as usize].raycast(origin, dir, max) {
-                if best.is_none_or(|h| t < h.distance) {
-                    best = Some(RayHit { distance: t, point: origin + dir * t, normal: n, collider: ColliderId(i) });
+        for (gi, g) in self.groups.iter().enumerate() {
+            let o = g.inv.transform_point3(origin);
+            let d = g.inv.transform_vector3(dir);
+            let mut test = |i: u32| {
+                let id = ColliderId { group: gi as u32, index: i };
+                if !self.enabled(g, i) || !keep(id) {
+                    return;
                 }
+                if let Some((t, n)) = g.shapes[i as usize].raycast(o, d, max) {
+                    if best.is_none_or(|h| t < h.distance) {
+                        best = Some(RayHit { distance: t, point: origin + dir * t, normal: g.xf.transform_vector3(n), collider: id });
+                    }
+                }
+            };
+            if g.built_for == g.shapes.len() && !g.shapes.is_empty() {
+                g.bvh.query_ray(o, d, max, &mut test);
+            } else {
+                (0..g.shapes.len() as u32).for_each(&mut test);
             }
-        };
-        if self.built_for == self.shapes.len() && !self.shapes.is_empty() {
-            self.bvh.query_ray(origin, dir, max, test);
-        } else {
-            (0..self.shapes.len() as u32).for_each(&mut test);
         }
         best
     }
 
     pub fn overlap_sphere(&self, c: Vec3, r: f32) -> Vec<ColliderId> {
         let mut out = Vec::new();
-        self.candidates(Aabb { min: c - Vec3::splat(r), max: c + Vec3::splat(r) }, |i| {
-            if self.shapes[i as usize].dist_sq(c) <= r * r {
-                out.push(ColliderId(i));
+        self.each(Aabb { min: c - Vec3::splat(r), max: c + Vec3::splat(r) }, |gi, g, i| {
+            let lc = g.inv.transform_point3(c);
+            if g.shapes[i as usize].dist_sq(lc) <= r * r {
+                out.push(ColliderId { group: gi as u32, index: i });
             }
         });
         out
@@ -476,10 +578,11 @@ impl World {
 
     pub fn overlap_capsule(&self, cap: Capsule) -> Vec<ColliderId> {
         let mut out = Vec::new();
-        self.candidates(cap.aabb(), |i| {
-            let (p, q) = self.shapes[i as usize].closest_to_segment(cap.a, cap.b);
+        self.each(cap.aabb(), |gi, g, i| {
+            let (a, b) = (g.inv.transform_point3(cap.a), g.inv.transform_point3(cap.b));
+            let (p, q) = g.shapes[i as usize].closest_to_segment(a, b);
             if p.distance_squared(q) <= cap.radius * cap.radius {
-                out.push(ColliderId(i));
+                out.push(ColliderId { group: gi as u32, index: i });
             }
         });
         out
@@ -492,15 +595,17 @@ impl World {
         let q = Aabb { min: origin.min(end) - Vec3::splat(r), max: origin.max(end) + Vec3::splat(r) };
         let mut best: Option<RayHit> = None;
         let step = (r * 0.25).max(0.02);
-        self.candidates(q, |i| {
-            let s = &self.shapes[i as usize];
-            if s.dist_sq(origin) <= r * r {
+        self.each(q, |gi, g, i| {
+            let s = &g.shapes[i as usize];
+            let o = g.inv.transform_point3(origin);
+            let d = g.inv.transform_vector3(dir);
+            if s.dist_sq(o) <= r * r {
                 return;
             }
             let mut t = 0.0f32;
             let mut hit_t = None;
             while t <= max {
-                if s.dist_sq(origin + dir * t) <= r * r {
+                if s.dist_sq(o + d * t) <= r * r {
                     hit_t = Some(t);
                     break;
                 }
@@ -510,17 +615,22 @@ impl World {
             let mut lo = (hi - step).max(0.0);
             for _ in 0..16 {
                 let m = (lo + hi) * 0.5;
-                if s.dist_sq(origin + dir * m) <= r * r {
+                if s.dist_sq(o + d * m) <= r * r {
                     hi = m;
                 } else {
                     lo = m;
                 }
             }
             if best.is_none_or(|h| hi < h.distance) {
-                let c = origin + dir * hi;
-                let point = s.closest_point(c);
-                let normal = (c - point).normalize_or(-dir);
-                best = Some(RayHit { distance: hi, point, normal, collider: ColliderId(i) });
+                let c = o + d * hi;
+                let lp = s.closest_point(c);
+                let ln = (c - lp).normalize_or(-d);
+                best = Some(RayHit {
+                    distance: hi,
+                    point: g.xf.transform_point3(lp),
+                    normal: g.xf.transform_vector3(ln),
+                    collider: ColliderId { group: gi as u32, index: i },
+                });
             }
         });
         best
@@ -528,17 +638,19 @@ impl World {
 
     /// Pushes a capsule out of every shape. Returns the contact normals so the caller can
     /// remove the velocity going into them (frictionless, zero-bounce contact, like
-    /// the player's "NoFriction" PhysicMaterial).
+    /// the player NoFriction PhysicMaterial).
     pub fn depenetrate_capsule(&self, cap: &mut Capsule, normals: &mut Vec<Vec3>) {
-        let mut cands = Vec::new();
+        let mut cands: Vec<(usize, u32)> = Vec::new();
         let margin = Vec3::splat(0.5);
         let q = cap.aabb();
-        self.candidates(Aabb { min: q.min - margin, max: q.max + margin }, |i| cands.push(i));
+        self.each(Aabb { min: q.min - margin, max: q.max + margin }, |gi, _, i| cands.push((gi, i)));
         for _ in 0..4 {
             let mut moved = false;
-            for &i in &cands {
-                let s = &self.shapes[i as usize];
-                let (p, q) = s.closest_to_segment(cap.a, cap.b);
+            for &(gi, i) in &cands {
+                let g = &self.groups[gi];
+                let s = &g.shapes[i as usize];
+                let (a, b) = (g.inv.transform_point3(cap.a), g.inv.transform_point3(cap.b));
+                let (p, q) = s.closest_to_segment(a, b);
                 let d2 = p.distance_squared(q);
                 if d2 >= cap.radius * cap.radius {
                     continue;
@@ -547,12 +659,13 @@ impl World {
                     let d = d2.sqrt();
                     ((p - q) / d, cap.radius - d)
                 } else {
-                    s.deep_push(p, (cap.a + cap.b) * 0.5, cap.radius)
+                    s.deep_push(p, (a + b) * 0.5, cap.radius)
                 };
-                let push = n * (depth + 1e-4);
+                let wn = g.xf.transform_vector3(n);
+                let push = wn * (depth + 1e-4);
                 cap.a += push;
                 cap.b += push;
-                normals.push(n);
+                normals.push(wn);
                 moved = true;
             }
             if !moved {

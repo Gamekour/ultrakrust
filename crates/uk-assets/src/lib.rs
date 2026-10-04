@@ -8,6 +8,7 @@ pub mod db;
 pub mod mesh;
 pub mod reader;
 pub mod scene;
+pub mod scenedef;
 pub mod serialized;
 pub mod texture;
 
