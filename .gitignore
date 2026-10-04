@@ -10,3 +10,6 @@
 parity/report.tsv
 parity/native.tsv
 parity/scenes.tsv
+# translated game shaders / caches must never be committed
+*.wgsl
+*.spv

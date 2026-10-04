@@ -473,23 +473,42 @@ fn skin(mesh: &MeshData, bones: &[Mat4]) -> MeshData {
         .enumerate()
         .map(|(i, b)| *b * mesh.bind_poses.get(i).copied().unwrap_or(Mat4::IDENTITY))
         .collect();
+    let normal_mats: Vec<Mat4> = mats.iter().map(|m| m.inverse().transpose()).collect();
+    // per vertex: is its dominant skinning matrix a reflection?
+    let mut mirrored = vec![false; mesh.positions.len()];
     for (vi, (idx, w)) in mesh.skin.iter().enumerate() {
         let p = Vec3::from(mesh.positions[vi]);
         let n = mesh.normals.get(vi).map(|n| Vec3::from(*n)).unwrap_or(Vec3::Y);
         let (mut pp, mut nn, mut tw) = (Vec3::ZERO, Vec3::ZERO, 0.0);
+        let mut dominant = (0.0f32, false);
         for k in 0..4 {
             if w[k] <= 0.0 {
                 continue;
             }
-            let m = mats.get(idx[k] as usize).copied().unwrap_or(Mat4::IDENTITY);
+            let i = idx[k] as usize;
+            let m = mats.get(i).copied().unwrap_or(Mat4::IDENTITY);
             pp += m.transform_point3(p) * w[k];
-            nn += m.transform_vector3(n) * w[k];
+            nn += normal_mats.get(i).copied().unwrap_or(Mat4::IDENTITY).transform_vector3(n) * w[k];
             tw += w[k];
+            if w[k] > dominant.0 {
+                dominant = (w[k], m.determinant() < 0.0);
+            }
         }
         if tw > 0.0 {
             out.positions[vi] = (pp / tw).to_array();
             if vi < out.normals.len() {
                 out.normals[vi] = nn.normalize_or_zero().to_array();
+            }
+            mirrored[vi] = dominant.1;
+        }
+    }
+    // A reflecting skin matrix reverses a triangle's orientation; reverse its winding back so the
+    // posed mesh (baked with an identity transform) keeps Unity's front faces.
+    for sm in &mut out.submeshes {
+        for t in sm.indices.chunks_exact_mut(3) {
+            let m = t.iter().filter(|&&i| mirrored.get(i as usize).copied().unwrap_or(false)).count();
+            if m >= 2 {
+                t.swap(1, 2);
             }
         }
     }

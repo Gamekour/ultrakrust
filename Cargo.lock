@@ -3485,6 +3485,7 @@ dependencies = [
  "log",
  "num-traits",
  "once_cell",
+ "petgraph",
  "pp-rs",
  "rustc-hash",
  "spirv",
@@ -5161,6 +5162,7 @@ dependencies = [
  "bevy_math",
  "lz4_flex",
  "lzma-rs",
+ "naga",
 ]
 
 [[package]]

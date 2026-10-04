@@ -42,6 +42,24 @@ pub fn all_scenes(install: &Path, r: &mut Report) {
                     }
                     Err(_) => r.note(format!("FAIL game build {short}: panicked")),
                 }
+                // Render geometry orientation: share of triangles whose stored normals point against the
+                // front face Bevy's CCW culling sees. ~0 when winding is right; authored double-sided
+                // cards (5-s tree leaves) keep some levels above zero.
+                let (mut agree, mut against) = (0usize, 0usize);
+                for rd in &def.renderers {
+                    let b = &rd.batch;
+                    for t in b.indices.chunks_exact(3) {
+                        let v = |i: u32| bevy_math::Vec3::from(b.positions[i as usize]);
+                        let n = |i: u32| bevy_math::Vec3::from(b.normals[i as usize]);
+                        let face = (v(t[1]) - v(t[0])).cross(v(t[2]) - v(t[0]));
+                        let vn = n(t[0]) + n(t[1]) + n(t[2]);
+                        if face.length_squared() < 1e-12 || vn.length_squared() < 1e-6 {
+                            continue;
+                        }
+                        if face.dot(vn) >= 0.0 { agree += 1 } else { against += 1 }
+                    }
+                }
+                r.lower(&format!("render.{short}.tris_against_normals_pct"), 100.0 * against as f64 / (agree + against).max(1) as f64, 0.5);
                 for s in def.scripts.iter().filter(|s| !s.class.is_empty()) {
                     total += 1;
                     match status(&s.class) {

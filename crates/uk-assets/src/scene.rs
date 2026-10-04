@@ -388,13 +388,15 @@ pub(crate) fn bake(b: &mut Batch, mesh: &MeshData, indices: &[u32], m: Mat4) {
         local.push(idx);
     }
     for t in local.chunks_exact(3) {
-        // Unity front faces are clockwise (left-handed); mirroring z turns them into
-        // Bevy's counter-clockwise fronts, so winding is kept — unless the object's own
-        // transform is mirrored, which flips it back.
+        // Mirroring z (Unity -> Bevy) is a reflection: it reverses the geometric face normal
+        // (v1-v0)x(v2-v0) but not the stored normals, so the winding must be reversed for faces to
+        // stay front-facing under Bevy's CCW culling. An object whose own transform is mirrored
+        // (det < 0) is reflected once more, which cancels it. Checked by `normals_check` and the
+        // harness (`render.*.tris_against_normals_pct`).
         if flip {
-            b.indices.extend_from_slice(&[t[0], t[2], t[1]]);
-        } else {
             b.indices.extend_from_slice(&[t[0], t[1], t[2]]);
+        } else {
+            b.indices.extend_from_slice(&[t[0], t[2], t[1]]);
         }
     }
 }
