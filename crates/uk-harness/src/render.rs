@@ -55,6 +55,20 @@ pub fn levels(install: &Path, filter: Option<&str>, r: &mut Report) {
         } else {
             r.note(format!("gap: render {l}: no frame read back"));
         }
+        // PostProcessV2 composite: present, and upright (closer to the scene as stored than flipped)
+        let post = grab(&log, "unity post stats").and_then(|line| {
+            let num = |key: &str| line.split(key).nth(1)?.split(|c: char| c == ' ' || c == ')').next()?.parse::<f64>().ok();
+            Some((num("vs scene ")?, num("rows flipped ")?, num("distinct colors ")?))
+        });
+        r.higher(&format!("render.{l}.post_present"), post.is_some() as i32 as f64);
+        match post {
+            Some((same, flip, colors)) => {
+                r.pass(&format!("render.{l}.post_upright"), same <= flip, format!("post vs scene diff {same:.2} > flipped {flip:.2}"));
+                r.info(&format!("render.{l}.post_diff"), same);
+                r.info(&format!("render.{l}.post_distinct_colors"), colors);
+            }
+            None => r.note(format!("gap: render {l}: PostProcessV2 composite not drawn")),
+        }
         if errors == 0 && out.status.success() {
             ok_levels += 1;
         } else {

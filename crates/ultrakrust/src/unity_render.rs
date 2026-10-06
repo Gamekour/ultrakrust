@@ -125,6 +125,15 @@ pub struct SceneData {
     pub ambient: [f32; 4],
     pub clear: [f32; 4],
     pub composite_shader: Handle<Shader>,
+    /// ULTRAKILL's final composite (PostProcessV2_Handler.postProcessV2_VSRM on the Virtual Camera quad).
+    pub post: Option<PostDef>,
+}
+
+pub struct PostDef {
+    pub variant: u32,
+    pub material: Arc<MaterialProps>,
+    /// PostProcessV2_Handler.ditherTexture (scene texture index).
+    pub dither: Option<u32>,
 }
 
 #[derive(Resource, Clone, Default, ExtractResource)]
@@ -296,6 +305,70 @@ fn module_slots(m: &naga::Module, params: &Params, slots: &mut [Vec<Slot>; 2]) {
     }
 }
 
+/// Translates one Vulkan variant (vertex entry holding both stages) into WGSL pipelines' parts.
+fn make_variant(sh: &ShaderAsset, vsub: &uk_assets::shader::SubProgram, shaders: &mut Assets<Shader>, index: usize) -> Result<Variant, String> {
+        let prog = sh.program(vsub.blob).map_err(|e| e.0)?;
+        let params = sh.params(vsub.params).map_err(|e| e.0)?;
+        let vw = prog.stages.first().cloned().flatten().ok_or("no vertex stage")?;
+        let fw = prog.stages.get(1).cloned().flatten().ok_or("no fragment stage")?;
+        let mut vm = parse_spirv(&vw)?;
+        let fm = parse_spirv(&fw)?;
+        link_stages(&mut vm, &fm)?;
+        let vsrc = to_wgsl(&vm)?;
+        let mut fsrc = to_wgsl(&fm)?;
+        // Diagnostics: UNITY_DEBUG_FS="<wgsl expr over the fragment's inputs>" replaces the
+        // color output, so frame statistics can show which input is wrong (no screenshots).
+        let debug_this = std::env::var("UNITY_DEBUG_VARIANT").ok().and_then(|s| s.parse::<u32>().ok()) == Some(vsub.blob);
+        if debug_this {
+            for cb in &params.constant_buffers {
+                eprintln!("CB {} size {}: {}", cb.name, cb.size, cb.params.iter().map(|p| format!("{}@{}{}", p.name, p.offset, if p.array_size > 0 { format!("[{}]", p.array_size) } else { String::new() })).collect::<Vec<_>>().join(" "));
+            }
+            eprintln!("keywords {:?}", prog.keywords);
+        }
+        if let (Ok(expr), true) = (std::env::var("UNITY_DEBUG_FS"), debug_this) {
+            if let Some(i) = fsrc.rfind("return FragmentOutput(") {
+                let start = i + "return FragmentOutput(".len();
+                let end = fsrc[start..].find([',', ')']).map(|e| start + e).unwrap_or(start);
+                fsrc.replace_range(start..end, &format!("vec4<f32>(({expr}).xyz, 1f)"));
+            }
+        }
+        let mut groups: [Vec<Slot>; 2] = [Vec::new(), Vec::new()];
+        module_slots(&vm, &params, &mut groups);
+        module_slots(&fm, &params, &mut groups);
+        if std::env::var_os("UNITY_DEBUG").is_some() && std::env::var("UNITY_DEBUG_VARIANT").ok().and_then(|s| s.parse::<u32>().ok()).is_none_or(|b| b == vsub.blob) {
+            eprintln!("variant {}#{}: group0 {:?}\n   group1 {:?}", sh.name, vsub.blob, groups[0], groups[1]);
+            for (_, g) in fm.global_variables.iter().filter(|(_, g)| g.binding.is_some()) {
+                eprintln!("   fs global {:?} {:?} {:?}", g.binding, g.space, fm.types[g.ty].inner);
+            }
+        }
+        // vertex inputs: component count from the entry point argument types
+        let ep = vm.entry_points.iter().find(|e| e.stage == naga::ShaderStage::Vertex).ok_or("no vertex entry")?;
+        let mut inputs = Vec::new();
+        for a in &ep.function.arguments {
+            let Some(naga::Binding::Location { location, .. }) = a.binding else { continue };
+            let n = match vm.types[a.ty].inner {
+                naga::TypeInner::Vector { size, .. } => size as u32,
+                _ => 1,
+            };
+            let ch = prog.channels.iter().find(|c| c.1 == location).map(|c| c.0).unwrap_or(0);
+            inputs.push((location, ch, n));
+        }
+        inputs.sort();
+        let stride = inputs.iter().map(|i| i.2 as u64 * 4).sum();
+        // unique per variant: levels can carry several copies of one shader (same name and
+        // blob index, different programs), and pipeline/layout caches must not mix them up
+        let label = format!("{}#{}@{}", sh.name, vsub.blob, index);
+        Ok(Variant {
+            vs: shaders.add(Shader::from_wgsl(vsrc, format!("unity/{label}/vs.wgsl"))),
+            fs: shaders.add(Shader::from_wgsl(fsrc, format!("unity/{label}/fs.wgsl"))),
+            label,
+            groups,
+            params,
+            inputs,
+            stride,
+        })
+}
+
 fn state_u8(v: &uk_assets::shader::StateValue, m: &MaterialProps) -> u8 {
     v.resolve(&m.floats).round().clamp(0.0, 255.0) as u8
 }
@@ -365,68 +438,7 @@ pub fn build(
             continue;
         };
         let vid = *variant_ids.entry((skey.0.clone(), skey.1, vsub.blob)).or_insert_with(|| {
-            let res = (|| -> Result<Variant, String> {
-                let prog = sh.program(vsub.blob).map_err(|e| e.0)?;
-                let params = sh.params(vsub.params).map_err(|e| e.0)?;
-                let vw = prog.stages.first().cloned().flatten().ok_or("no vertex stage")?;
-                let fw = prog.stages.get(1).cloned().flatten().ok_or("no fragment stage")?;
-                let mut vm = parse_spirv(&vw)?;
-                let fm = parse_spirv(&fw)?;
-                link_stages(&mut vm, &fm)?;
-                let vsrc = to_wgsl(&vm)?;
-                let mut fsrc = to_wgsl(&fm)?;
-                // Diagnostics: UNITY_DEBUG_FS="<wgsl expr over the fragment's inputs>" replaces the
-                // color output, so frame statistics can show which input is wrong (no screenshots).
-                let debug_this = std::env::var("UNITY_DEBUG_VARIANT").ok().and_then(|s| s.parse::<u32>().ok()) == Some(vsub.blob);
-                if debug_this {
-                    for cb in &params.constant_buffers {
-                        eprintln!("CB {} size {}: {}", cb.name, cb.size, cb.params.iter().map(|p| format!("{}@{}{}", p.name, p.offset, if p.array_size > 0 { format!("[{}]", p.array_size) } else { String::new() })).collect::<Vec<_>>().join(" "));
-                    }
-                    eprintln!("keywords {:?}", prog.keywords);
-                }
-                if let (Ok(expr), true) = (std::env::var("UNITY_DEBUG_FS"), debug_this) {
-                    if let Some(i) = fsrc.rfind("return FragmentOutput(") {
-                        let start = i + "return FragmentOutput(".len();
-                        let end = fsrc[start..].find([',', ')']).map(|e| start + e).unwrap_or(start);
-                        fsrc.replace_range(start..end, &format!("vec4<f32>(({expr}).xyz, 1f)"));
-                    }
-                }
-                let mut groups: [Vec<Slot>; 2] = [Vec::new(), Vec::new()];
-                module_slots(&vm, &params, &mut groups);
-                module_slots(&fm, &params, &mut groups);
-                if std::env::var_os("UNITY_DEBUG").is_some() && std::env::var("UNITY_DEBUG_VARIANT").ok().and_then(|s| s.parse::<u32>().ok()).is_none_or(|b| b == vsub.blob) {
-                    eprintln!("variant {}#{}: group0 {:?}\n   group1 {:?}", sh.name, vsub.blob, groups[0], groups[1]);
-                    for (_, g) in fm.global_variables.iter().filter(|(_, g)| g.binding.is_some()) {
-                        eprintln!("   fs global {:?} {:?} {:?}", g.binding, g.space, fm.types[g.ty].inner);
-                    }
-                }
-                // vertex inputs: component count from the entry point argument types
-                let ep = vm.entry_points.iter().find(|e| e.stage == naga::ShaderStage::Vertex).ok_or("no vertex entry")?;
-                let mut inputs = Vec::new();
-                for a in &ep.function.arguments {
-                    let Some(naga::Binding::Location { location, .. }) = a.binding else { continue };
-                    let n = match vm.types[a.ty].inner {
-                        naga::TypeInner::Vector { size, .. } => size as u32,
-                        _ => 1,
-                    };
-                    let ch = prog.channels.iter().find(|c| c.1 == location).map(|c| c.0).unwrap_or(0);
-                    inputs.push((location, ch, n));
-                }
-                inputs.sort();
-                let stride = inputs.iter().map(|i| i.2 as u64 * 4).sum();
-                // unique per variant: levels can carry several copies of one shader (same name and
-                // blob index, different programs), and pipeline/layout caches must not mix them up
-                let label = format!("{}#{}@{}", sh.name, vsub.blob, variants.len());
-                Ok(Variant {
-                    vs: shaders.add(Shader::from_wgsl(vsrc, format!("unity/{label}/vs.wgsl"))),
-                    fs: shaders.add(Shader::from_wgsl(fsrc, format!("unity/{label}/fs.wgsl"))),
-                    label,
-                    groups,
-                    params,
-                    inputs,
-                    stride,
-                })
-            })();
+            let res = make_variant(&sh, &vsub, shaders, variants.len());
             match res {
                 Ok(v) => {
                     variants.push(v);
@@ -528,6 +540,25 @@ pub fn build(
             radius: (hi - lo).length() * 0.5,
         });
     }
+    // the final composite: GameController's PostProcessV2_Handler names the material and dither texture
+    let post = (|| {
+        let h = def.scripts.iter().find(|s| s.class == "PostProcessV2_Handler")?;
+        let f = db.file(&def.scene_file).ok()?;
+        let (mf, mid) = db.resolve(&f, h.data.get("postProcessV2_VSRM").pptr()).ok().flatten()?;
+        let props = MaterialProps::from_value(&mf.read_id(mid).ok()?);
+        let (sf, sid) = db.resolve(&mf, props.shader).ok().flatten()?;
+        let sh = ShaderAsset::from_value(&sf.read_id(sid).ok()?).ok()?;
+        let kw: Vec<&str> = props.keywords.iter().map(|s| s.as_str()).collect();
+        let vsub = sh.select(&sh.passes.first()?.vertex, &kw)?.clone();
+        let var = make_variant(&sh, &vsub, shaders, variants.len()).map_err(|e| warn!("post-process variant: {e}")).ok()?;
+        variants.push(var);
+        let dither = db.resolve(&f, h.data.get("ditherTexture").pptr()).ok().flatten().and_then(|(tf, tid)| {
+            let t = uk_assets::texture::decode_texture(db, &tf.read_id(tid).ok()?).ok()?;
+            textures.push(TexCpu { width: t.width, height: t.height, rgba: t.rgba, filter: t.filter, wrap: t.wrap });
+            Some(textures.len() as u32 - 1)
+        });
+        Some(PostDef { variant: variants.len() as u32 - 1, material: Arc::new(props), dither })
+    })();
     let rs = &def.render_settings;
     let lights = def
         .lights
@@ -538,7 +569,8 @@ pub fn build(
     let mut sk: Vec<_> = skipped.into_iter().collect();
     sk.sort_by(|a, b| b.1.cmp(&a.1));
     let summary = format!(
-        "unity shaders: {} variants, {}/{} renderers drawn, {} textures, {} lights; skipped: {:?}",
+        "unity shaders: post-process {}, {} variants, {}/{} renderers drawn, {} textures, {} lights; skipped: {:?}",
+        post.as_ref().map_or("missing".to_string(), |p| format!("{} dither {:?}", variants[p.variant as usize].label, p.dither.map(|t| (textures[t as usize].width, textures[t as usize].height)))),
         variants.len(),
         draws.len(),
         total,
@@ -556,6 +588,7 @@ pub fn build(
         ambient: rs.ambient_sky,
         clear: CLEAR,
         composite_shader: shaders.add(Shader::from_wgsl(COMPOSITE_WGSL, "unity/composite.wgsl")),
+        post,
     };
     (scene, summary)
 }
@@ -620,6 +653,50 @@ struct UnityGpu {
     ubo: Option<Buffer>,
     staging: Vec<u8>,
     composite: Option<(CachedRenderPipelineId, BindGroupLayoutDescriptor, Sampler)>,
+    post: Option<PostGpu>,
+    /// PostProcessV2 output (what the Virtual Camera puts on screen), same size as the scene target.
+    post_target: Option<(Texture, TextureView)>,
+    post_readback: std::sync::Mutex<Option<Buffer>>,
+}
+
+struct PostGpu {
+    pipeline: CachedRenderPipelineId,
+    layouts: [BindGroupLayoutDescriptor; 2],
+    ubufs: Vec<(u32, Buffer, usize)>,
+    vbuf: Buffer,
+    dither: (TextureView, Sampler),
+    main_sampler: Sampler,
+}
+
+/// PostProcessV2's constant buffers: the handler's globals at default settings (pixelization off ->
+/// full resolution, colorCompression -> 32 levels, dithering 0.2, gamma 1, no hurt flash). The quad
+/// is a clip-space triangle (identity matrices); `_ProjectionParams.x = -1` is Unity's flipped
+/// render-texture convention, since the scene target is stored top row first.
+fn fill_post_cb(out: &mut [u8], cb: &uk_assets::shader::ConstantBuffer, mat: &MaterialProps, size: UVec2) {
+    out.fill(0);
+    for p in &cb.params {
+        let v: Vec<f32> = if p.is_matrix {
+            Mat4::IDENTITY.to_cols_array().to_vec()
+        } else {
+            let v = match p.name.as_str() {
+                "_ProjectionParams" => [-1.0, NEAR, FAR, 1.0 / FAR],
+                "_VirtualRes" => [size.x as f32, size.y as f32, 0.0, 0.0],
+                "_ColorPrecision" => [32.0, 0.0, 0.0, 0.0],
+                "_DitherStrength" => [0.2, 0.0, 0.0, 0.0],
+                "_Gamma" => [1.0, 0.0, 0.0, 0.0],
+                "_HurtScreenColor" => [0.0; 4],
+                n => mat.vector(n).unwrap_or([0.0; 4]),
+            };
+            v[..p.cols.clamp(1, 4) as usize].to_vec()
+        };
+        for (k, f) in v.iter().enumerate() {
+            let o = p.offset as usize + k * 4;
+            if o + 4 <= out.len() {
+                let bytes = if p.ty == 1 { (*f as i32).to_le_bytes() } else { f.to_le_bytes() };
+                out[o..o + 4].copy_from_slice(&bytes);
+            }
+        }
+    }
 }
 
 const COLOR_FORMAT: TextureFormat = TextureFormat::Rgba8Unorm;
@@ -1079,6 +1156,44 @@ fn prepare(
         }
         gpu.draws = draws;
         gpu.ubo = ubo;
+        gpu.post = scene.post.as_ref().map(|p| {
+            let var = &scene.variants[p.variant as usize];
+            let layouts = [
+                BindGroupLayoutDescriptor::new("unity post g0", &layout_entries(&var.groups[0])),
+                BindGroupLayoutDescriptor::new("unity post g1", &layout_entries(&var.groups[1])),
+            ];
+            let ubufs = var.groups[1]
+                .iter()
+                .filter_map(|s| match s {
+                    Slot::Uniform { binding, cb } => {
+                        let size = var.params.constant_buffers.get(*cb).map_or(16, |c| c.size.next_multiple_of(16).max(16)) as u64;
+                        let b = dev.create_buffer(&BufferDescriptor { label: Some("unity post cb"), size, usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST, mapped_at_creation: false });
+                        Some((*binding, b, *cb))
+                    }
+                    _ => None,
+                })
+                .collect();
+            // one clip-space triangle covering the screen
+            let mut verts: Vec<u8> = Vec::new();
+            for c in [[-1.0f32, -1.0], [3.0, -1.0], [-1.0, 3.0]] {
+                for &(_, _, n) in &var.inputs {
+                    for f in [c[0], c[1], 0.5, 1.0].iter().take(n as usize) {
+                        verts.extend_from_slice(&f.to_le_bytes());
+                    }
+                }
+            }
+            let vbuf = dev.create_buffer_with_data(&BufferInitDescriptor { label: Some("unity post vb"), contents: &verts, usage: BufferUsages::VERTEX });
+            // PostProcessV2's pass: Cull Off, ZWrite Off, ZTest Always, Blend One Zero
+            let state = DrawState { cull: 0, zwrite: false, ztest: 8, src: 1, dst: 0, src_a: 1, dst_a: 0, op: 0, mask: 15 };
+            let mut desc = pipeline_descriptor(var, &layouts, state);
+            desc.depth_stencil = None;
+            let dither = match p.dither {
+                Some(t) => (tex_views[t as usize].clone(), sampler_for(&dev, scene.textures.get(t as usize))),
+                None => (white.clone(), sampler_for(&dev, None)),
+            };
+            let main_sampler = dev.create_sampler(&SamplerDescriptor { label: Some("unity post main"), ..default() });
+            PostGpu { pipeline: cache.queue_render_pipeline(desc), layouts, ubufs, vbuf, dither, main_sampler }
+        });
     }
     // composite pipeline
     if gpu.composite.is_none() {
@@ -1140,6 +1255,18 @@ fn prepare(
         let cv = color.create_view(&TextureViewDescriptor::default());
         let dv = depth.create_view(&TextureViewDescriptor::default());
         gpu.target = Some((size, color, cv, dv));
+        let post = dev.create_texture(&TextureDescriptor {
+            label: Some("unity post output"),
+            size: Extent3d { width: size.x, height: size.y, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: COLOR_FORMAT,
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let pv = post.create_view(&TextureViewDescriptor::default());
+        gpu.post_target = Some((post, pv));
     }
     // camera: Bevy view -> Unity space (Unity world = Bevy world mirrored in z)
     let mirror = Mat4::from_scale(Vec3::new(1.0, 1.0, -1.0));
@@ -1272,6 +1399,15 @@ fn prepare(
     }
     gpu.staging = staging;
     gpu.in_view = in_view;
+    if let (Some(post), Some(pd)) = (&gpu.post, scene.post.as_ref()) {
+        let var = &scene.variants[pd.variant as usize];
+        for (_, buf, cb) in &post.ubufs {
+            let Some(cbd) = var.params.constant_buffers.get(*cb) else { continue };
+            let mut bytes = vec![0u8; buf.size() as usize];
+            fill_post_cb(&mut bytes, cbd, &pd.material, size);
+            queue.write_buffer(buf, 0, &bytes);
+        }
+    }
     if std::env::var_os("UNITY_FRAME_STATS").is_some() && gpu.frames.load(std::sync::atomic::Ordering::Relaxed) == 240 {
         info!("unity prepare: {:.2} ms; draws in view {}/{}", t_prepare.elapsed().as_secs_f64() * 1e3, gpu.in_view.iter().filter(|v| **v).count(), gpu.in_view.len());
     }
@@ -1397,6 +1533,50 @@ fn draw(
             pass.draw_indexed(0..d.count, 0, 0..1);
         }
     }
+    // ULTRAKILL's final composite (PostProcessV2) into the post target
+    let mut shown = color;
+    if let (Some(post), Some(pd), Some((_, pv))) = (&gpu.post, scene.post.as_ref(), gpu.post_target.as_ref()) {
+        if let Some(p) = cache.get_render_pipeline(post.pipeline) {
+            let dev = world.resource::<RenderDevice>();
+            let var = &scene.variants[pd.variant as usize];
+            let mut e0 = Vec::new();
+            for s in &var.groups[0] {
+                match s {
+                    Slot::Texture { binding, name, .. } => {
+                        let view = if name == "_MainTex" { color } else { &post.dither.0 };
+                        e0.push(BindGroupEntry { binding: *binding, resource: BindingResource::TextureView(view) });
+                    }
+                    Slot::Sampler { binding, .. } => {
+                        // split samplers sit SAMPLER_BINDING_OFFSET above their texture
+                        let tex = var.groups[0].iter().find_map(|t| match t {
+                            Slot::Texture { binding: tb, name, .. } if *tb + uk_assets::spirv::SAMPLER_BINDING_OFFSET == *binding => Some(name.as_str()),
+                            _ => None,
+                        });
+                        let smp = if tex == Some("_MainTex") { &post.main_sampler } else { &post.dither.1 };
+                        e0.push(BindGroupEntry { binding: *binding, resource: BindingResource::Sampler(smp) });
+                    }
+                    _ => {}
+                }
+            }
+            let e1: Vec<BindGroupEntry> = post.ubufs.iter().map(|(b, buf, _)| BindGroupEntry { binding: *b, resource: buf.as_entire_binding() }).collect();
+            let bg0 = dev.create_bind_group("unity post g0", &cache.get_bind_group_layout(&post.layouts[0]), &e0);
+            let bg1 = dev.create_bind_group("unity post g1", &cache.get_bind_group_layout(&post.layouts[1]), &e1);
+            let mut pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
+                label: Some("unity post"),
+                color_attachments: &[Some(RenderPassColorAttachment { view: pv, depth_slice: None, resolve_target: None, ops: Operations { load: LoadOp::Clear(wgpu_types::Color::BLACK), store: StoreOp::Store } })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_render_pipeline(p);
+            pass.set_bind_group(0, &bg0, &[]);
+            pass.set_bind_group(1, &bg1, &[]);
+            pass.set_vertex_buffer(0, post.vbuf.slice(..));
+            pass.draw(0..3, 0..1);
+            shown = pv;
+        }
+    }
     // numeric frame check: copy one frame of the scene target back to the CPU
     let n = gpu.frames.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if n == 240 && std::env::var_os("UNITY_FRAME_STATS").is_some() {
@@ -1417,15 +1597,24 @@ fn draw(
             Extent3d { width: size.x, height: size.y, depth_or_array_layers: 1 },
         );
         *gpu.readback.lock().unwrap() = Some((buf, row, *size, false));
+        if let (Some((ptex, _)), false) = (gpu.post_target.as_ref(), std::ptr::eq(shown, color)) {
+            let pbuf = dev.create_buffer(&BufferDescriptor { label: Some("unity post readback"), size: (row * size.y) as u64, usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ, mapped_at_creation: false });
+            ctx.command_encoder().copy_texture_to_buffer(
+                ptex.as_image_copy(),
+                TexelCopyBufferInfo { buffer: &pbuf, layout: TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(size.y) } },
+                Extent3d { width: size.x, height: size.y, depth_or_array_layers: 1 },
+            );
+            *gpu.post_readback.lock().unwrap() = Some(pbuf);
+        }
     }
-    // composite onto the camera's view (gamma -> linear)
+    // composite onto the camera's view (gamma -> linear): PostProcessV2's output, else the raw scene
     let Some((pid, layout, sampler)) = gpu.composite.as_ref() else { return };
     let Some(p) = cache.get_render_pipeline(*pid) else { return };
     let dev = world.resource::<RenderDevice>();
     let bg = dev.create_bind_group(
         "unity composite",
         &cache.get_bind_group_layout(layout),
-        &[BindGroupEntry { binding: 0, resource: BindingResource::TextureView(color) }, BindGroupEntry { binding: 1, resource: BindingResource::Sampler(sampler) }],
+        &[BindGroupEntry { binding: 0, resource: BindingResource::TextureView(shown) }, BindGroupEntry { binding: 1, resource: BindingResource::Sampler(sampler) }],
     );
     let mut pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
         label: Some("unity composite"),
@@ -1483,4 +1672,26 @@ fn frame_stats(gpu: Res<UnityGpu>, dev: Res<RenderDevice>, scene: Res<UnityScene
         sum[2] as f64 / n,
         distinct.len()
     );
+    // PostProcessV2 output against the scene it read: mean |post - scene| as stored and with rows
+    // flipped (orientation check), and its distinct colors (dither + 32-level quantization)
+    if let Some(pbuf) = gpu.post_readback.lock().unwrap().take() {
+        let ps = pbuf.slice(..);
+        ps.map_async(MapMode::Read, |_| {});
+        let _ = dev.poll(wgpu_types::PollType::wait_indefinitely());
+        let post = ps.get_mapped_range();
+        let (mut same, mut flip) = (0u64, 0u64);
+        let mut pd = std::collections::HashSet::new();
+        for y in 0..size.y {
+            for x in 0..size.x {
+                let i = (y * *row + x * 4) as usize;
+                let j = ((size.y - 1 - y) * *row + x * 4) as usize;
+                for k in 0..3 {
+                    same += (post[i + k] as i32 - data[i + k] as i32).unsigned_abs() as u64;
+                    flip += (post[i + k] as i32 - data[j + k] as i32).unsigned_abs() as u64;
+                }
+                pd.insert((post[i] >> 2, post[i + 1] >> 2, post[i + 2] >> 2));
+            }
+        }
+        info!("unity post stats: mean abs diff vs scene {:.2} (rows flipped {:.2}) distinct colors {}", same as f64 / (3.0 * n), flip as f64 / (3.0 * n), pd.len());
+    }
 }

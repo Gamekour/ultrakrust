@@ -152,6 +152,8 @@ pub struct SceneDef {
     pub lights: Vec<LightDef>,
     /// The scene's RenderSettings (fog, ambient).
     pub render_settings: RenderSettingsDef,
+    /// Name of the scene's serialized file (PPtrs in `ScriptDef::data` resolve against it).
+    pub scene_file: String,
 }
 
 impl SceneDef {
@@ -280,7 +282,7 @@ pub fn load_scene(db: &mut AssetDb, bundle: &std::path::Path) -> Result<SceneDef
         .cloned()
         .ok_or_else(|| crate::Error("no scene file in bundle".into()))?;
     let mut ld = Loader { db, scene: scene.clone(), meshes: HashMap::new(), class_names: HashMap::new() };
-    let mut def = SceneDef::default();
+    let mut def = SceneDef { scene_file: scene.name.clone(), ..SceneDef::default() };
 
     // --- GameObjects + Transforms -> nodes ---
     struct RawTr {
