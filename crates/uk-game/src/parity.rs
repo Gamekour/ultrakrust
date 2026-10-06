@@ -25,6 +25,7 @@ pub const PORTED: &[(&str, Port)] = &[
     ("DeathZone", Port::Full),
     ("TeleportPlayer", Port::Full),
     ("PlayerActivator", Port::Full),
+    ("OnLevelStart", Port::Partial("hideFogUntilStart / levelNameOnStart not applied")),
     ("FinalDoor", Port::Partial("no animation/sound")),
     ("FinalDoorOpener", Port::Full),
     ("FinalPit", Port::Partial("no results screen")),

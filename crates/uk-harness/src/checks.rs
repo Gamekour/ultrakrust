@@ -442,3 +442,51 @@ fn bot_run(def: &Arc<SceneDef>, r: &mut Report) {
         ))
     }
 }
+
+/// OnLevelStart: on every campaign level, walking out of the spawn starts the level and its
+/// `onStart` brings in the first rooms (no void past the FirstRoom door).
+pub fn first_rooms(install: &Path, filter: Option<&str>, r: &mut Report) {
+    let dir = AssetDb::bundle_dir(install);
+    let mut levels: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .filter_map(|e| {
+            let n = e.file_name().to_string_lossy().to_string();
+            n.strip_prefix("campaign_scenes_level").and_then(|s| s.strip_suffix(".bundle")).map(str::to_string)
+        })
+        .filter(|l| filter.is_none_or(|f| l.contains(f)))
+        .collect();
+    levels.sort();
+    let mut db = AssetDb::open(install).unwrap();
+    let (mut ok, mut with) = (0, 0);
+    for l in &levels {
+        let Ok(def) = scenedef::load_scene(&mut db, &dir.join(format!("campaign_scenes_level{l}.bundle"))) else { continue };
+        let def = Arc::new(def);
+        let targets: Vec<u32> = def
+            .scripts
+            .iter()
+            .filter(|s| s.class == "OnLevelStart")
+            .flat_map(|s| uk_game::scripts::nodes(&def, s.data.get("onStart").get("toActivateObjects")))
+            .collect();
+        if targets.is_empty() {
+            continue;
+        }
+        with += 1;
+        let mut g = Game::new(def.clone());
+        let mut t = 0.0;
+        for i in 0..400 {
+            let input = Input { move_axis: bevy_math::Vec2::new(0.0, (i >= 250) as i32 as f32), ..Default::default() };
+            g.fixed_update(&input);
+            t += FIXED_DT as f64;
+            g.update(&input, FIXED_DT, t);
+        }
+        let on = targets.iter().filter(|&&n| g.active(n)).count();
+        if g.s.player.activated && on == targets.len() {
+            ok += 1;
+        } else {
+            r.note(format!("FAIL first_rooms {l}: player activated {}, OnLevelStart targets active {on}/{}", g.s.player.activated, targets.len()));
+        }
+    }
+    r.higher("first_rooms.levels_ok", ok as f64);
+    r.pass("first_rooms.all", ok == with, format!("{ok}/{with} levels bring in their first rooms at level start"));
+}

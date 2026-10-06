@@ -1200,6 +1200,24 @@ impl Game {
         self.s.player.activated = true;
     }
 
+    /// OnLevelStart.Update: once the level has started (StatsManager's timer, i.e. the player
+    /// activated), `onStart` brings in the first rooms.
+    fn level_start_update(&mut self) {
+        if !self.s.player.activated {
+            return;
+        }
+        for sc in 0..self.s.scripts.len() as u32 {
+            let Script::OnLevelStart { activated: false, .. } = self.s.scripts[sc as usize] else { continue };
+            if !self.script_live(sc) {
+                continue;
+            }
+            let Script::OnLevelStart { on_start, activated } = &mut self.s.scripts[sc as usize] else { continue };
+            *activated = true;
+            let ev = on_start.clone();
+            self.run_uevent(&ev, false);
+        }
+    }
+
     fn final_door_open(&mut self, sc: u32) {
         let Script::FinalDoor(fd) = &mut self.s.scripts[sc as usize] else { return };
         fd.about_to_open = true;
@@ -1677,6 +1695,7 @@ impl Game {
             return;
         }
         self.run_starts();
+        self.level_start_update();
         // GunControl: the revolver viewmodel is out once picked up
         if let Some(r) = self.vm_revolver {
             if self.s.active_self[r as usize] != self.s.has_revolver {

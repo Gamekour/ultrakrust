@@ -29,6 +29,8 @@ pub fn levels(install: &Path, filter: Option<&str>, r: &mut Report) {
             .env("UNITY_FRAME_STATS", "1")
             // punch on cooldown so the Feedbacker's Jab clips bring the viewmodel through the HUD Camera
             .env("UK_PROBE_PUNCH", "1")
+            // presented-window read-back: the scene reaches the screen, and HUD text clears
+            .env("UK_PROBE_PRESENT", "1")
             .env("RUST_LOG", "info,naga=error,wgpu_hal=warn,wgpu_core=warn")
             .output();
         let Ok(out) = out else {
@@ -94,6 +96,21 @@ pub fn levels(install: &Path, filter: Option<&str>, r: &mut Report) {
         match series.iter().map(|(a, b)| 100.0 * a / b.max(1.0)).reduce(f64::max) {
             Some(pct) => r.higher(&format!("render.{l}.viewmodel_on_screen_max_pct"), pct),
             None => r.note(format!("gap: render {l}: no viewmodel through the HUD Camera")),
+        }
+        let present = |key: &str| {
+            let line = log.lines().find(|x| x.contains(&format!("present probe {key} ")))?;
+            let num = |k: &str| line.split(k).nth(1)?.split_whitespace().next()?.parse::<f64>().ok();
+            Some((num("lit_frac ")?, num("hint_ink ")?))
+        };
+        match (present("before"), present("during"), present("after"), present("late")) {
+            (Some(b), Some(d), Some(a), Some(late)) => {
+                r.higher(&format!("render.{l}.present_lit_frac"), late.0);
+                // only judged where the hint band is dark without text
+                if b.1 < 100.0 {
+                    r.pass(&format!("render.{l}.hint_clears"), d.1 > b.1 + 500.0 && a.1 <= b.1 + 50.0, format!("hint ink before {} during {} after {}", b.1, d.1, a.1));
+                }
+            }
+            _ => r.note(format!("gap: render {l}: no presented-window read-back")),
         }
         if errors == 0 && out.status.success() {
             ok_levels += 1;

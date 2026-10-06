@@ -26,6 +26,7 @@ All numbers below are measured by tooling (`uk-harness --full`, `parity_scripts`
 | Engine systems (unweighted mean, 37 tracked) | — | **25.7%** (was 22.7% at the gap analysis) | see §3 |
 | Level 0-1 autopilot (deterministic) | 56 waypoints | **43/56** (was 25 before NavMesh) | stalls at the Combo Hallway east stairs: the hand-written route asks for a 2-high step under a 3-high lintel; a bot route problem, not a game one |
 | Scenes that build a level runtime | 54 | 54 | every scene builds a `Game` without panicking |
+| First room active at level start (`OnLevelStart.onStart`) | 41 campaign levels | 41/41 | harness `first_rooms` |
 
 **0-1 checks passing:** load, all 11 live door controllers, all 14 arenas, boss → final door → final pit, checkpoint respawn,
 tick-for-tick determinism, sim under budget (p99 1.3 ms/tick), navmesh, Fan Room path.

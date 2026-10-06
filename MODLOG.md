@@ -177,3 +177,19 @@ CPU-skinned enemies, 3,393 colliders/569 triggers, 11,758 MonoBehaviours with ty
   (`animrt.slots_bound_pct` 90.96 -> 90.27). `examples/unbound.rs` resolves unbound hashes against every node-path suffix.
 - Prefab lookups cache the catalog and each bundle's m_Container (was ~265 ms per lookup; scene load back to baseline).
 - Re-blessed: 10 authored viewmodel triangles face against their normals (det > 0, winding as stored).
+
+## Playability fixes: first room, HUD clearing, black window (2026-10-06)
+- **First room void:** ULTRAKILL activates each level's first room through `OnLevelStart.onStart` (toActivateObjects /
+  onActivate...), fired when the level timer starts (= PlayerActivator sets `player.activated`). Ported as
+  `Script::OnLevelStart`, run once by `Game::level_start_update`. `hideFogUntilStart` / `levelNameOnStart` not applied (Partial).
+  Probe: `cargo run -p uk-game --example spawn_room -- <level>`. Harness `--only first_rooms`: every campaign level
+  activates every onStart target and the player walks into it (`first_rooms.levels_ok` 41/41).
+- **Text piling up / black window until resize (Unity renderer):** the order-1 VIEW_LAYER child camera (MSAA, own
+  main texture) was drawn over the Unity composite and its UI target was never cleared, so old HUD text accumulated
+  and the scene stayed black until a resize recreated the textures. Unity mode no longer spawns it; MainCam is
+  `IsDefaultUiCamera`.
+- Developer overlay (top-left debug text) is hidden by default, toggled with **F3**.
+- Probe: `UK_PROBE_PRESENT=1` reduces swapchain captures to numbers (lit fraction, near-white ink in the hint band and
+  debug corner) while forcing the hint on for frames 160-199. 0-1: hint ink 0 -> 2445 -> 0, corner ink stable, lit
+  fraction 0.72 by frame 120 with no resize (frames 3-90 dark/flickering while pipelines compile).
+  Harness: `pass.render.<level>.hint_clears`, `render.<level>.present_lit_frac`.

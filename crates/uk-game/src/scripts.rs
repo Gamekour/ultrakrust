@@ -268,6 +268,8 @@ pub enum Script {
     WeaponPickUp,
     /// OutOfBoundsTargetSetter: explicit death zones (empty = all that allow it).
     OobTargetSetter { death_zones: Vec<u32> },
+    /// OnLevelStart: `onStart` fires once when the level timer starts (the player is activated).
+    OnLevelStart { on_start: UEvent, activated: bool },
     Other,
 }
 
@@ -409,6 +411,7 @@ pub fn parse(def: &SceneDef, idx: usize) -> Script {
         })),
         "WeaponPickUp" => Script::WeaponPickUp,
         "OutOfBoundsTargetSetter" => Script::OobTargetSetter { death_zones: scripts(def, v.get("deathZones")) },
+        "OnLevelStart" => Script::OnLevelStart { on_start: parse_uevent(def, v.get("onStart")), activated: false },
         _ => Script::Other,
     }
 }

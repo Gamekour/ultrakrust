@@ -9,6 +9,7 @@
 //! R restart from checkpoint, N noclip, [ ] sensitivity, T camera tilt, Esc release mouse.
 
 mod unity_render;
+mod present_probe;
 mod demo;
 mod level;
 mod map;
@@ -102,6 +103,7 @@ fn main() {
         .add_plugins(unity_render::UnityRenderPlugin)
         .add_systems(Startup, setup)
         .add_systems(Last, exit_after)
+        .add_systems(Update, present_probe::run.after(update_hud).run_if(present_probe::enabled))
         .add_systems(FixedUpdate, fixed_sim)
         .add_systems(Update, (cursor_grab, frame_sim, sync_level, unity_frame, apply_view, update_beams, update_hud, tour::run_tour).chain())
         .run();
@@ -185,20 +187,23 @@ fn setup(
         .insert_if(
             // ULTRAKILL's own shaders: no tonemapping or MSAA (the game has neither), and the view is
             // composited from the gamma-space scene target.
-            (unity_render::UnityCamera, bevy::core_pipeline::tonemapping::Tonemapping::None, Msaa::Off),
+            // The HUD is drawn straight onto this view after the composite: no second camera on
+            // the window, whose own target would cover the composite and keep stale UI.
+            (unity_render::UnityCamera, bevy::core_pipeline::tonemapping::Tonemapping::None, Msaa::Off, IsDefaultUiCamera),
             || unity_shaders && is_level,
         )
         .with_children(|c| {
+            // ULTRAKILL's own viewmodel (layer 13, HUD Camera) replaces the placeholder view-model
+            // camera on the Unity path
+            if unity_shaders && is_level {
+                return;
+            }
             c.spawn((
                 Camera3d::default(),
                 Camera { order: 1, ..default() },
                 Projection::from(PerspectiveProjection { fov: 90f32.to_radians(), near: 0.01, ..default() }),
                 RenderLayers::layer(VIEW_LAYER),
             ));
-            // ULTRAKILL's own viewmodel (layer 13, HUD Camera) replaces these on the Unity path
-            if unity_shaders && is_level {
-                return;
-            }
             // Placeholder revolver: body + barrel + cylinder.
             let gun = materials.add(StandardMaterial { base_color: Color::srgb(0.55, 0.56, 0.6), metallic: 0.7, ..default() });
             let grip = materials.add(Color::srgb(0.25, 0.12, 0.06));
@@ -613,6 +618,8 @@ fn update_beams(mut commands: Commands, time: Res<Time>, mut q: Query<(Entity, &
 fn update_hud(
     sim: Res<Sim>,
     diag: Res<Time<Real>>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut debug_shown: Local<bool>,
     mut text: Single<&mut Text, (With<HudText>, Without<HintText>, Without<BannerText>, Without<HpText>)>,
     mut hint: Single<&mut Text, (With<HintText>, Without<HudText>, Without<BannerText>, Without<HpText>)>,
     mut banner: Single<&mut Text, (With<BannerText>, Without<HudText>, Without<HintText>, Without<HpText>)>,
@@ -623,6 +630,10 @@ fn update_hud(
 ) {
     let g = &sim.game;
     let p = &g.s.player;
+    // the developer overlay (not part of ULTRAKILL's HUD) is off until F3
+    if keys.just_pressed(KeyCode::F3) {
+        *debug_shown = !*debug_shown;
+    }
     let mut state = Vec::new();
     if p.gc.on_ground {
         state.push("GROUND")
@@ -660,7 +671,7 @@ fn update_hud(
     for (msg, _) in sim.log.iter().rev().take(4) {
         s.push_str(&format!("\n{msg}"));
     }
-    text.0 = s;
+    text.0 = if *debug_shown { s } else { String::new() };
     hint.0 = g.s.messages.last().map(|m| m.text.clone()).unwrap_or_default();
     banner.0 = match &sim.banner {
         Some((b, _)) if b == "LEVEL COMPLETE" => format!("LEVEL COMPLETE\n{:.1}s  -  {} kills", sim.level_time, g.s.kills),

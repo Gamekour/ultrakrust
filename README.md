@@ -54,7 +54,7 @@ cargo run --release -p uk-assets --example dump_level -- level0-1
 
 Controls (ULTRAKILL defaults): **WASD** move, **Space** jump, **Left Shift** dash,
 **Left Ctrl** slide (in the air: ground slam), **LMB** fire, **hold RMB** charge a piercing shot,
-**F** punch (also parries projectiles), **R** restart from checkpoint, **N** noclip, **T** camera tilt,
+**F** punch (also parries projectiles), **R** restart from checkpoint, **N** noclip, **F3** developer overlay, **T** camera tilt,
 **[ ]** mouse sensitivity, **Esc** release the mouse. `--demo <dir>` plays a scripted run and saves screenshots.
 
 ## Faithfulness notes
