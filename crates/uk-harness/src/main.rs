@@ -6,6 +6,7 @@
 //!   cargo run --release -p uk-harness -- --bless   # accept current results as the new baseline
 //!
 //! Output: `parity/report.tsv` (all metrics) and a printed list of failures/regressions only.
+mod anim;
 mod checks;
 mod coverage;
 mod render;
@@ -59,6 +60,7 @@ fn main() {
         r.pass("repo.no_game_files", bad.is_empty(), format!("tracked game-derived files: {bad:?}"));
     }
     if run("level0-1") { checks::level_0_1(&install, &mut r) }
+    if run("anim") { anim::all_clips(&install, &mut r) }
     if run("shaders") { shaders::level(&install, "level0-1", &mut r) }
     if args.iter().any(|a| a == "--render") { render::levels(&install, only.as_deref().filter(|o| o.contains('-')), &mut r) }
     if full && run("coverage") { coverage::all_scenes(&install, &mut r) }

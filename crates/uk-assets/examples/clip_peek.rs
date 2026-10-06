@@ -35,7 +35,17 @@ fn main() {
     let filter = a.get(2).cloned().unwrap_or_default();
     let install = uk_assets::find_install().unwrap();
     let mut db = AssetDb::open(&install).unwrap();
-    let mut bundles: Vec<_> = std::fs::read_dir(AssetDb::bundle_dir(&install)).unwrap().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "bundle")).collect();
+    let mut bundles = Vec::new();
+    let mut stack = vec![AssetDb::bundle_dir(&install)];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() { stack.push(p) } else if p.extension().is_some_and(|x| x == "bundle") { bundles.push(p) }
+        }
+    }
+    // AnimationClip census: binding (typeID, attribute) tallies, curve storage kinds, events
+    let mut tally: std::collections::BTreeMap<(i64, i64, bool), usize> = Default::default();
+    let (mut streamed, mut dense, mut constant, mut events, mut legacy) = (0, 0, 0, 0, 0);
     bundles.sort();
     let mut total = 0;
     let mut shown = false;
@@ -44,15 +54,30 @@ fn main() {
         for f in files {
             for o in f.objects.iter().filter(|o| o.class_id == class) {
                 total += 1;
-                if shown { continue }
                 let Ok(v) = f.read(o) else { continue };
+                if class == 74 {
+                    let c = v.get("m_MuscleClip").get("m_Clip").get("data");
+                    streamed += !c.get("m_StreamedClip").get("data").array().is_empty() as usize;
+                    dense += !c.get("m_DenseClip").get("m_SampleArray").array().is_empty() as usize;
+                    constant += !c.get("m_ConstantClip").get("data").array().is_empty() as usize;
+                    events += v.get("m_Events").array().len();
+                    legacy += v.get("m_Legacy").bool() as usize;
+                    for g in v.get("m_ClipBindingConstant").get("genericBindings").array() {
+                        *tally.entry((g.get("typeID").i64(), g.get("attribute").i64(), g.get("customType").i64() != 0)).or_default() += 1;
+                    }
+                }
+                if shown { continue }
                 if !v.get("m_Name").str().contains(&filter) { continue }
                 let mut s = String::new();
                 shape(&v, 0, &mut s);
-                println!("{} in {} ({})\n{s}", v.get("m_Name").str(), b.file_name().unwrap().to_string_lossy(), f.file_name());
+                println!("{} in {} ({})\n{s}", v.get("m_Name").str(), b.file_name().unwrap().to_string_lossy(), f.name);
                 shown = true;
             }
         }
     }
     println!("class {class}: {total} objects");
+    if class == 74 {
+        println!("streamed {streamed} dense {dense} constant {constant} events {events} legacy {legacy}");
+        for ((t, a, c), n) in tally { println!("binding typeID {t} attribute {a} custom {c}: {n}") }
+    }
 }
