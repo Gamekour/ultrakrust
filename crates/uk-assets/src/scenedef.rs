@@ -47,9 +47,12 @@ pub mod tags {
     pub const ARMOR: u32 = 20028;
 }
 
-/// Layers the player's Main Camera does not draw (its culling mask is 0x8fd2dfd7):
-/// trigger volumes (16 Invisible), UI, HUD, PlayerOnly/EnemyWall blockers, ...
-const HIDDEN_LAYERS: &[u8] = &[3, 5, 13, 16, 18, 19, 21, 28, 29, 30];
+/// Layers neither the player's Main Camera (culling mask 0x8fd2dfd7) nor its HUD Camera (0x2000)
+/// draws: trigger volumes (16 Invisible), UI, PlayerOnly/EnemyWall blockers, ...
+const HIDDEN_LAYERS: &[u8] = &[3, 5, 16, 18, 19, 21, 28, 29, 30];
+
+/// The viewmodel layer ("AlwaysOnTop"): drawn only by the HUD Camera (fov 90, depth cleared).
+pub const VIEWMODEL_LAYER: u8 = 13;
 
 #[derive(Clone, Debug)]
 pub struct NodeDef {
@@ -164,6 +167,8 @@ pub struct ScriptDef {
     pub enabled: bool,
     pub path_id: i64,
     pub data: Value,
+    /// Serialized file the script's PPtrs resolve against when it came from a prefab (None: the scene file).
+    pub file: Option<String>,
 }
 
 #[derive(Default)]
@@ -393,11 +398,6 @@ pub fn load_scene(db: &mut AssetDb, bundle: &std::path::Path) -> Result<SceneDef
     let mut def = SceneDef { scene_file: scene.name.clone(), ..SceneDef::default() };
 
     // --- GameObjects + Transforms -> nodes ---
-    struct RawTr {
-        go: i64,
-        father: i64,
-        trs: (Vec3, Quat, Vec3),
-    }
     let mut raw_go: HashMap<i64, Value> = HashMap::new();
     let mut raw_tr: HashMap<i64, RawTr> = HashMap::new();
     for o in &scene.objects {
@@ -407,10 +407,7 @@ pub fn load_scene(db: &mut AssetDb, bundle: &std::path::Path) -> Result<SceneDef
             }
             CLASS_TRANSFORM | CLASS_RECT_TRANSFORM => {
                 let v = scene.read(o)?;
-                raw_tr.insert(
-                    o.path_id,
-                    RawTr { go: v.get("m_GameObject").pptr().1, father: v.get("m_Father").pptr().1, trs: unity_trs(&v) },
-                );
+                raw_tr.insert(o.path_id, self::raw_tr(&v));
             }
             CLASS_RENDER_SETTINGS => {
                 let v = scene.read(o)?;
@@ -435,6 +432,29 @@ pub fn load_scene(db: &mut AssetDb, bundle: &std::path::Path) -> Result<SceneDef
             _ => {}
         }
     }
+    add_objects(&mut ld, &mut def, &raw_go, &raw_tr, None)?;
+    spawn_viewmodel(&mut ld, &mut def);
+    def.navmeshes = crate::navmesh::load_scene_navmeshes(ld.db, bundle).unwrap_or_default();
+    Ok(def)
+}
+
+struct RawTr {
+    go: i64,
+    father: i64,
+    trs: (Vec3, Quat, Vec3),
+}
+
+fn raw_tr(v: &Value) -> RawTr {
+    RawTr { go: v.get("m_GameObject").pptr().1, father: v.get("m_Father").pptr().1, trs: unity_trs(v) }
+}
+
+/// Appends the GameObjects / Transforms of `ld.scene` (`raw_go`, `raw_tr`) as nodes with their
+/// components. Roots attach under `parent` (local TRS kept, as `Instantiate(prefab, parent)`).
+/// Returns the first new root node.
+fn add_objects(ld: &mut Loader, def: &mut SceneDef, raw_go: &HashMap<i64, Value>, raw_tr: &HashMap<i64, RawTr>, parent: Option<u32>) -> Result<Option<u32>> {
+    let file = ld.scene.clone();
+    let prefab = parent.is_some().then(|| file.name.clone());
+    let base = def.nodes.len();
     // stable node order: by transform path id
     let mut tr_ids: Vec<i64> = raw_tr.keys().copied().collect();
     tr_ids.sort();
@@ -443,6 +463,9 @@ pub fn load_scene(db: &mut AssetDb, bundle: &std::path::Path) -> Result<SceneDef
     for &t in &tr_ids {
         let rt = &raw_tr[&t];
         let Some(g) = raw_go.get(&rt.go) else { continue };
+        if def.obj_to_node.contains_key(&rt.go) {
+            return Err(crate::Error(format!("{}: object {} already in the scene (instantiated twice?)", file.name, rt.go)));
+        }
         let idx = def.nodes.len() as u32;
         tr_to_node.insert(t, idx);
         node_tr.push(t);
@@ -462,18 +485,25 @@ pub fn load_scene(db: &mut AssetDb, bundle: &std::path::Path) -> Result<SceneDef
             world0: Mat4::IDENTITY,
         });
     }
+    let mut roots = Vec::new();
     for &t in &tr_ids {
-        let (Some(&n), Some(&pf)) = (tr_to_node.get(&t), tr_to_node.get(&raw_tr[&t].father)) else { continue };
-        def.nodes[n as usize].parent = Some(pf);
-        def.nodes[pf as usize].children.push(n);
+        let Some(&n) = tr_to_node.get(&t) else { continue };
+        let pf = tr_to_node.get(&raw_tr[&t].father).copied();
+        if pf.is_none() {
+            roots.push(n);
+        }
+        if let Some(pf) = pf.or(parent) {
+            def.nodes[n as usize].parent = Some(pf);
+            def.nodes[pf as usize].children.push(n);
+        }
     }
-    // world matrices in Unity space, computed top-down
-    let mut unity_world = vec![Mat4::IDENTITY; def.nodes.len()];
-    let mut order: Vec<u32> = (0..def.nodes.len() as u32).filter(|&n| def.nodes[n as usize].parent.is_none()).collect();
+    // world matrices in Unity space, computed top-down (existing nodes keep theirs)
+    let mut unity_world: Vec<Mat4> = def.nodes.iter().map(|n| to_bevy_mat(n.world0)).collect();
+    let mut order = roots.clone();
     let mut i = 0;
     while i < order.len() {
         let n = order[i];
-        let rt = &raw_tr[&node_tr[n as usize]];
+        let rt = &raw_tr[&node_tr[n as usize - base]];
         let local = Mat4::from_scale_rotation_translation(rt.trs.2, rt.trs.1, rt.trs.0);
         unity_world[n as usize] = match def.nodes[n as usize].parent {
             Some(p) => unity_world[p as usize] * local,
@@ -482,8 +512,8 @@ pub fn load_scene(db: &mut AssetDb, bundle: &std::path::Path) -> Result<SceneDef
         order.extend(def.nodes[n as usize].children.iter().copied());
         i += 1;
     }
-    for (n, m) in unity_world.iter().enumerate() {
-        def.nodes[n].world0 = to_bevy_mat(*m);
+    for n in base..def.nodes.len() {
+        def.nodes[n].world0 = to_bevy_mat(unity_world[n]);
     }
 
     // --- components ---
@@ -501,12 +531,12 @@ pub fn load_scene(db: &mut AssetDb, bundle: &std::path::Path) -> Result<SceneDef
             if f != 0 {
                 continue;
             }
-            let Some(o) = scene.object(id) else { continue };
+            let Some(o) = file.object(id) else { continue };
             match o.class_id {
-                CLASS_MESH_FILTER => filter_mesh = scene.read(o).ok().map(|v| v.get("m_Mesh").pptr()),
-                CLASS_MESH_RENDERER => renderer = scene.read(o).ok(),
+                CLASS_MESH_FILTER => filter_mesh = file.read(o).ok().map(|v| v.get("m_Mesh").pptr()),
+                CLASS_MESH_RENDERER => renderer = file.read(o).ok(),
                 CLASS_SKINNED_MESH_RENDERER => {
-                    let Ok(v) = scene.read(o) else { continue };
+                    let Ok(v) = file.read(o) else { continue };
                     if HIDDEN_LAYERS.contains(&layer) {
                         continue;
                     }
@@ -525,7 +555,7 @@ pub fn load_scene(db: &mut AssetDb, bundle: &std::path::Path) -> Result<SceneDef
                     }
                 }
                 CLASS_BOX_COLLIDER | CLASS_SPHERE_COLLIDER | CLASS_CAPSULE_COLLIDER | CLASS_MESH_COLLIDER => {
-                    let Ok(v) = scene.read(o) else { continue };
+                    let Ok(v) = file.read(o) else { continue };
                     let shape = match o.class_id {
                         CLASS_BOX_COLLIDER => {
                             let (scale, rot, _) = world.to_scale_rotation_translation();
@@ -581,16 +611,16 @@ pub fn load_scene(db: &mut AssetDb, bundle: &std::path::Path) -> Result<SceneDef
                     });
                 }
                 CLASS_MONOBEHAVIOUR => {
-                    let Ok(v) = scene.read(o) else { continue };
+                    let Ok(v) = file.read(o) else { continue };
                     let class = ld.class_name(v.get("m_Script").pptr());
                     def.obj_to_node.insert(id, node);
                     def.comp_to_script.insert(id, def.scripts.len() as u32);
-                    def.scripts.push(ScriptDef { node, class, enabled: v.get("m_Enabled").bool(), path_id: id, data: v });
+                    def.scripts.push(ScriptDef { node, class, enabled: v.get("m_Enabled").bool(), path_id: id, data: v, file: prefab.clone() });
                 }
                 CLASS_ANIMATOR => {
-                    let Ok(v) = scene.read(o) else { continue };
+                    let Ok(v) = file.read(o) else { continue };
                     def.obj_to_node.insert(id, node);
-                    let controller = ld.controller(&mut def, v.get("m_Controller").pptr());
+                    let controller = ld.controller(def, v.get("m_Controller").pptr());
                     def.animators.push(AnimatorDef {
                         node,
                         controller,
@@ -608,7 +638,7 @@ pub fn load_scene(db: &mut AssetDb, bundle: &std::path::Path) -> Result<SceneDef
                 }
                 CLASS_LIGHT => {
                     def.obj_to_node.insert(id, node);
-                    let Ok(v) = scene.read(o) else { continue };
+                    let Ok(v) = file.read(o) else { continue };
                     let c = v.get("m_Color");
                     def.lights.push(LightDef {
                         node,
@@ -654,8 +684,76 @@ pub fn load_scene(db: &mut AssetDb, bundle: &std::path::Path) -> Result<SceneDef
             }
         }
     }
-    def.navmeshes = crate::navmesh::load_scene_navmeshes(ld.db, bundle).unwrap_or_default();
-    Ok(def)
+    Ok(roots.first().copied())
+}
+
+/// `Object.Instantiate(prefab, parent)`: the prefab whose root GameObject is `go` in `file`,
+/// with its whole hierarchy and components, under `parent`. Returns the instance's root node.
+fn instantiate(ld: &mut Loader, def: &mut SceneDef, file: Arc<SerializedFile>, go: i64, parent: u32) -> Result<u32> {
+    let mut raw_go = HashMap::new();
+    let mut raw_trs = HashMap::new();
+    let mut stack = vec![go];
+    while let Some(g) = stack.pop() {
+        let v = file.read_id(g)?;
+        for c in v.get("m_Component").array() {
+            let (_, cid) = c.get("component").pptr();
+            if !matches!(file.object(cid).map(|o| o.class_id), Some(CLASS_TRANSFORM | CLASS_RECT_TRANSFORM)) {
+                continue;
+            }
+            let t = file.read_id(cid)?;
+            for k in t.get("m_Children").array() {
+                stack.push(file.read_id(k.pptr().1)?.get("m_GameObject").pptr().1);
+            }
+            let mut rt = raw_tr(&t);
+            if g == go {
+                rt.father = 0;
+            }
+            raw_trs.insert(cid, rt);
+        }
+        raw_go.insert(g, v);
+    }
+    let prev = std::mem::replace(&mut ld.scene, file);
+    // class names are cached per PPtr, which is relative to the file
+    let names = std::mem::take(&mut ld.class_names);
+    let r = add_objects(ld, def, &raw_go, &raw_trs, Some(parent));
+    ld.scene = prev;
+    ld.class_names = names;
+    r?.ok_or_else(|| crate::Error("prefab without a root transform".into()))
+}
+
+/// The viewmodel prefabs spawned at Awake from Addressables references:
+/// GunSetter.ResetWeapons instantiates the equipped weapons under GunControl (in 0-1: the blue
+/// Piercer revolver, the one weapon the player starts with); FistControl.ResetFists the blue
+/// Feedbacker arm under Punch.
+fn spawn_viewmodel(ld: &mut Loader, def: &mut SceneDef) {
+    if !def.scripts.iter().any(|s| s.class == "GunSetter" || s.class == "FistControl") {
+        return;
+    }
+    let cat = match ld.db.catalog.clone().map(Ok).unwrap_or_else(|| crate::addressables::Catalog::load(&ld.db.install.clone()).map(std::sync::Arc::new)) {
+        Ok(c) => {
+            ld.db.catalog = Some(c.clone());
+            c
+        }
+        Err(e) => {
+            def.warnings.push(format!("viewmodel: {e}"));
+            return;
+        }
+    };
+    // (spawning script, AssetReference field; arrays are [blue, green] variants)
+    for (class, field) in [("GunSetter", "revolverPierce"), ("FistControl", "blueArm")] {
+        let Some(s) = def.scripts.iter().position(|s| s.class == class) else { continue };
+        let r = def.scripts[s].data.get(field);
+        let r = r.array().first().unwrap_or(r);
+        let (node, guid) = (def.scripts[s].node, r.get("m_AssetGUID").str().to_string());
+        if guid.is_empty() {
+            continue;
+        }
+        match cat.load_asset(ld.db, &guid).and_then(|(f, id)| instantiate(ld, def, f, id, node)) {
+            // GunControl.SwitchWeapon / FistControl.ArmChange activate the equipped one
+            Ok(root) => def.nodes[root as usize].active_self = true,
+            Err(e) => def.warnings.push(format!("viewmodel {class}.{field}: {e}")),
+        }
+    }
 }
 
 /// CPU skinning with the bone poses saved in the scene (Unity space in, Unity space out).

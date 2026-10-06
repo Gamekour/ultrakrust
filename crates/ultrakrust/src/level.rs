@@ -73,7 +73,7 @@ pub fn load(
     let player = game.player_node;
     let unity = unity_shaders.map(|shaders| {
         let t = std::time::Instant::now();
-        let (scene, summary) = crate::unity_render::build(&mut db, &def, |n| player.is_some_and(|p| def.is_descendant(n, p)), shaders, 1);
+        let (scene, summary) = crate::unity_render::build(&mut db, &def, |n| def.nodes[n as usize].layer != scenedef::VIEWMODEL_LAYER && player.is_some_and(|p| def.is_descendant(n, p)), shaders, 1);
         info!("{summary} ({:.2}s)", t.elapsed().as_secs_f32());
         scene
     });

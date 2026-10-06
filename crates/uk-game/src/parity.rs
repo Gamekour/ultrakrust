@@ -38,8 +38,8 @@ pub const PORTED: &[(&str, Port)] = &[
     ("GroundCheck", Port::Full),
     ("WallCheck", Port::Full),
     ("CameraController", Port::Partial("no screenshake, no options")),
-    ("Revolver", Port::Partial("piercer variant only; no coin/alt variants, no anim/sound")),
-    ("Punch", Port::Partial("Feedbacker basics; no Knuckleblaster, no anim")),
+    ("Revolver", Port::Partial("piercer variant only; no coin/alt variants, no sound; viewmodel anim fed (Shoot/ChargeShoot)")),
+    ("Punch", Port::Partial("Feedbacker basics; no Knuckleblaster; viewmodel Jab/Jab2 fed")),
     // enemies (enemy.rs)
     ("EnemyIdentifier", Port::Partial("damage/limb multipliers; no buffs, blessing, radiance, sand")),
     ("Zombie", Port::Partial("navmesh pursuit (TrackTick); no anim, no agent avoidance")),

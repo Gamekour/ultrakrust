@@ -104,6 +104,8 @@ pub struct Draw {
     pub radius: f32,
     /// SkinnedMeshRenderer: re-skinned on the CPU each frame its bones are animated.
     pub skin: Option<Arc<SkinDraw>>,
+    /// Viewmodel layer (13): drawn by the HUD Camera after a depth clear.
+    pub hud: bool,
 }
 
 pub struct SkinDraw {
@@ -139,6 +141,8 @@ pub struct SceneData {
     pub composite_shader: Handle<Shader>,
     /// ULTRAKILL's final composite (PostProcessV2_Handler.postProcessV2_VSRM on the Virtual Camera quad).
     pub post: Option<PostDef>,
+    /// HUD Camera (renders layer 13 only): load-time Bevy-space transform and vertical fov (deg).
+    pub hud_cam: Option<(Mat4, f32)>,
 }
 
 pub struct PostDef {
@@ -566,6 +570,7 @@ pub fn build(
             // animated limbs leave the bind-pose bounds
             radius: (hi - lo).length() * if skin.is_some() { 1.0 } else { 0.5 } + if skin.is_some() { 1.0 } else { 0.0 },
             skin,
+            hud: def.nodes[r.node as usize].layer == uk_assets::scenedef::VIEWMODEL_LAYER,
         });
     }
     // the final composite: GameController's PostProcessV2_Handler names the material and dither texture
@@ -617,6 +622,8 @@ pub fn build(
         clear: CLEAR,
         composite_shader: shaders.add(Shader::from_wgsl(COMPOSITE_WGSL, "unity/composite.wgsl")),
         post,
+        // the HUD Camera component: fov 90, culling mask layer 13, depth-only clear
+        hud_cam: def.find("HUD Camera").map(|h| (def.nodes[h as usize].world0, 90.0)),
     };
     (scene, summary)
 }
@@ -1374,7 +1381,32 @@ fn prepare(
         near,
         size,
     };
-    if std::env::var_os("UNITY_FRAME_STATS").is_some() && gpu.frames.load(std::sync::atomic::Ordering::Relaxed) == 240 {
+    // HUD Camera: the viewmodel animates in its load-time world space, so its camera stays there too
+    let hud_ctx = scene.hud_cam.map(|(w, fov)| {
+        let v = w.inverse() * mirror;
+        let fy = 1.0 / (fov.to_radians() * 0.5).tan();
+        let proj = Mat4::from_cols(proj.x_axis * (fy / proj.y_axis.y), proj.y_axis * (fy / proj.y_axis.y), proj.z_axis, proj.w_axis);
+        let c = w.w_axis.truncate();
+        FrameCtx { vp: proj * v, v, cam_pos: Vec3::new(c.x, c.y, -c.z), ..ctx }
+    });
+    let fno = gpu.frames.load(std::sync::atomic::Ordering::Relaxed);
+    if let (Some(h), true) = (&hud_ctx, std::env::var_os("UNITY_FRAME_STATS").is_some() && (200..=400).contains(&fno) && fno % 10 == 0) {
+        // viewmodel time series: visible (posed) layer-13 vertices on screen through the HUD Camera
+        let (mut inside, mut total, mut shown) = (0usize, 0usize, 0usize);
+        for (di, d) in scene.draws.iter().enumerate().filter(|(i, d)| d.hud && frame.visible.get(*i).copied().unwrap_or(true)) {
+            shown += 1;
+            let stride = scene.variants[d.variant as usize].stride as usize;
+            let bytes = frame.skinned.iter().find(|(i, _)| *i == di).map_or(&d.vertices[..], |(_, b)| &b[..]);
+            for k in 0..bytes.len() / stride {
+                let f = |o: usize| f32::from_le_bytes(bytes[k * stride + o..k * stride + o + 4].try_into().unwrap());
+                let c = h.vp * Vec4::new(f(0), f(4), f(8), 1.0);
+                total += 1;
+                inside += (c.w > 0.0 && c.x.abs() <= c.w && c.y.abs() <= c.w && c.z >= 0.0 && c.z <= c.w) as usize;
+            }
+        }
+        info!("unity hud series f{fno}: visible draws {shown} vertices on screen {inside}/{total}");
+    }
+    if std::env::var_os("UNITY_FRAME_STATS").is_some() && fno == 240 {
         // numeric view of what the shaders get: frustum coverage and the nearest draw's lights
         let (mut inside, mut total) = (0usize, 0usize);
         let mut nearest: Option<(f32, usize)> = None;
@@ -1398,6 +1430,33 @@ fn prepare(
             }
         }
         info!("unity camera (unity space) {:?}; sampled vertices inside frustum {inside}/{total}", ctx.cam_pos);
+        if let Some(h) = &hud_ctx {
+            // the viewmodel at rest through the HUD Camera: vertices on screen, and their screen bounds
+            let (mut inside, mut total) = (0usize, 0usize);
+            for (di, d) in scene.draws.iter().enumerate().filter(|(_, d)| d.hud) {
+                let i0 = inside;
+                let (lo, hi) = (&mut Vec2::splat(9.0), &mut Vec2::splat(-9.0));
+                let stride = scene.variants[d.variant as usize].stride as usize;
+                // the animated pose when this frame re-skinned it
+                let bytes = frame.skinned.iter().find(|(i, _)| *i == di).map_or(&d.vertices[..], |(_, b)| &b[..]);
+                let posed = bytes.as_ptr() != d.vertices.as_ptr();
+                let mut sum = Vec3::ZERO;
+                for k in 0..bytes.len() / stride {
+                    let f = |o: usize| f32::from_le_bytes(bytes[k * stride + o..k * stride + o + 4].try_into().unwrap());
+                    let c = h.vp * Vec4::new(f(0), f(4), f(8), 1.0);
+                    sum += h.v.transform_point3(Vec3::new(f(0), f(4), f(8)));
+                    total += 1;
+                    if c.w > 0.0 && c.x.abs() <= c.w && c.y.abs() <= c.w && c.z >= 0.0 && c.z <= c.w {
+                        inside += 1;
+                        let n = Vec2::new(c.x, c.y) / c.w;
+                        *lo = lo.min(n);
+                        *hi = hi.max(n);
+                    }
+                }
+                info!("  hud draw {di} node {} visible {} posed {posed} queue {} on screen {} ndc {lo:.2?}..{hi:.2?} view centroid {:.2?}", d.node, frame.visible.get(di).copied().unwrap_or(true), d.queue, inside - i0, sum / (bytes.len() / stride).max(1) as f32);
+            }
+            info!("unity hud camera {:?}: viewmodel vertices on screen {inside}/{total}", h.cam_pos);
+        }
         // which draws could cover the whole view: bounds containing the camera, or huge on screen
         let mut big: Vec<(f32, usize)> = scene
             .draws
@@ -1446,6 +1505,9 @@ fn prepare(
         if !frame.visible.get(di).copied().unwrap_or(true) {
             return false;
         }
+        if d.hud {
+            return hud_ctx.is_some();
+        }
         let c = frame.object_to_world.get(di).map_or(d.center, |o| o.transform_point3(d.center));
         planes.iter().all(|p| p.truncate().dot(c) + p.w >= -d.radius)
     }));
@@ -1461,7 +1523,8 @@ fn prepare(
         let var = &scene.variants[scene.draws[di].variant as usize];
         for &(_, off, size, cb) in &d.ubufs {
             let Some(cbd) = var.params.constant_buffers.get(cb) else { continue };
-            fill_cb(&mut staging[off as usize..(off + size) as usize], cbd, &scene, &frame, di, &ctx, &gpu.light_pick[di]);
+            let c = if scene.draws[di].hud { hud_ctx.as_ref().unwrap_or(&ctx) } else { &ctx };
+            fill_cb(&mut staging[off as usize..(off + size) as usize], cbd, &scene, &frame, di, c, &gpu.light_pick[di]);
             run = match run {
                 Some((s, e)) if off <= e.next_multiple_of(256) + 256 => Some((s, off + size)),
                 Some(r) => {
@@ -1491,7 +1554,8 @@ fn prepare(
         }
     }
     if std::env::var_os("UNITY_FRAME_STATS").is_some() && gpu.frames.load(std::sync::atomic::Ordering::Relaxed) == 240 {
-        info!("unity prepare: {:.2} ms; draws in view {}/{}", t_prepare.elapsed().as_secs_f64() * 1e3, gpu.in_view.iter().filter(|v| **v).count(), gpu.in_view.len());
+        let hud = scene.draws.iter().enumerate().filter(|(i, d)| d.hud && gpu.in_view[*i]).count();
+        info!("unity prepare: {:.2} ms; draws in view {}/{} (hud camera {hud}/{})", t_prepare.elapsed().as_secs_f64() * 1e3, gpu.in_view.iter().filter(|v| **v).count(), gpu.in_view.len(), scene.draws.iter().filter(|d| d.hud).count());
     }
 }
 
@@ -1575,25 +1639,39 @@ fn draw(
     // opaque by queue, then transparent back to front
     let cam = extracted.world_from_view.translation();
     let cam_u = Vec3::new(cam.x, cam.y, -cam.z);
-    let mut order: Vec<(i64, f32, usize)> = (0..gpu.draws.len())
-        .filter(|&i| gpu.draws[i].is_some() && gpu.in_view.get(i).copied().unwrap_or(false))
-        .map(|i| {
-            let d = &scene.draws[i];
-            let dist = d.center.distance(cam_u);
-            (d.queue, if d.queue >= 2500 { -dist } else { dist }, i)
-        })
-        .collect();
-    order.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+    let hud_u = scene.hud_cam.map_or(cam_u, |(w, _)| {
+        let c = w.w_axis.truncate();
+        Vec3::new(c.x, c.y, -c.z)
+    });
+    let sorted = |hud: bool| {
+        let eye = if hud { hud_u } else { cam_u };
+        let mut order: Vec<(i64, f32, usize)> = (0..gpu.draws.len())
+            .filter(|&i| gpu.draws[i].is_some() && scene.draws[i].hud == hud && gpu.in_view.get(i).copied().unwrap_or(false))
+            .map(|i| {
+                let d = &scene.draws[i];
+                let dist = d.center.distance(eye);
+                (d.queue, if d.queue >= 2500 { -dist } else { dist }, i)
+            })
+            .collect();
+        order.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+        order
+    };
     let t_draw = std::time::Instant::now();
     let c = scene.clear;
-    {
+    // Main Camera, then the HUD Camera (depth-only clear) over it
+    for hud in [false, true] {
+        let order = sorted(hud);
+        if hud && order.is_empty() {
+            continue;
+        }
+        let color_load = if hud { LoadOp::Load } else { LoadOp::Clear(wgpu_types::Color { r: c[0] as f64, g: c[1] as f64, b: c[2] as f64, a: 1.0 }) };
         let mut pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
-            label: Some("unity scene"),
+            label: Some(if hud { "unity hud camera" } else { "unity scene" }),
             color_attachments: &[Some(RenderPassColorAttachment {
                 view: color,
                 depth_slice: None,
                 resolve_target: None,
-                ops: Operations { load: LoadOp::Clear(wgpu_types::Color { r: c[0] as f64, g: c[1] as f64, b: c[2] as f64, a: 1.0 }), store: StoreOp::Store },
+                ops: Operations { load: color_load, store: StoreOp::Store },
             })],
             depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
                 view: depth,

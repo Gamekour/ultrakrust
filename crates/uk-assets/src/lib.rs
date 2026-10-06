@@ -2,6 +2,7 @@
 //! UnityFS bundles, SerializedFiles (typetree-driven), meshes, and level scenes.
 //! Nothing read here is bundled with ULTRAKRUST.
 
+pub mod addressables;
 pub mod anim;
 pub mod bundle;
 mod common_strings;

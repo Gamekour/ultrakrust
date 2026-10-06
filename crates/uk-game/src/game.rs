@@ -87,6 +87,8 @@ pub struct State {
     pub checkpoint_pos: Option<Vec3>,
     pub checkpoint_yaw: f32,
     pub anim: Vec<crate::anim::AnimatorState>,
+    /// UnityEngine.Random stand-in for viewmodel animator rolls (PunchRandomizer, RandomChance)
+    pub vm_rng: u32,
 }
 
 pub struct Mover {
@@ -118,6 +120,10 @@ pub struct Game {
     scripts_by_node: Vec<Vec<u32>>,
     pub unknown_calls: std::collections::BTreeSet<String>,
     pub anim: crate::anim::Anim,
+    /// Viewmodel roots GunSetter / FistControl instantiated (layer 13): the revolver shows once owned.
+    pub vm_revolver: Option<u32>,
+    /// Rigs of the viewmodel Animators: (Revolver, Arm Blue / Punch)
+    pub vm_rigs: (Option<usize>, Option<usize>),
 }
 
 fn layer_solid(l: u8) -> bool {
@@ -273,6 +279,7 @@ impl Game {
             checkpoint_pos: None,
             checkpoint_yaw: 0.0,
             anim: anim_states,
+            vm_rng: 0x9E37_79B9,
         };
         let mut g = Game {
             def: def.clone(),
@@ -293,7 +300,27 @@ impl Game {
             scripts_by_node,
             unknown_calls: Default::default(),
             anim,
+            vm_revolver: def.scripts.iter().find(|s| s.class == "Revolver" && s.file.is_some()).map(|s| s.node),
+            vm_rigs: (None, None),
         };
+        // viewmodel animators by the parameters their scripts drive (Revolver.Shoot, Punch.PunchStart)
+        let vm_rig = |param: &str| {
+            (0..def.animators.len() as u32).find_map(|a| {
+                let x = &def.animators[a as usize];
+                let c = &def.controllers[x.controller? as usize].ctrl;
+                (def.nodes[x.node as usize].layer == uk_assets::scenedef::VIEWMODEL_LAYER && c.params.iter().any(|p| c.name(p.id) == param)).then_some(a)
+            })
+        };
+        g.vm_rigs = (vm_rig("Shoot").and_then(|a| g.anim.rig_of_animator(a)), vm_rig("Punch").and_then(|a| g.anim.rig_of_animator(a)));
+        // HookArm.Start: the arm model only shows while the hook is out
+        for s in def.scripts.iter().filter(|s| s.class == "HookArm") {
+            if let Some(m) = def.node_ref(s.data.get("model")) {
+                g.s.active_self[m as usize] = false;
+            }
+        }
+        if let Some(r) = g.vm_revolver {
+            g.s.active_self[r as usize] = g.s.has_revolver;
+        }
         // Scene load: activate roots (Awake/OnEnable for everything initially active).
         let roots: Vec<u32> = (0..n as u32).filter(|&i| def.nodes[i as usize].parent.is_none()).collect();
         for r in roots {
@@ -1650,6 +1677,12 @@ impl Game {
             return;
         }
         self.run_starts();
+        // GunControl: the revolver viewmodel is out once picked up
+        if let Some(r) = self.vm_revolver {
+            if self.s.active_self[r as usize] != self.s.has_revolver {
+                self.set_active(r, self.s.has_revolver);
+            }
+        }
         // timers
         let t = self.s.time;
         let mut due: Vec<Invoke> = Vec::new();

@@ -195,6 +195,10 @@ fn setup(
                 Projection::from(PerspectiveProjection { fov: 90f32.to_radians(), near: 0.01, ..default() }),
                 RenderLayers::layer(VIEW_LAYER),
             ));
+            // ULTRAKILL's own viewmodel (layer 13, HUD Camera) replaces these on the Unity path
+            if unity_shaders && is_level {
+                return;
+            }
             // Placeholder revolver: body + barrel + cylinder.
             let gun = materials.add(StandardMaterial { base_color: Color::srgb(0.55, 0.56, 0.6), metallic: 0.7, ..default() });
             let grip = materials.add(Color::srgb(0.25, 0.12, 0.06));
@@ -479,7 +483,8 @@ fn frame_sim(
             sim.game.fire_revolver(eye, aim, shot == Shot::Pierce);
         }
     }
-    if alive && captured && keys.just_pressed(KeyCode::KeyF) && sim.punch_cd <= 0.0 {
+    let probe_punch = std::env::var_os("UK_PROBE_PUNCH").is_some();
+    if alive && (probe_punch || captured && keys.just_pressed(KeyCode::KeyF)) && sim.punch_cd <= 0.0 {
         // FistControl: fistCooldown = cooldownCost (2) * 0.25
         sim.punch_cd = 0.5;
         sim.punch_anim = 1.0;
@@ -564,8 +569,8 @@ fn apply_view(
     fixed: Res<Time<Fixed>>,
     tour: Option<Res<tour::Tour>>,
     mut cam: Single<(&mut Transform, &mut Projection), With<MainCam>>,
-    mut vm: Single<(&mut Transform, &mut Visibility), (With<ViewModel>, Without<MainCam>)>,
-    mut fist: Single<&mut Transform, (With<FistModel>, Without<MainCam>, Without<ViewModel>)>,
+    vm: Option<Single<(&mut Transform, &mut Visibility), (With<ViewModel>, Without<MainCam>)>>,
+    fist: Option<Single<&mut Transform, (With<FistModel>, Without<MainCam>, Without<ViewModel>)>>,
 ) {
     let alpha = fixed.overstep_fraction();
     let pos = sim.game.s.player.interpolated_pos(alpha) + sim.cam.local_pos;
@@ -581,6 +586,7 @@ fn apply_view(
             p.fov = 75f32.to_radians();
         }
     }
+    let (Some(mut vm), Some(mut fist)) = (vm, fist) else { return };
     // Revolver kick
     vm.0.translation = Vec3::new(0.32, -0.3, -0.55 + sim.recoil * 0.08);
     vm.0.rotation = Quat::from_rotation_x(sim.recoil * 0.35);

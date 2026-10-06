@@ -27,6 +27,8 @@ pub fn levels(install: &Path, filter: Option<&str>, r: &mut Report) {
         let out = Command::new(&exe)
             .args(["--level", l, "--unity-shaders", "--exit-after", "20"])
             .env("UNITY_FRAME_STATS", "1")
+            // punch on cooldown so the Feedbacker's Jab clips bring the viewmodel through the HUD Camera
+            .env("UK_PROBE_PUNCH", "1")
             .env("RUST_LOG", "info,naga=error,wgpu_hal=warn,wgpu_core=warn")
             .output();
         let Ok(out) = out else {
@@ -80,6 +82,18 @@ pub fn levels(install: &Path, filter: Option<&str>, r: &mut Report) {
             r.info(&format!("render.{l}.rigid_anim_draws_moved"), num("rigid_moved "));
         } else {
             r.note(format!("gap: render {l}: no anim stats"));
+        }
+        // viewmodel through the HUD Camera: best on-screen share of its visible posed vertices
+        let series: Vec<(f64, f64)> = log
+            .lines()
+            .filter_map(|l| {
+                let (a, b) = l.split("vertices on screen ").nth(1)?.split_whitespace().next()?.split_once('/')?;
+                l.contains("unity hud series").then(|| (a.parse().unwrap_or(0.0), b.parse().unwrap_or(0.0)))
+            })
+            .collect();
+        match series.iter().map(|(a, b)| 100.0 * a / b.max(1.0)).reduce(f64::max) {
+            Some(pct) => r.higher(&format!("render.{l}.viewmodel_on_screen_max_pct"), pct),
+            None => r.note(format!("gap: render {l}: no viewmodel through the HUD Camera")),
         }
         if errors == 0 && out.status.success() {
             ok_levels += 1;

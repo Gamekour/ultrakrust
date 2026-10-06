@@ -21,7 +21,7 @@ All numbers below are measured by tooling (`uk-harness --full`, `parity_scripts`
 | Script instances in scenes | 617k | 3.6% have a port, 1.4% a full one | |
 | Scenes that load | 54 | 54 | geometry, colliders, scene graph |
 | Enemy types (`EnemyType`) | 43 | 3, all partial (Filth, Stray, Malicious Face) | 7% |
-| Weapons | 5 guns × 3 variants + 3 arms + coins | Piercer revolver, Feedbacker (partial) | ~10% |
+| Weapons | 5 guns × 3 variants + 3 arms + coins | Piercer revolver, Feedbacker (partial); ULTRAKILL's own viewmodel prefabs, animated, through the HUD Camera | ~12% |
 | Style bonuses (`AddPoints`) | 61 distinct, 156 call sites | 0 | 0% |
 | Engine systems (unweighted mean, 37 tracked) | — | **25.7%** (was 22.7% at the gap analysis) | see §3 |
 | Level 0-1 autopilot (deterministic) | 56 waypoints | **43/56** (was 25 before NavMesh) | stalls at the Combo Hallway east stairs: the hand-written route asks for a 2-high step under a 3-high lintel; a bot route problem, not a game one |
@@ -141,7 +141,7 @@ Each phase ends when its harness metrics are green and added to the baseline. Co
    Filth and Strays re-path with `TrackTick`/`SetDestination`). Still open here: agent avoidance (enemies can stack),
    NavMeshObstacle carving, area costs, sibling order fix, ~~Animator + AnimationClip~~ (done: Mecanim runtime; Filth
    bites and Stray throws are timed by clip events; still open: root motion, IK, additive layers, humanoid muscles, V2 /
-   arm / script-driven animators), Rigidbody dynamics (gibs, physics props, knockback).
+   script-driven animators; the viewmodel Revolver and Arm Blue animators are fed from Shoot / Punch), Rigidbody dynamics (gibs, physics props, knockback).
 3. **Look (next):** PostProcessV2 as ULTRAKILL wires it (`PostProcessV2_Handler`): the main camera renders into
    color (ARGB32) + RG16 + view normal (the Master shader's 3 outputs) + depth; command buffers run the heat-wave blit and
    the 4-pass outline shader; the PostProcessV2 shader composites with `_Dither`, `_PaletteTex`, `_ColorPrecision` 2048,

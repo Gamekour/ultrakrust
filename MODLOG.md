@@ -159,3 +159,21 @@ CPU-skinned enemies, 3,393 colliders/569 triggers, 11,758 MonoBehaviours with ty
   broke; now explicit waypoints under the balcony -> balcony -> arena stair, plus a hallway corner
   before door 7. Holding at a waypoint gives up after hold+6 s with no targetable enemy; standing on a
   mover (lift/door group) doesn't count as stuck. probe_floor maps floor heights / surface columns.
+
+## Viewmodel: ULTRAKILL's prefabs through the HUD Camera (2026-10-06)
+- `uk_assets::addressables`: catalog.json reader (keys -> bundle + internal id); `scenedef::spawn_viewmodel` instantiates
+  GunSetter.revolverPierce and FistControl.blueArm into the scene (prefab objects keep `ScriptDef.file`).
+- HUD Camera (child of Main Camera, fov 90, culling mask layer 13, depth-only clear): layer-13 draws render in a second
+  pass (color Load, depth Clear) with the HUD Camera's view, frustum culling skipped.
+- Visibility as the scripts set it: HookArm.Start hides `model` (shows only while the hook is out); GunControl shows the
+  revolver once picked up; Arm Blue/Arm2 is off in the prefab.
+- Animator feed: Revolver.Shoot -> `RandomChance` roll + `Shoot` (Shoot / Shoot2), charged beam -> `ChargeShoot` (Shoot3);
+  Punch -> `PunchRandomizer` roll + `Punch` (Jab / Jab2). Deterministic xorshift (`s.vm_rng`) stands in for UnityEngine.Random.
+- The Feedbacker's Idle pose is below the HUD frustum (0 vertices on screen) as in ULTRAKILL; punching brings
+  52-77% of its vertices on screen. Probe: `UNITY_FRAME_STATS` logs `unity hud series` every 10 frames 200..400;
+  `UK_PROBE_PUNCH=1` punches on cooldown. Harness: `render.<level>.viewmodel_on_screen_max_pct`.
+- Arm Blue's controller carries curves for two rigs: Feedbacker (`Armature/UpperArm/...`) and the disabled Arm2
+  (`Armature/Upper Arm/...`). One Animator binds against one root, so the 51 Arm2 slots stay inert, as in Unity
+  (`animrt.slots_bound_pct` 90.96 -> 90.27). `examples/unbound.rs` resolves unbound hashes against every node-path suffix.
+- Prefab lookups cache the catalog and each bundle's m_Container (was ~265 ms per lookup; scene load back to baseline).
+- Re-blessed: 10 authored viewmodel triangles face against their normals (det > 0, winding as stored).

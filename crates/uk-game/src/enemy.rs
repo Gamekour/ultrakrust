@@ -830,6 +830,12 @@ pub fn kill_enemy(g: &mut Game, e: usize) {
 impl Game {
     /// Revolver hitscan. Normal beams stop at the first body; piercing beams pass through enemies.
     pub fn fire_revolver(&mut self, eye: Vec3, dir: Vec3, pierce: bool) {
+        // Revolver.Shoot: RandomChance picks Shoot / Shoot2; the charged beam plays Shoot3
+        if let Some(r) = self.vm_rigs.0 {
+            let roll = next_rand(&mut self.s.vm_rng);
+            crate::anim::set_param(self, r, "RandomChance", roll);
+            crate::anim::set_param(self, r, if pierce { "ChargeShoot" } else { "Shoot" }, 1.0);
+        }
         let dir = dir.normalize_or_zero();
         let max = 1000.0;
         let env = self.world.raycast(eye, dir, max);
@@ -901,6 +907,12 @@ impl Game {
 
     /// Feedbacker punch: enemies within 4 (ray, then r=1 sphere cast), else breakables; parries projectiles.
     pub fn punch(&mut self, eye: Vec3, dir: Vec3) {
+        // Punch.PunchStart: PunchRandomizer picks Jab / Jab2
+        if let Some(r) = self.vm_rigs.1 {
+            let roll = next_rand(&mut self.s.vm_rng);
+            crate::anim::set_param(self, r, "PunchRandomizer", roll);
+            crate::anim::set_param(self, r, "Punch", 1.0);
+        }
         let dir = dir.normalize_or_zero();
         // parry: projectiles in the zone in front of the camera
         let mut parried = false;

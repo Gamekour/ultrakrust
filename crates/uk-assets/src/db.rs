@@ -16,6 +16,10 @@ pub struct AssetDb {
     files: HashMap<String, Arc<SerializedFile>>,
     /// resource name (e.g. "CAB-x.resS") → bytes
     resources: HashMap<String, Arc<[u8]>>,
+    /// per bundle: AssetBundle `m_Container` (lowercase asset path -> (file, PPtr)), read once
+    pub containers: HashMap<PathBuf, Arc<HashMap<String, (Arc<SerializedFile>, (i32, i64))>>>,
+    /// Addressables catalog, parsed on first use
+    pub catalog: Option<Arc<crate::addressables::Catalog>>,
 }
 
 /// A reference to an object in a specific serialized file.
@@ -60,6 +64,8 @@ impl AssetDb {
             bundles: HashMap::new(),
             files: HashMap::new(),
             resources: HashMap::new(),
+            containers: HashMap::new(),
+            catalog: None,
         })
     }
 
