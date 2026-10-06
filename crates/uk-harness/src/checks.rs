@@ -57,8 +57,15 @@ pub fn level_0_1(install: &Path, r: &mut Report) {
     };
     let first_load_ms = t.elapsed().as_secs_f64() * 1e3;
     let t = Instant::now();
-    let _ = Game::new(def.clone());
+    let mut g = Game::new(def.clone());
     r.lower("perf.0-1.game_build_ms", t.elapsed().as_secs_f64() * 1e3, 0.35);
+    let mut rt = crate::anim::RtTotals::default();
+    crate::anim::runtime(&mut g, 240, &mut rt);
+    r.higher("animrt.0-1.rigs", rt.rigs as f64);
+    r.higher("animrt.0-1.moved_nodes", rt.moved_nodes as f64);
+    r.higher("animrt.0-1.slots_bound_pct", 100.0 * rt.slots_bound as f64 / rt.slots.max(1) as f64);
+    crate::anim::enemy_attacks(&def, r);
+    r.pass("animrt.0-1.finite", rt.nonfinite == 0, format!("{} non-finite", rt.nonfinite));
     r.pass("0-1.load", true, "");
     // A second, independent load: every HashMap gets a fresh random seed, so any load-order
     // dependence on hash iteration shows up as a divergence. Load time = the faster of the two,

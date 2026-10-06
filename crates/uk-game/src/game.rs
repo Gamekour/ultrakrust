@@ -55,6 +55,8 @@ pub enum GameEvent {
     LevelComplete,
     Shot { from: Vec3, to: Vec3, pierce: bool },
     PunchHit,
+    /// AnimationEvent fired by a clip on the Animator at `node`.
+    AnimEvent { node: u32, function: String, string: String, float: f32, int: i32 },
 }
 
 #[derive(Clone)]
@@ -84,6 +86,7 @@ pub struct State {
     pub kills: u32,
     pub checkpoint_pos: Option<Vec3>,
     pub checkpoint_yaw: f32,
+    pub anim: Vec<crate::anim::AnimatorState>,
 }
 
 pub struct Mover {
@@ -114,6 +117,7 @@ pub struct Game {
     pending_events: Vec<(u32, bool)>,
     scripts_by_node: Vec<Vec<u32>>,
     pub unknown_calls: std::collections::BTreeSet<String>,
+    pub anim: crate::anim::Anim,
 }
 
 fn layer_solid(l: u8) -> bool {
@@ -242,6 +246,7 @@ impl Game {
         player.yaw_deg = spawn_yaw;
         player.activated = activated;
 
+        let (anim, anim_states) = crate::anim::Anim::new(&def);
         let s = State {
             time: 0.0,
             active_self: def.nodes.iter().map(|n| n.active_self).collect(),
@@ -267,6 +272,7 @@ impl Game {
             kills: 0,
             checkpoint_pos: None,
             checkpoint_yaw: 0.0,
+            anim: anim_states,
         };
         let mut g = Game {
             def: def.clone(),
@@ -286,6 +292,7 @@ impl Game {
             pending_events: Vec::new(),
             scripts_by_node,
             unknown_calls: Default::default(),
+            anim,
         };
         // Scene load: activate roots (Awake/OnEnable for everything initially active).
         let roots: Vec<u32> = (0..n as u32).filter(|&i| def.nodes[i as usize].parent.is_none()).collect();
@@ -295,6 +302,7 @@ impl Game {
         g.flush_events();
         g.run_starts();
         g.sync_world();
+        enemy::bind_rigs(&mut g);
         g.start = Some(Box::new(g.s.clone()));
         g
     }
@@ -1707,6 +1715,9 @@ impl Game {
             self.hurt_player(999_999, false);
         }
         self.check_weapons();
+        let ev0 = self.events.len();
+        crate::anim::update(self, dt);
+        enemy::anim_events(self, ev0);
     }
 
     /// Weapons: the real game unlocks them from save progress (GunSetter); here picking up

@@ -680,6 +680,18 @@ fn unity_frame(sim: Res<Sim>, scene: Res<unity_render::UnityScene>, time: Res<Ti
     *n += 1;
     if *n == 120 && std::env::var_os("UNITY_FRAME_STATS").is_some() {
         info!("unity frame state (main world): {:.2} ms", t.elapsed().as_secs_f64() * 1e3);
+        let (checked, err) = unity_render::skin_rest_error(&sim.game, scene);
+        let rigid = out.object_to_world.iter().zip(&scene.draws).filter(|(o, d)| d.skin.is_none() && sim.game.anim.animated(d.node) && !o.abs_diff_eq(Mat4::IDENTITY, 1e-4)).count();
+        let a = &sim.game.anim;
+        let bound = scene.draws.iter().filter(|d| match &d.skin { Some(sk) => sk.def.bones.iter().flatten().any(|&b| a.animated(b)), None => a.animated(d.node) }).count();
+        let bound_vis = scene.draws.iter().zip(out.visible.iter()).filter(|(d, v)| **v && match &d.skin { Some(sk) => sk.def.bones.iter().flatten().any(|&b| a.animated(b)), None => a.animated(d.node) }).count();
+        info!(
+            "unity anim stats: anim_bound {bound} anim_bound_visible {bound_vis} updated {} skinned {} reskinned {} rigid_moved {} rest_checked {checked} rest_err {err:.6}",
+            a.stats.updated_last_frame,
+            scene.draws.iter().filter(|d| d.skin.is_some()).count(),
+            out.skinned.len(),
+            rigid
+        );
     }
 }
 

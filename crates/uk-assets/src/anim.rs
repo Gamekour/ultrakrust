@@ -227,14 +227,18 @@ pub fn width(t: Target) -> usize {
 
 /// Unity's path hash for animation bindings (CRC32 / IEEE of the UTF-8 path, "a/b/c").
 pub fn path_hash(path: &str) -> u32 {
-    let mut crc = !0u32;
-    for &b in path.as_bytes() {
+    !crc_feed(!0, path.as_bytes())
+}
+
+/// Running (un-finalized) CRC32 of `path_hash`: hash a path's prefix once, extend per child.
+pub fn crc_feed(mut crc: u32, bytes: &[u8]) -> u32 {
+    for &b in bytes {
         crc ^= b as u32;
         for _ in 0..8 {
             crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
         }
     }
-    !crc
+    crc
 }
 
 // ---------------------------------------------------------------------------------------------

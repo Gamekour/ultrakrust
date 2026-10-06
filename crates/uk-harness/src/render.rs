@@ -69,6 +69,18 @@ pub fn levels(install: &Path, filter: Option<&str>, r: &mut Report) {
             }
             None => r.note(format!("gap: render {l}: PostProcessV2 composite not drawn")),
         }
+        if let Some(line) = grab(&log, "unity anim stats:") {
+            let num = |key: &str| line.split(key).nth(1).and_then(|s| s.split_whitespace().next()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(-1.0);
+            let err = num("rest_err ");
+            r.pass(&format!("render.{l}.skin_rest_match"), (0.0..1e-3).contains(&err), format!("re-skinned rest pose off baked vertices by {err}"));
+            r.info(&format!("render.{l}.skinned_draws"), num("skinned "));
+            r.info(&format!("render.{l}.anim_bound_visible_draws"), num("anim_bound_visible "));
+            r.info(&format!("render.{l}.animators_updated"), num("updated "));
+            r.info(&format!("render.{l}.reskinned_draws"), num("reskinned "));
+            r.info(&format!("render.{l}.rigid_anim_draws_moved"), num("rigid_moved "));
+        } else {
+            r.note(format!("gap: render {l}: no anim stats"));
+        }
         if errors == 0 && out.status.success() {
             ok_levels += 1;
         } else {

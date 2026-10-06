@@ -21,6 +21,7 @@ pub fn all_scenes(install: &Path, r: &mut Report) {
     let mut classes = BTreeSet::new();
     let mut native: BTreeMap<i32, usize> = BTreeMap::new();
     let mut load_ms = 0.0;
+    let mut rt = crate::anim::RtTotals::default();
     for b in &bundles {
         let name = b.file_name().unwrap().to_string_lossy().to_string();
         let t = Instant::now();
@@ -34,11 +35,12 @@ pub fn all_scenes(install: &Path, r: &mut Report) {
                 let def = std::sync::Arc::new(def);
                 let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| uk_game::Game::new(def.clone())));
                 match built {
-                    Ok(g) => {
+                    Ok(mut g) => {
                         games_built += 1;
                         if g.nav.is_some() {
                             crate::checks::nav_checks(&short, &g, r);
                         }
+                        crate::anim::runtime(&mut g, 120, &mut rt);
                     }
                     Err(_) => r.note(format!("FAIL game build {short}: panicked")),
                 }
@@ -85,6 +87,7 @@ pub fn all_scenes(install: &Path, r: &mut Report) {
     }
     r.higher("cov.scenes_loading", loaded as f64);
     r.pass("all.games_build", games_built == loaded, format!("{games_built}/{loaded} scenes build a Game"));
+    crate::anim::report_runtime(&rt, r);
     r.info("cov.scenes_total", bundles.len() as f64);
     r.pass("all.scenes_load", loaded == bundles.len(), format!("{loaded}/{} scenes load", bundles.len()));
     r.lower("perf.all.scene_load_ms_total", load_ms, 0.35);

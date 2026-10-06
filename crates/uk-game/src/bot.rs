@@ -169,7 +169,8 @@ impl Bot {
             }
             self.hold_t += dt;
             let any_enemy = g.s.enemies.iter().any(|e| e.alive && g.active(e.node));
-            if self.hold_t >= wp.hold && !any_enemy {
+            // wait out live enemies, but not ones out of sight for long (none targetable here)
+            if self.hold_t >= wp.hold && (!any_enemy || self.hold_t >= wp.hold + 6.0) {
                 self.idx += 1;
                 self.hold_t = -1.0;
                 self.best_dist = f32::MAX;
@@ -210,7 +211,8 @@ impl Bot {
         if d < self.best_dist - 0.5 {
             self.best_dist = d;
             self.since_progress = 0.0;
-        } else {
+        } else if !(p.gc.on_ground && p.gc.cols.iter().any(|c| c.group != 0)) {
+            // (standing on a mover - lift, door - waits for it rather than counting as stuck)
             self.since_progress += dt;
         }
         // target below us and stuck: break the floor (glass) by shooting / punching straight down
@@ -301,10 +303,15 @@ pub fn route_0_1() -> Vec<Waypoint> {
         w(40.0, 8.0, -623.5, "door 4", 1.5),
         w(65.5, 19.0, -640.0, "door 5", 3.0),
         w(76.0, 18.0, -640.0, "checkpoint 4", 4.0),
+        // the balcony (wall-jump up from under its edge), then its stair onto the arena block
+        w(95.0, 18.0, -623.0, "under the balcony", 2.5),
+        w(95.0, 28.0, -617.0, "balcony", 3.0),
+        w(89.0, 31.0, -626.0, "arena stair", 2.0),
         w(88.0, 36.0, -640.0, "projectile arena", 6.0),
         w(146.5, 30.0, -640.0, "door 6", 3.0),
         w(157.0, 28.0, -640.0, "checkpoint 1", 4.0),
         w(180.0, 30.0, -640.0, "combo hallway", 6.0),
+        w(190.0, 28.0, -639.0, "hallway corner", 2.0),
         w(192.0, 30.0, -594.5, "door 7", 3.0),
         w(192.0, 30.0, -599.0, "past door 7", 1.5),
         w(201.0, 37.0, -597.0, "east stairs", 1.5),

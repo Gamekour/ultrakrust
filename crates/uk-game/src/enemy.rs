@@ -74,6 +74,15 @@ pub struct Enemy {
     pub path: Vec<crate::nav::Corner>,
     pub path_i: usize,
     pub track_t: f32,
+    /// Mecanim rig of the enemy's Animator (attack timing then comes from clip events)
+    pub rig: Option<usize>,
+    /// turning toward the target (cleared by the StopTracking clip event)
+    pub tracking: bool,
+    /// between the DamageStart and DamageEnd clip events
+    pub damaging: bool,
+    pub was_grounded: bool,
+    /// seconds off the ground (step-down flicker is not a fall)
+    pub air_t: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -195,6 +204,11 @@ impl Enemy {
             path: Vec::new(),
             path_i: 0,
             track_t: 0.0,
+            rig: None,
+            tracking: true,
+            damaging: false,
+            was_grounded: true,
+            air_t: 0.0,
         })
     }
 
@@ -378,7 +392,7 @@ pub fn fixed_update(g: &mut Game) {
         en.vel.z = nh.z;
         en.vel.y += GRAVITY * dt;
         en.vel.y = en.vel.y.max(-100.0);
-        if dist > 0.1 {
+        if dist > 0.1 && en.tracking {
             let want = dir.x.atan2(-dir.z);
             let diff = (want - en.yaw + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
             en.yaw += diff.clamp(-8.0 * dt, 8.0 * dt);
@@ -486,6 +500,97 @@ pub fn fixed_update(g: &mut Game) {
 }
 
 /// Attacks, timers, deaths (per frame).
+fn start_attack(g: &mut Game, i: usize) {
+    let en = &mut g.s.enemies[i];
+    en.attacking = true;
+    en.attack_t = 0.0;
+    en.hit_done = false;
+    en.damaging = false;
+    if let Some(r) = en.rig {
+        crate::anim::set_param(g, r, "Swing", 1.0);
+    }
+}
+
+fn end_attack(en: &mut Enemy) {
+    en.attacking = false;
+    en.damaging = false;
+    en.tracking = true;
+    en.cooldown = match en.kind {
+        Kind::Filth => 0.5,
+        _ => 1.0 + pseudo_rand(en.node as f32 + en.attack_t) * 1.5,
+    };
+}
+
+fn stray_throw(g: &mut Game, i: usize, target: Vec3) {
+    let en = &mut g.s.enemies[i];
+    en.hit_done = true;
+    let from = en.center() + Vec3::Y * 1.0;
+    let dir = (target + Vec3::Y * 1.0 - from).normalize_or_zero();
+    g.s.projectiles.push(Projectile { pos: from + dir, vel: dir * 65.0, damage: 25.0, friendly: false, life: 10.0 });
+}
+
+/// Each enemy's Animator rig: the first Animator on the enemy root or below it.
+pub fn bind_rigs(g: &mut Game) {
+    for i in 0..g.s.enemies.len() {
+        let node = g.s.enemies[i].node;
+        g.s.enemies[i].rig = (0..g.def.animators.len() as u32).filter(|&a| g.def.is_descendant(g.def.animators[a as usize].node, node)).find_map(|a| g.anim.rig_of_animator(a));
+    }
+}
+
+/// The Animator feed of Zombie.Update: Running / RunSpeed from the agent's velocity, Falling
+/// while airborne (StartFalling on leaving the ground).
+fn drive_animator(g: &mut Game, i: usize, dt: f32) {
+    let en = &mut g.s.enemies[i];
+    let Some(r) = en.rig else { return };
+    let max = match en.kind {
+        Kind::Filth => 20.0,
+        Kind::Stray => 10.0,
+        _ => return,
+    };
+    let h = Vec3::new(en.vel.x, 0.0, en.vel.z).length();
+    // the NavMeshAgent pins a walking zombie to the mesh: only a real airborne spell (knockback,
+    // ledge) reads as falling
+    en.air_t = if en.grounded { 0.0 } else { en.air_t + dt };
+    let (grounded, was) = (en.air_t < 0.15, en.was_grounded);
+    en.was_grounded = grounded;
+    crate::anim::set_param(g, r, "Running", (h > 0.1) as i32 as f32);
+    crate::anim::set_param(g, r, "RunSpeed", (h / max).min(1.0));
+    crate::anim::set_param(g, r, "Falling", (!grounded) as i32 as f32);
+    if was && !grounded {
+        crate::anim::set_param(g, r, "StartFalling", 1.0);
+    }
+}
+
+/// Clip events fired this frame (`g.events[from..]`) routed to the enemy owning the Animator:
+/// the attack's tracking / damage window / projectile / end come from the animation, as in
+/// ZombieMelee and ZombieProjectiles.
+pub fn anim_events(g: &mut Game, from: usize) {
+    let mut hits = Vec::new();
+    for e in &g.events[from.min(g.events.len())..] {
+        let GameEvent::AnimEvent { node, function, .. } = e else { continue };
+        let Some(i) = g.s.enemies.iter().position(|en| en.alive && en.rig.is_some_and(|r| g.def.animators[g.anim.rig_info(r).0 as usize].node == *node)) else { continue };
+        hits.push((i, function.clone()));
+    }
+    if hits.is_empty() {
+        return;
+    }
+    let target = player_target(g);
+    for (i, f) in hits {
+        let en = &mut g.s.enemies[i];
+        if !en.attacking {
+            continue;
+        }
+        match f.as_str() {
+            "StopTracking" => en.tracking = false,
+            "DamageStart" => en.damaging = true,
+            "DamageEnd" => en.damaging = false,
+            "ThrowProjectile" if !en.hit_done => stray_throw(g, i, target),
+            "SwingEnd" => end_attack(en),
+            _ => {}
+        }
+    }
+}
+
 pub fn update(g: &mut Game, dt: f32) {
     let target = player_target(g);
     let player_pos = g.s.player.pos;
@@ -517,14 +622,14 @@ pub fn update(g: &mut Game, dt: f32) {
                     en.cooldown = move_towards(en.cooldown, 0.0, 0.4 * dt);
                 }
                 if !en.attacking && en.cooldown <= 0.0 && en.grounded && flat.length() < 3.0 {
-                    en.attacking = true;
-                    en.attack_t = 0.0;
-                    en.hit_done = false;
+                    start_attack(g, i);
                 }
+                let en = &mut g.s.enemies[i];
                 if en.attacking {
                     en.attack_t += dt;
-                    // bite: damage window during the lunge
-                    if !en.hit_done && en.attack_t > 0.45 && en.attack_t < 0.65 {
+                    // bite: damage window during the lunge (DamageStart..DamageEnd when animated)
+                    let window = if en.rig.is_some() { en.damaging } else { en.attack_t > 0.45 && en.attack_t < 0.65 };
+                    if !en.hit_done && window {
                         let fwd = Vec3::new(en.yaw.sin(), 0.0, -en.yaw.cos());
                         let to = player_pos - en.pos;
                         if to.length() < 3.5 && fwd.dot(Vec3::new(to.x, 0.0, to.z).normalize_or_zero()) > 0.3 {
@@ -534,9 +639,9 @@ pub fn update(g: &mut Game, dt: f32) {
                         }
                     }
                     let en = &mut g.s.enemies[i];
-                    if en.attack_t > 1.0 {
-                        en.attacking = false;
-                        en.cooldown = 0.5;
+                    // animated: SwingEnd ends it (timeout only guards a rig stuck elsewhere)
+                    if en.attack_t > if en.rig.is_some() { 4.0 } else { 1.0 } {
+                        end_attack(en);
                     }
                 }
             }
@@ -546,22 +651,18 @@ pub fn update(g: &mut Game, dt: f32) {
                 }
                 let in_range = dist < if en.cooldown <= 0.0 { 60.0 } else { 30.0 };
                 if !en.attacking && en.cooldown <= 0.0 && in_range {
-                    en.attacking = true;
-                    en.attack_t = 0.0;
-                    en.hit_done = false;
+                    start_attack(g, i);
                 }
+                let en = &mut g.s.enemies[i];
                 if en.attacking {
                     en.attack_t += dt;
-                    if !en.hit_done && en.attack_t > 0.55 {
-                        en.hit_done = true;
-                        let from = en.center() + Vec3::Y * 1.0;
-                        let dir = (target + Vec3::Y * 1.0 - from).normalize_or_zero();
-                        g.s.projectiles.push(Projectile { pos: from + dir, vel: dir * 65.0, damage: 25.0, friendly: false, life: 10.0 });
+                    // animated: the ThrowProjectile clip event throws
+                    if en.rig.is_none() && !en.hit_done && en.attack_t > 0.55 {
+                        stray_throw(g, i, target);
                     }
                     let en = &mut g.s.enemies[i];
-                    if en.attack_t > 0.9 {
-                        en.attacking = false;
-                        en.cooldown = 1.0 + pseudo_rand(i as f32 + g_time_seed(dist)) * 1.5;
+                    if en.attack_t > if en.rig.is_some() { 4.0 } else { 0.9 } {
+                        end_attack(en);
                     }
                 }
             }
@@ -570,6 +671,7 @@ pub fn update(g: &mut Game, dt: f32) {
             }
             Kind::Other => {}
         }
+        drive_animator(g, i, dt);
     }
 }
 
@@ -670,9 +772,6 @@ fn pseudo_rand(x: f32) -> f32 {
     ((x * 12.9898).sin() * 43758.547).fract().abs()
 }
 
-fn g_time_seed(d: f32) -> f32 {
-    d * 7.13
-}
 
 pub fn damage_enemy(g: &mut Game, e: usize, base: f32, zone: HitZone, hit_pos: Vec3) {
     let en = &mut g.s.enemies[e];

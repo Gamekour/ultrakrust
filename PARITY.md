@@ -139,8 +139,9 @@ Each phase ends when its harness metrics are green and added to the baseline. Co
 1. **Foundation (done):** harness, determinism fix, coverage registry, baseline.
 2. **Unblock play:** ~~NavMesh reader + agents~~ (done: Detour v16 reader, polygon graph, A*, funnel, off-mesh links;
    Filth and Strays re-path with `TrackTick`/`SetDestination`). Still open here: agent avoidance (enemies can stack),
-   NavMeshObstacle carving, area costs, sibling order fix, Animator + AnimationClip (enemy attack timing depends on
-   animation events), Rigidbody dynamics (gibs, physics props, knockback).
+   NavMeshObstacle carving, area costs, sibling order fix, ~~Animator + AnimationClip~~ (done: Mecanim runtime; Filth
+   bites and Stray throws are timed by clip events; still open: root motion, IK, additive layers, humanoid muscles, V2 /
+   arm / script-driven animators), Rigidbody dynamics (gibs, physics props, knockback).
 3. **Look (next):** PostProcessV2 as ULTRAKILL wires it (`PostProcessV2_Handler`): the main camera renders into
    color (ARGB32) + RG16 + view normal (the Master shader's 3 outputs) + depth; command buffers run the heat-wave blit and
    the 4-pass outline shader; the PostProcessV2 shader composites with `_Dither`, `_PaletteTex`, `_ColorPrecision` 2048,

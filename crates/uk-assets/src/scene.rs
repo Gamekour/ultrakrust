@@ -54,6 +54,8 @@ pub struct Batch {
     /// Vertex colors (white when the mesh has none).
     pub colors: Vec<[f32; 4]>,
     pub indices: Vec<u32>,
+    /// Source mesh vertex of each batch vertex (re-skinning writes through this).
+    pub src: Vec<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -386,6 +388,7 @@ pub(crate) fn bake(b: &mut Batch, mesh: &MeshData, indices: &[u32], m: Mat4) {
             b.normals.push(to_bevy_point(n).to_array());
             b.uvs.push(mesh.uv0.get(i as usize).copied().unwrap_or([0.0, 0.0]));
             b.colors.push(mesh.colors.get(i as usize).copied().unwrap_or([1.0; 4]));
+            b.src.push(i);
             next
         });
         local.push(idx);

@@ -3,6 +3,7 @@
 //! Breakable, Glass, CheckPoint, DeathZone, TeleportPlayer, FinalDoor, ...),
 //! enemies and combat, on top of `uk-core`'s movement and collision.
 
+pub mod anim;
 pub mod bot;
 pub mod enemy;
 pub mod game;

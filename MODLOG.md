@@ -141,3 +141,21 @@ CPU-skinned enemies, 3,393 colliders/569 triggers, 11,758 MonoBehaviours with ty
   unwritten (vertex outputs added as zero), `_CausticVolumeData` is a read-only storage buffer (bound zeroed).
 - Bevy 0.19: custom Core3d system + own passes; pipeline layout = Vec<BindGroupLayoutDescriptor>; ViewTarget
   get_color_attachment() clears on first use; wgpu Color/types from wgpu-types 29.0.4.
+
+## Mecanim runtime + animated enemies (2026-10-06)
+- `uk_game::anim`: per-Animator rigs (bindings resolved by CRC32 of the transform path, as Unity's `m_TOS`), layers
+  (override/weight; additive still skipped), state machines with exit-time / condition transitions, ANY-state,
+  trigger consumption, cross-fades (normalized durations), 1D/2D/direct blend trees, write-defaults to the rest pose,
+  clip events -> `GameEvent::AnimEvent`. Controllers inactive with `keepAnimatorStateOnDisable` off reset to defaults.
+- Skinned meshes re-skin from the animated bones every frame (Unity renderer).
+- Zombie feed (Zombie.Update): `Running` = agent speed > 0.1, `RunSpeed` = speed / max (Filth 20, Stray 10),
+  `Falling` / `StartFalling` only after 0.15 s airborne (the NavMeshAgent keeps a walking zombie on the mesh; raw
+  ground flicker on steps would otherwise cut the Attack state).
+- Attack timing from the clips, as ZombieMelee / ZombieProjectiles: Filth Bite (1.15 s, speed 0.85) StopTracking 0.22,
+  DamageStart 0.34, DamageEnd 0.51, SwingEnd 0.97; Stray ThrowProjectile (2.08 s, speed 1.25) SpawnProjectile 0.31,
+  ThrowProjectile 0.64, SwingEnd 0.95. Harness: `animrt.0-1.filth_attack` / `stray_attack`.
+- Cost: ~2.3 us per animated rig (all 110 rigs of 0-1 on: 0.25 ms).
+- Bot route 0-1: the projectile-arena climb was a lucky wall-jump that animated (slower-dying) Strays
+  broke; now explicit waypoints under the balcony -> balcony -> arena stair, plus a hallway corner
+  before door 7. Holding at a waypoint gives up after hold+6 s with no targetable enemy; standing on a
+  mover (lift/door group) doesn't count as stuck. probe_floor maps floor heights / surface columns.

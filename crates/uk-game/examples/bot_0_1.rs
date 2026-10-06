@@ -48,11 +48,30 @@ fn main() {
         for l in bot.log.drain(..) {
             println!("{l}");
         }
+        if let Ok(w) = std::env::var("TRACE") {
+            let v: Vec<f64> = w.split(',').map(|x| x.parse().unwrap()).collect();
+            if t >= v[0] && t <= v[1] && (t * 2.0).fract() < 0.01 {
+                let p = &g.s.player;
+                let alive = g.s.enemies.iter().filter(|e| e.alive && g.active(e.node)).count();
+                let al: Vec<String> = g.s.enemies.iter().filter(|e| e.alive && g.active(e.node)).map(|e| format!("{:?}@{:.0},{:.0},{:.0}{}", e.kind, e.pos.x, e.pos.y, e.pos.z, if e.attacking { "!" } else { "" })).collect();
+                println!("  {t:6.1} pos {:.1},{:.1},{:.1} ground {} prog {:.1} wp {} alive {alive} {:?}", p.pos.x, p.pos.y, p.pos.z, p.gc.on_ground, bot.since_progress, bot.idx, al);
+            }
+        }
         if t - last_report > 30.0 {
             last_report = t;
             println!("{t:7.1}s  pos {:?} hp {} kills {} wp {}", g.s.player.pos, g.s.hp, g.s.kills, bot.idx);
         }
     }
     println!("end at {t:.1}s: waypoint {}/{}, kills {}, deaths {deaths}, complete {}", bot.idx, bot.route.len(), g.s.kills, g.s.level_complete);
+    for e in g.s.enemies.iter().filter(|e| e.alive && g.active(e.node)) {
+        println!("  alive {:?} {} at {:?} vel {:?} grounded {} attacking {} hp {:.1} spawn_t {:.2}", e.kind, g.def.nodes[e.node as usize].name, e.pos, e.vel, e.grounded, e.attacking, e.health, e.spawn_t);
+        if let Some(r) = e.rig {
+            let (a, ci) = g.anim.rig_info(r);
+            let c = &g.def.controllers[ci as usize].ctrl;
+            let ls = &g.s.anim[r].layers[0];
+            let m = &c.machines[c.layers[0].machine as usize];
+            println!("    cd {:.2} at {:.2} hit_done {} anim_active {} state {} t {:.2} fade {}", e.cooldown, e.attack_t, e.hit_done, g.active(g.def.animators[a as usize].node), c.name(m.states[ls.state as usize].name), ls.time, ls.fade.is_some());
+        }
+    }
     println!("unknown calls: {:?}", g.unknown_calls);
 }

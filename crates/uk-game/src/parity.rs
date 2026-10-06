@@ -61,7 +61,7 @@ pub const NATIVE: &[(i32, &str, f64)] = &[
     (4, "Transform", 1.0),
     (23, "MeshRenderer", 0.6),         // drawn; no Unity shaders, lightmaps or light probes
     (33, "MeshFilter", 1.0),
-    (137, "SkinnedMeshRenderer", 0.3), // CPU-skinned in the scene pose, no animation
+    (137, "SkinnedMeshRenderer", 0.7), // skinned from the animated bones each frame; no blend shapes
     (65, "BoxCollider", 1.0),
     (64, "MeshCollider", 1.0),
     (135, "SphereCollider", 0.8),
@@ -81,9 +81,9 @@ pub const NATIVE: &[(i32, &str, f64)] = &[
     (96, "TrailRenderer", 0.0),
     (120, "LineRenderer", 0.05),
     (212, "SpriteRenderer", 0.0),
-    (95, "Animator", 0.0),
-    (74, "AnimationClip", 0.0),
-    (91, "AnimatorController", 0.0),
+    (95, "Animator", 0.5), // state machines, transitions, blend trees, layers, clip events; Filth/Stray driven; no root motion, IK, additive layers, humanoid muscles
+    (74, "AnimationClip", 0.8), // streamed/dense/constant transform curves + events; non-transform bindings unapplied
+    (91, "AnimatorController", 0.85), // fully decoded; override controllers + state machine behaviours not run
     (195, "NavMeshAgent", 0.3), // path following via TrackTick/SetDestination; no avoidance, off-mesh links walked, no autoBraking
     (208, "NavMeshObstacle", 0.0),
     (238, "NavMeshData", 0.8),  // tiles + off-mesh links decoded and queried; area costs/masks not applied

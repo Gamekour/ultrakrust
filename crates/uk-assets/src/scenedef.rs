@@ -5,6 +5,7 @@
 //!
 //! Coordinates are converted to Bevy's right-handed space (Unity z -> -z).
 
+use crate::anim::{Clip, Controller};
 use crate::db::AssetDb;
 use crate::mesh::{self, MeshData};
 use crate::scene::{bake, to_bevy_point, to_bevy_quat, Batch, MaterialKey};
@@ -28,6 +29,9 @@ const CLASS_CAPSULE_COLLIDER: i32 = 136;
 const CLASS_RECT_TRANSFORM: i32 = 224;
 const CLASS_LIGHT: i32 = 108;
 const CLASS_RENDER_SETTINGS: i32 = 104;
+const CLASS_ANIMATOR: i32 = 95;
+const CLASS_ANIMATOR_CONTROLLER: i32 = 91;
+const CLASS_ANIMATOR_OVERRIDE_CONTROLLER: i32 = 221;
 
 /// Tag ids from TagManager (globalgamemanagers): custom tags start at 20000.
 pub mod tags {
@@ -69,6 +73,37 @@ pub struct RenderDef {
     /// Geometry baked in world space at load time (Bevy space).
     pub batch: Batch,
     pub enabled: bool,
+    /// SkinnedMeshRenderer: the bind-pose mesh and its bone nodes, for re-skinning when animated.
+    pub skin: Option<Arc<SkinDef>>,
+}
+
+#[derive(Debug)]
+pub struct SkinDef {
+    pub mesh: Arc<MeshData>,
+    /// bone index -> node (None: bone outside the scene, falls back to the renderer's node)
+    pub bones: Vec<Option<u32>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AnimatorDef {
+    pub node: u32,
+    /// index into `SceneDef::controllers`
+    pub controller: Option<u32>,
+    pub enabled: bool,
+    /// 0 AlwaysAnimate, 1 CullUpdateTransforms, 2 CullCompletely
+    pub culling: u8,
+    /// 0 Normal, 1 AnimatePhysics, 2 UnscaledTime
+    pub update_mode: u8,
+    pub root_motion: bool,
+    pub keep_state_on_disable: bool,
+    pub path_id: i64,
+}
+
+#[derive(Debug)]
+pub struct ControllerDef {
+    pub ctrl: Arc<Controller>,
+    /// `ctrl.clips[i]` -> index into `SceneDef::clips` (override clips already applied)
+    pub clips: Vec<Option<u32>>,
 }
 
 #[derive(Clone, Debug)]
@@ -154,6 +189,9 @@ pub struct SceneDef {
     pub render_settings: RenderSettingsDef,
     /// Name of the scene's serialized file (PPtrs in `ScriptDef::data` resolve against it).
     pub scene_file: String,
+    pub animators: Vec<AnimatorDef>,
+    pub controllers: Vec<ControllerDef>,
+    pub clips: Vec<Arc<Clip>>,
 }
 
 impl SceneDef {
@@ -224,6 +262,8 @@ struct Loader<'a> {
     scene: Arc<SerializedFile>,
     meshes: HashMap<(String, i64), Option<Arc<MeshData>>>,
     class_names: HashMap<(i32, i64), String>,
+    controllers: HashMap<(String, i64), Option<u32>>,
+    clips: HashMap<(String, i64), Option<u32>>,
 }
 
 impl Loader<'_> {
@@ -249,6 +289,74 @@ impl Loader<'_> {
         });
         self.meshes.insert(key, decoded.clone());
         decoded
+    }
+
+    /// AnimationClip by PPtr from `from`, decoded once per scene.
+    fn clip(&mut self, def: &mut SceneDef, from: &Arc<SerializedFile>, pptr: (i32, i64)) -> Option<u32> {
+        let (file, id) = self.db.resolve(from, pptr).ok()??;
+        let key = (file.name.clone(), id);
+        if let Some(c) = self.clips.get(&key) {
+            return *c;
+        }
+        let c = file.read_id(id).ok().filter(|v| !v.get("m_Legacy").bool()).map(|v| {
+            def.clips.push(Arc::new(Clip::from_value(&v)));
+            def.clips.len() as u32 - 1
+        });
+        self.clips.insert(key, c);
+        c
+    }
+
+    /// AnimatorController (or override controller) by PPtr from the scene, decoded once.
+    fn controller(&mut self, def: &mut SceneDef, pptr: (i32, i64)) -> Option<u32> {
+        let scene = self.scene.clone();
+        let (file, id) = self.db.resolve(&scene, pptr).ok()??;
+        let key = (file.name.clone(), id);
+        if let Some(c) = self.controllers.get(&key) {
+            return *c;
+        }
+        let class = file.objects.iter().find(|o| o.path_id == id).map(|o| o.class_id);
+        let v = file.read_id(id).ok()?;
+        let built = match class {
+            Some(CLASS_ANIMATOR_CONTROLLER) => {
+                let ctrl = Controller::from_value(&v);
+                let clips = ctrl.clips.iter().map(|&p| self.clip(def, &file, p)).collect();
+                Some(ControllerDef { ctrl: Arc::new(ctrl), clips })
+            }
+            Some(CLASS_ANIMATOR_OVERRIDE_CONTROLLER) => self.override_controller(def, &file, &v),
+            _ => None,
+        };
+        let idx = built.map(|c| {
+            def.controllers.push(c);
+            def.controllers.len() as u32 - 1
+        });
+        self.controllers.insert(key, idx);
+        idx
+    }
+
+    /// AnimatorOverrideController (221): the base controller with its clips swapped. Originals
+    /// resolve against the override's file, the base's own clip list against the base's file.
+    fn override_controller(&mut self, def: &mut SceneDef, file: &Arc<SerializedFile>, v: &Value) -> Option<ControllerDef> {
+        let (bf, bid) = self.db.resolve(file, v.get("m_Controller").pptr()).ok()??;
+        let base = Controller::from_value(&bf.read_id(bid).ok()?);
+        let mut over: HashMap<(String, i64), (i32, i64)> = HashMap::new();
+        for c in v.get("m_Clips").array() {
+            let o = c.get("m_OverrideClip").pptr();
+            if o.1 == 0 {
+                continue;
+            }
+            if let Ok(Some((f, i))) = self.db.resolve(file, c.get("m_OriginalClip").pptr()) {
+                over.insert((f.name.clone(), i), o);
+            }
+        }
+        let mut clips = Vec::new();
+        for &p in &base.clips {
+            let orig = self.db.resolve(&bf, p).ok().flatten().map(|(f, i)| (f.name.clone(), i));
+            clips.push(match orig.and_then(|k| over.get(&k).copied()) {
+                Some(o) => self.clip(def, file, o),
+                None => self.clip(def, &bf, p),
+            });
+        }
+        Some(ControllerDef { ctrl: Arc::new(base), clips })
     }
 
     fn class_name(&mut self, pptr: (i32, i64)) -> String {
@@ -281,7 +389,7 @@ pub fn load_scene(db: &mut AssetDb, bundle: &std::path::Path) -> Result<SceneDef
         .find(|f| !f.name.contains('.'))
         .cloned()
         .ok_or_else(|| crate::Error("no scene file in bundle".into()))?;
-    let mut ld = Loader { db, scene: scene.clone(), meshes: HashMap::new(), class_names: HashMap::new() };
+    let mut ld = Loader { db, scene: scene.clone(), meshes: HashMap::new(), class_names: HashMap::new(), controllers: HashMap::new(), clips: HashMap::new() };
     let mut def = SceneDef { scene_file: scene.name.clone(), ..SceneDef::default() };
 
     // --- GameObjects + Transforms -> nodes ---
@@ -404,19 +512,16 @@ pub fn load_scene(db: &mut AssetDb, bundle: &std::path::Path) -> Result<SceneDef
                     }
                     def.obj_to_node.insert(id, node);
                     let Some(mesh) = ld.mesh(v.get("m_Mesh").pptr()) else { continue };
-                    let bones: Vec<Mat4> = v
-                        .get("m_Bones")
-                        .array()
-                        .iter()
-                        .map(|b| tr_to_node.get(&b.pptr().1).map(|&bn| unity_world[bn as usize]).unwrap_or(world))
-                        .collect();
+                    let bone_nodes: Vec<Option<u32>> = v.get("m_Bones").array().iter().map(|b| tr_to_node.get(&b.pptr().1).copied()).collect();
+                    let bones: Vec<Mat4> = bone_nodes.iter().map(|b| b.map(|bn| unity_world[bn as usize]).unwrap_or(world)).collect();
                     let posed = skin(&mesh, &bones);
+                    let skin_def = (!mesh.skin.is_empty() && !bones.is_empty()).then(|| Arc::new(SkinDef { mesh: mesh.clone(), bones: bone_nodes }));
                     let mats: Vec<(i32, i64)> = v.get("m_Materials").array().iter().map(|m| m.pptr()).collect();
                     for (k, sm) in posed.submeshes.iter().enumerate() {
                         let material = mats.get(k).or(mats.last()).copied().and_then(|p| ld.material_key(p));
                         let mut batch = Batch::default();
                         bake(&mut batch, &posed, &sm.indices, Mat4::IDENTITY);
-                        def.renderers.push(RenderDef { node, material, batch, enabled: v.get("m_Enabled").bool() });
+                        def.renderers.push(RenderDef { node, material, batch, enabled: v.get("m_Enabled").bool(), skin: skin_def.clone() });
                     }
                 }
                 CLASS_BOX_COLLIDER | CLASS_SPHERE_COLLIDER | CLASS_CAPSULE_COLLIDER | CLASS_MESH_COLLIDER => {
@@ -482,6 +587,21 @@ pub fn load_scene(db: &mut AssetDb, bundle: &std::path::Path) -> Result<SceneDef
                     def.comp_to_script.insert(id, def.scripts.len() as u32);
                     def.scripts.push(ScriptDef { node, class, enabled: v.get("m_Enabled").bool(), path_id: id, data: v });
                 }
+                CLASS_ANIMATOR => {
+                    let Ok(v) = scene.read(o) else { continue };
+                    def.obj_to_node.insert(id, node);
+                    let controller = ld.controller(&mut def, v.get("m_Controller").pptr());
+                    def.animators.push(AnimatorDef {
+                        node,
+                        controller,
+                        enabled: v.get("m_Enabled").bool(),
+                        culling: v.get("m_CullingMode").i64() as u8,
+                        update_mode: v.get("m_UpdateMode").i64() as u8,
+                        root_motion: v.get("m_ApplyRootMotion").bool(),
+                        keep_state_on_disable: v.get("m_KeepAnimatorStateOnDisable").bool(),
+                        path_id: id,
+                    });
+                }
                 CLASS_RIGIDBODY => {
                     def.obj_to_node.insert(id, node);
                     def.rigidbodies.insert(node);
@@ -530,7 +650,7 @@ pub fn load_scene(db: &mut AssetDb, bundle: &std::path::Path) -> Result<SceneDef
                 let material = mats.get(k).or(mats.last()).copied().and_then(|p| ld.material_key(p));
                 let mut batch = Batch::default();
                 bake(&mut batch, &mesh, &sm.indices, m);
-                def.renderers.push(RenderDef { node, material, batch, enabled: r.get("m_Enabled").bool() });
+                def.renderers.push(RenderDef { node, material, batch, enabled: r.get("m_Enabled").bool(), skin: None });
             }
         }
     }
@@ -539,22 +659,20 @@ pub fn load_scene(db: &mut AssetDb, bundle: &std::path::Path) -> Result<SceneDef
 }
 
 /// CPU skinning with the bone poses saved in the scene (Unity space in, Unity space out).
-fn skin(mesh: &MeshData, bones: &[Mat4]) -> MeshData {
-    let mut out = mesh.clone();
-    if mesh.skin.is_empty() || bones.is_empty() {
-        return out;
-    }
-    let mats: Vec<Mat4> = bones
-        .iter()
-        .enumerate()
-        .map(|(i, b)| *b * mesh.bind_poses.get(i).copied().unwrap_or(Mat4::IDENTITY))
-        .collect();
+/// Linear-blend skinning of every vertex: `bones` are bone world matrices (bind poses applied
+/// here). Writes posed positions / normals (same space as `bones`) and whether each vertex's
+/// dominant matrix mirrors; vertices without weights keep their bind-pose values.
+pub fn skin_vertices(mesh: &MeshData, bones: &[Mat4], pos: &mut Vec<Vec3>, nrm: &mut Vec<Vec3>, mirrored: &mut Vec<bool>) {
+    let mats: Vec<Mat4> = bones.iter().enumerate().map(|(i, b)| *b * mesh.bind_poses.get(i).copied().unwrap_or(Mat4::IDENTITY)).collect();
     let normal_mats: Vec<Mat4> = mats.iter().map(|m| m.inverse().transpose()).collect();
-    // per vertex: is its dominant skinning matrix a reflection?
-    let mut mirrored = vec![false; mesh.positions.len()];
-    for (vi, (idx, w)) in mesh.skin.iter().enumerate() {
-        let p = Vec3::from(mesh.positions[vi]);
-        let n = mesh.normals.get(vi).map(|n| Vec3::from(*n)).unwrap_or(Vec3::Y);
+    pos.clear();
+    nrm.clear();
+    mirrored.clear();
+    pos.extend(mesh.positions.iter().map(|p| Vec3::from(*p)));
+    nrm.extend((0..mesh.positions.len()).map(|i| mesh.normals.get(i).map(|n| Vec3::from(*n)).unwrap_or(Vec3::Y)));
+    mirrored.resize(mesh.positions.len(), false);
+    for (vi, (idx, w)) in mesh.skin.iter().enumerate().take(pos.len()) {
+        let (p, n) = (pos[vi], nrm[vi]);
         let (mut pp, mut nn, mut tw) = (Vec3::ZERO, Vec3::ZERO, 0.0);
         let mut dominant = (0.0f32, false);
         for k in 0..4 {
@@ -571,11 +689,24 @@ fn skin(mesh: &MeshData, bones: &[Mat4]) -> MeshData {
             }
         }
         if tw > 0.0 {
-            out.positions[vi] = (pp / tw).to_array();
-            if vi < out.normals.len() {
-                out.normals[vi] = nn.normalize_or_zero().to_array();
-            }
+            pos[vi] = pp / tw;
+            nrm[vi] = nn.normalize_or_zero();
             mirrored[vi] = dominant.1;
+        }
+    }
+}
+
+fn skin(mesh: &MeshData, bones: &[Mat4]) -> MeshData {
+    let mut out = mesh.clone();
+    if mesh.skin.is_empty() || bones.is_empty() {
+        return out;
+    }
+    let (mut pos, mut nrm, mut mirrored) = (Vec::new(), Vec::new(), Vec::new());
+    skin_vertices(mesh, bones, &mut pos, &mut nrm, &mut mirrored);
+    for (vi, p) in pos.iter().enumerate() {
+        out.positions[vi] = p.to_array();
+        if vi < out.normals.len() {
+            out.normals[vi] = nrm[vi].to_array();
         }
     }
     // A reflecting skin matrix reverses a triangle's orientation; reverse its winding back so the

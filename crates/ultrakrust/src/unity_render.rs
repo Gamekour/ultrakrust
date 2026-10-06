@@ -102,6 +102,18 @@ pub struct Draw {
     /// Unity-space bounds centre and radius (light selection, sorting).
     pub center: Vec3,
     pub radius: f32,
+    /// SkinnedMeshRenderer: re-skinned on the CPU each frame its bones are animated.
+    pub skin: Option<Arc<SkinDraw>>,
+}
+
+pub struct SkinDraw {
+    pub def: Arc<uk_assets::scenedef::SkinDef>,
+    /// source mesh vertex of each draw vertex
+    pub src: Vec<u32>,
+    pub stride: usize,
+    /// byte offsets of the position / normal inputs inside a vertex, when the shader reads them
+    pub pos: Option<usize>,
+    pub nrm: Option<usize>,
 }
 
 pub struct LightCpu {
@@ -146,6 +158,8 @@ pub struct UnityFrame {
     pub visible: Arc<Vec<bool>>,
     /// Unity-space object-to-world per draw (identity unless moved by a mover).
     pub object_to_world: Arc<Vec<Mat4>>,
+    /// Re-skinned vertex buffers (draw index, full vertex bytes) for this frame.
+    pub skinned: Arc<Vec<(usize, Vec<u8>)>>,
     /// Unity-space light world positions / forward directions, and whether each is active.
     pub lights: Arc<Vec<(Vec3, Vec3, bool)>>,
 }
@@ -513,6 +527,18 @@ pub fn build(
             op: state_u8(&st.blend_op, &mat),
             mask: state_u8(&st.color_mask, &mat),
         };
+        let skin = r.skin.as_ref().map(|def| {
+            let (mut off, mut pos, mut nrm) = (0usize, None, None);
+            for &(_, ch, n) in &var.inputs {
+                match ch {
+                    0 if n >= 3 => pos = Some(off),
+                    1 if n >= 3 => nrm = Some(off),
+                    _ => {}
+                }
+                off += n as usize * 4;
+            }
+            Arc::new(SkinDraw { def: def.clone(), src: b.src.clone(), stride: var.stride as usize, pos, nrm })
+        });
         let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
         for p in &b.positions {
             let p = Vec3::from(unity_point(*p));
@@ -537,7 +563,9 @@ pub fn build(
             material: mat.clone(),
             textures: tex,
             center: (lo + hi) * 0.5,
-            radius: (hi - lo).length() * 0.5,
+            // animated limbs leave the bind-pose bounds
+            radius: (hi - lo).length() * if skin.is_some() { 1.0 } else { 0.5 } + if skin.is_some() { 1.0 } else { 0.0 },
+            skin,
         });
     }
     // the final composite: GameController's PostProcessV2_Handler names the material and dither texture
@@ -593,18 +621,67 @@ pub fn build(
     (scene, summary)
 }
 
+/// Re-skins every skinned draw at the scene's rest pose and returns (draws checked, largest
+/// position error vs the baked vertex bytes): proves the vertex mapping the animated path writes through.
+pub fn skin_rest_error(game: &uk_game::Game, scene: &SceneData) -> (usize, f32) {
+    let f = Mat4::from_scale(Vec3::new(1.0, 1.0, -1.0));
+    let rest = |n: u32| f * game.def.nodes[n as usize].world0 * f;
+    let (mut n, mut err) = (0, 0.0f32);
+    let (mut pos, mut nrm, mut mir) = (Vec::new(), Vec::new(), Vec::new());
+    for d in &scene.draws {
+        let Some(sk) = &d.skin else { continue };
+        let Some(o) = sk.pos else { continue };
+        let bones: Vec<Mat4> = sk.def.bones.iter().map(|b| rest(b.unwrap_or(d.node))).collect();
+        uk_assets::scenedef::skin_vertices(&sk.def.mesh, &bones, &mut pos, &mut nrm, &mut mir);
+        n += 1;
+        for (i, &src) in sk.src.iter().enumerate() {
+            let b = &d.vertices[i * sk.stride + o..i * sk.stride + o + 12];
+            let baked = Vec3::from_slice(bytemuck::cast_slice::<u8, f32>(b));
+            err = err.max(pos.get(src as usize).map_or(f32::MAX, |p| p.distance(baked)));
+        }
+    }
+    (n, err)
+}
+
 /// Per-frame state from the game: what is visible, where movers have moved things, lights.
 pub fn frame(game: &uk_game::Game, scene: &SceneData, time: f32) -> UnityFrame {
     let m = Mat4::from_scale(Vec3::new(1.0, 1.0, -1.0));
-    let visible = scene.draws.iter().map(|d| d.enabled && game.active(d.node)).collect();
+    let visible: Vec<bool> = scene.draws.iter().map(|d| d.enabled && game.active(d.node)).collect();
     let object_to_world = scene
         .draws
         .iter()
-        .map(|d| match game.node_mover[d.node as usize] {
-            Some(mv) => m * Mat4::from(game.mover_delta(mv)) * m,
-            None => Mat4::IDENTITY,
+        .map(|d| {
+            let mover = match game.node_mover[d.node as usize] {
+                Some(mv) => m * Mat4::from(game.mover_delta(mv)) * m,
+                None => Mat4::IDENTITY,
+            };
+            // skinned vertices already carry the animated bones; rigid ones follow their node
+            if d.skin.is_some() { mover } else { mover * game.anim.delta_of(d.node) }
         })
-        .collect();
+        .collect::<Vec<_>>();
+    let mut skinned = Vec::new();
+    let (mut pos, mut nrm, mut mir) = (Vec::new(), Vec::new(), Vec::new());
+    for (di, d) in scene.draws.iter().enumerate() {
+        let Some(sk) = &d.skin else { continue };
+        if !visible[di] || (sk.pos.is_none() && sk.nrm.is_none()) || !sk.def.bones.iter().flatten().any(|&b| game.anim.animated(b)) {
+            continue;
+        }
+        let fallback = game.anim.world_of(d.node);
+        let bones: Vec<Mat4> = sk.def.bones.iter().map(|b| b.map_or(fallback, |b| game.anim.world_of(b))).collect();
+        uk_assets::scenedef::skin_vertices(&sk.def.mesh, &bones, &mut pos, &mut nrm, &mut mir);
+        let mut bytes = d.vertices.clone();
+        for (i, &src) in sk.src.iter().enumerate() {
+            let base = i * sk.stride;
+            for (off, v) in [(sk.pos, pos.get(src as usize)), (sk.nrm, nrm.get(src as usize))] {
+                if let (Some(o), Some(v)) = (off, v) {
+                    if base + o + 12 <= bytes.len() {
+                        bytes[base + o..base + o + 12].copy_from_slice(bytemuck::cast_slice(&v.to_array()));
+                    }
+                }
+            }
+        }
+        skinned.push((di, bytes));
+    }
     let lights = scene
         .lights
         .iter()
@@ -616,7 +693,7 @@ pub fn frame(game: &uk_game::Game, scene: &SceneData, time: f32) -> UnityFrame {
             (Vec3::new(pos.x, pos.y, -pos.z), Vec3::new(fwd.x, fwd.y, -fwd.z), l.enabled && game.active(l.node))
         })
         .collect();
-    UnityFrame { time, visible: Arc::new(visible), object_to_world: Arc::new(object_to_world), lights: Arc::new(lights) }
+    UnityFrame { time, visible: Arc::new(visible), object_to_world: Arc::new(object_to_world), skinned: Arc::new(skinned), lights: Arc::new(lights) }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1148,7 +1225,7 @@ fn prepare(
                 }
             }
             let bg1 = dev.create_bind_group("unity g1", &l1, &e1);
-            let vbuf = dev.create_buffer_with_data(&BufferInitDescriptor { label: Some("unity vb"), contents: &d.vertices, usage: BufferUsages::VERTEX });
+            let vbuf = dev.create_buffer_with_data(&BufferInitDescriptor { label: Some("unity vb"), contents: &d.vertices, usage: BufferUsages::VERTEX | BufferUsages::COPY_DST });
             let ibuf = dev.create_buffer_with_data(&BufferInitDescriptor { label: Some("unity ib"), contents: bytemuck::cast_slice(&d.indices), usage: BufferUsages::INDEX });
             let key = (d.variant, d.state);
             let pipeline = *gpu.pipelines.entry(key).or_insert_with(|| cache.queue_render_pipeline(pipeline_descriptor(var, layouts, d.state)));
@@ -1281,6 +1358,11 @@ fn prepare(
         Vec4::new(0.0, 0.0, near / (FAR - near), -1.0),
         Vec4::new(0.0, 0.0, near * FAR / (FAR - near), 0.0),
     );
+    for (di, bytes) in frame.skinned.iter() {
+        if let Some(Some(g)) = gpu.draws.get(*di) {
+            queue.write_buffer(&g.vbuf, 0, bytes);
+        }
+    }
     let cam = world_from_view.w_axis.truncate();
     let ctx = FrameCtx {
         vp: proj * v,
