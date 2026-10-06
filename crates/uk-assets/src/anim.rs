@@ -236,3 +236,296 @@ pub fn path_hash(path: &str) -> u32 {
     }
     !crc
 }
+
+// ---------------------------------------------------------------------------------------------
+// AnimatorController (class 91): the compiled Mecanim runtime constant (layers -> state machines
+// -> states -> transitions / blend trees) plus parameters, the hash -> name table and clip list.
+
+/// Transition condition modes (AnimatorConditionMode).
+pub mod cond {
+    pub const IF: u32 = 1;
+    pub const IF_NOT: u32 = 2;
+    pub const GREATER: u32 = 3;
+    pub const LESS: u32 = 4;
+    pub const EXIT_TIME: u32 = 5;
+    pub const EQUALS: u32 = 6;
+    pub const NOT_EQUAL: u32 = 7;
+}
+
+/// Parameter types (AnimatorControllerParameterType).
+pub mod param {
+    pub const FLOAT: u32 = 1;
+    pub const INT: u32 = 3;
+    pub const BOOL: u32 = 4;
+    pub const TRIGGER: u32 = 9;
+}
+
+/// Destination indices at or above this are selector (sub-state-machine entry/exit) states.
+pub const SELECTOR_BASE: u32 = 30000;
+
+#[derive(Debug, Clone)]
+pub struct Condition {
+    pub mode: u32,
+    pub param: u32,
+    pub threshold: f32,
+    pub exit_time: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct Transition {
+    pub conditions: Vec<Condition>,
+    pub dest: u32,
+    pub full_path: u32,
+    pub duration: f32,
+    pub offset: f32,
+    pub exit_time: f32,
+    pub has_exit_time: bool,
+    pub fixed_duration: bool,
+    /// 0 none, 1 source, 2 destination, 3 source then destination, 4 destination then source
+    pub interruption: u32,
+    pub ordered_interruption: bool,
+    pub to_self: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct BlendNode {
+    /// 0 1D, 1 SimpleDirectional2D, 2 FreeformDirectional2D, 3 FreeformCartesian2D, 4 Direct
+    pub kind: u32,
+    pub param: u32,
+    pub param_y: u32,
+    pub children: Vec<u32>,
+    pub thresholds: Vec<f32>,
+    pub positions: Vec<[f32; 2]>,
+    pub direct_params: Vec<u32>,
+    /// index into `Controller::clips`
+    pub clip: Option<u32>,
+    pub duration: f32,
+    pub cycle_offset: f32,
+    pub mirror: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct State {
+    pub name: u32,
+    pub full_path: u32,
+    pub speed: f32,
+    /// parameter multiplying speed (None when unused)
+    pub speed_param: Option<u32>,
+    pub cycle_offset: f32,
+    pub looping: bool,
+    pub write_defaults: bool,
+    pub transitions: Vec<Transition>,
+    /// per synchronized layer: index into `trees` (None = empty state)
+    pub tree_index: Vec<Option<u32>>,
+    pub trees: Vec<Vec<BlendNode>>,
+}
+
+impl State {
+    /// Blend nodes (root first) of this state for a layer's synchronized index.
+    pub fn tree(&self, sync: usize) -> Option<&[BlendNode]> {
+        let i = (*self.tree_index.get(sync).or(self.tree_index.first())?)? as usize;
+        self.trees.get(i).map(|t| t.as_slice())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Selector {
+    pub full_path: u32,
+    pub entry: bool,
+    pub transitions: Vec<(u32, Vec<Condition>)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Machine {
+    pub states: Vec<State>,
+    pub any_state: Vec<Transition>,
+    pub selectors: Vec<Selector>,
+    pub default_state: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct Layer {
+    pub machine: u32,
+    pub sync_index: u32,
+    pub binding: u32,
+    /// 0 override, 1 additive
+    pub blending: u32,
+    pub weight: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct Param {
+    pub id: u32,
+    pub kind: u32,
+    pub index: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Controller {
+    pub name: String,
+    pub layers: Vec<Layer>,
+    pub machines: Vec<Machine>,
+    pub params: Vec<Param>,
+    pub floats: Vec<f32>,
+    pub ints: Vec<i32>,
+    pub bools: Vec<bool>,
+    pub names: std::collections::HashMap<u32, String>,
+    /// PPtrs to AnimationClips; blend nodes index this
+    pub clips: Vec<(i32, i64)>,
+}
+
+fn data(v: &Value) -> &Value {
+    if v.has("data") { v.get("data") } else { v }
+}
+
+fn u32s(v: &Value) -> Vec<u32> {
+    v.array().iter().map(|x| x.i64() as u32).collect()
+}
+
+fn conditions(v: &Value) -> Vec<Condition> {
+    v.array()
+        .iter()
+        .map(|c| {
+            let c = data(c);
+            Condition { mode: c.get("m_ConditionMode").i64() as u32, param: c.get("m_EventID").i64() as u32, threshold: c.get("m_EventThreshold").f32(), exit_time: c.get("m_ExitTime").f32() }
+        })
+        .collect()
+}
+
+fn transition(t: &Value) -> Transition {
+    let t = data(t);
+    Transition {
+        conditions: conditions(t.get("m_ConditionConstantArray")),
+        dest: t.get("m_DestinationState").i64() as u32,
+        full_path: t.get("m_FullPathID").i64() as u32,
+        duration: t.get("m_TransitionDuration").f32(),
+        offset: t.get("m_TransitionOffset").f32(),
+        exit_time: t.get("m_ExitTime").f32(),
+        has_exit_time: t.get("m_HasExitTime").bool(),
+        fixed_duration: t.get("m_HasFixedDuration").bool(),
+        interruption: t.get("m_InterruptionSource").i64() as u32,
+        ordered_interruption: t.get("m_OrderedInterruption").bool(),
+        to_self: t.get("m_CanTransitionToSelf").bool(),
+    }
+}
+
+fn blend_node(n: &Value) -> BlendNode {
+    let n = data(n);
+    let clip = n.get("m_ClipID").i64() as u32;
+    let b2 = data(n.get("m_Blend2dData"));
+    BlendNode {
+        kind: n.get("m_BlendType").i64() as u32,
+        param: n.get("m_BlendEventID").i64() as u32,
+        param_y: n.get("m_BlendEventYID").i64() as u32,
+        children: u32s(n.get("m_ChildIndices")),
+        thresholds: floats(data(n.get("m_Blend1dData")).get("m_ChildThresholdArray")),
+        positions: b2.get("m_ChildPositionArray").array().iter().map(|p| [p.get("x").f32(), p.get("y").f32()]).collect(),
+        direct_params: u32s(data(n.get("m_BlendDirectData")).get("m_ChildBlendEventIDArray")),
+        clip: (clip != u32::MAX).then_some(clip),
+        duration: n.get("m_Duration").f32(),
+        cycle_offset: n.get("m_CycleOffset").f32(),
+        mirror: n.get("m_Mirror").bool(),
+    }
+}
+
+fn state(s: &Value) -> State {
+    let s = data(s);
+    let sp = s.get("m_SpeedParamID").i64() as u32;
+    State {
+        name: s.get("m_NameID").i64() as u32,
+        full_path: s.get("m_FullPathID").i64() as u32,
+        speed: s.get("m_Speed").f32(),
+        speed_param: (sp != 0).then_some(sp),
+        cycle_offset: s.get("m_CycleOffset").f32(),
+        looping: s.get("m_Loop").bool(),
+        write_defaults: s.get("m_WriteDefaultValues").bool(),
+        transitions: s.get("m_TransitionConstantArray").array().iter().map(transition).collect(),
+        tree_index: s.get("m_BlendTreeConstantIndexArray").array().iter().map(|i| (i.i64() >= 0).then_some(i.i64() as u32)).collect(),
+        trees: s.get("m_BlendTreeConstantArray").array().iter().map(|t| data(t).get("m_NodeArray").array().iter().map(blend_node).collect()).collect(),
+    }
+}
+
+fn machine(m: &Value) -> Machine {
+    let m = data(m);
+    let selectors = m
+        .get("m_SelectorStateConstantArray")
+        .array()
+        .iter()
+        .map(|s| {
+            let s = data(s);
+            let transitions = s
+                .get("m_TransitionConstantArray")
+                .array()
+                .iter()
+                .map(|t| {
+                    let t = data(t);
+                    (t.get("m_Destination").i64() as u32, conditions(t.get("m_ConditionConstantArray")))
+                })
+                .collect();
+            Selector { full_path: s.get("m_FullPathID").i64() as u32, entry: s.get("m_IsEntry").bool(), transitions }
+        })
+        .collect();
+    Machine {
+        states: m.get("m_StateConstantArray").array().iter().map(state).collect(),
+        any_state: m.get("m_AnyStateTransitionConstantArray").array().iter().map(transition).collect(),
+        selectors,
+        default_state: m.get("m_DefaultState").i64() as u32,
+    }
+}
+
+impl Controller {
+    pub fn from_value(v: &Value) -> Controller {
+        let c = v.get("m_Controller");
+        let layers = c
+            .get("m_LayerArray")
+            .array()
+            .iter()
+            .map(|l| {
+                let l = data(l);
+                Layer {
+                    machine: l.get("m_StateMachineIndex").i64() as u32,
+                    sync_index: l.get("m_StateMachineSynchronizedLayerIndex").i64() as u32,
+                    binding: l.get("m_Binding").i64() as u32,
+                    blending: l.get("(int&)m_LayerBlendingMode").i64() as u32,
+                    weight: l.get("m_DefaultWeight").f32(),
+                }
+            })
+            .collect();
+        let params = data(c.get("m_Values"))
+            .get("m_ValueArray")
+            .array()
+            .iter()
+            .map(|p| Param { id: p.get("m_ID").i64() as u32, kind: p.get("m_Type").i64() as u32, index: p.get("m_Index").i64() as u32 })
+            .collect();
+        let dv = data(c.get("m_DefaultValues"));
+        Controller {
+            name: v.get("m_Name").str().to_string(),
+            layers,
+            machines: c.get("m_StateMachineArray").array().iter().map(machine).collect(),
+            params,
+            floats: floats(dv.get("m_FloatValues")),
+            ints: dv.get("m_IntValues").array().iter().map(|x| x.i64() as i32).collect(),
+            bools: dv.get("m_BoolValues").array().iter().map(|x| x.bool()).collect(),
+            names: v.get("m_TOS").array().iter().map(|p| (p.get("first").i64() as u32, p.get("second").str().to_string())).collect(),
+            clips: v.get("m_AnimationClips").array().iter().map(|p| p.pptr()).collect(),
+        }
+    }
+
+    /// AnimatorOverrideController (class 221): the base controller with clips swapped.
+    pub fn with_overrides(mut self, overrides: &[((i32, i64), (i32, i64))], same: impl Fn((i32, i64), (i32, i64)) -> bool) -> Controller {
+        for c in &mut self.clips {
+            if let Some((_, o)) = overrides.iter().find(|(orig, o)| same(*orig, *c) && o.1 != 0) {
+                *c = *o;
+            }
+        }
+        self
+    }
+
+    pub fn param(&self, id: u32) -> Option<&Param> {
+        self.params.iter().find(|p| p.id == id)
+    }
+
+    pub fn name(&self, hash: u32) -> &str {
+        self.names.get(&hash).map_or("", |s| s.as_str())
+    }
+}

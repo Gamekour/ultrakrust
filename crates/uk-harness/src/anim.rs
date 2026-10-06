@@ -4,7 +4,7 @@
 //! cubic segment decoding).
 use crate::Report;
 use std::path::Path;
-use uk_assets::anim::{Clip, Target};
+use uk_assets::anim::{Clip, Controller, Target, SELECTOR_BASE};
 use uk_assets::db::AssetDb;
 
 pub fn all_clips(install: &Path, r: &mut Report) {
@@ -25,11 +25,59 @@ pub fn all_clips(install: &Path, r: &mut Report) {
     bundles.sort();
     let (mut clips, mut counts_ok, mut finite_ok, mut quat_ok, mut quats, mut events) = (0, 0, 0, 0, 0, 0);
     let (mut jumps, mut joints) = (0usize, 0usize);
+    let (mut ctrls, mut ctrl_ok, mut states, mut named, mut transitions, mut blends) = (0, 0, 0, 0, 0, 0);
     let mut bad = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for b in &bundles {
         let Ok(files) = db.load_bundle_files(b) else { continue };
         for f in files {
+            for o in f.objects.iter().filter(|o| o.class_id == 91) {
+                if !seen.insert((f.name.clone(), o.path_id)) {
+                    continue;
+                }
+                let Ok(v) = f.read(o) else { continue };
+                let c = Controller::from_value(&v);
+                ctrls += 1;
+                // every internal reference must land: destinations, clips, parameters, names
+                let mut why: Vec<String> = Vec::new();
+                if c.layers.is_empty() || c.layers.iter().any(|l| l.machine as usize >= c.machines.len()) { why.push("layers".into()) }
+                let pok = |id: u32| c.param(id).is_some_and(|p| match p.kind {
+                    1 => (p.index as usize) < c.floats.len(),
+                    3 => (p.index as usize) < c.ints.len(),
+                    _ => (p.index as usize) < c.bools.len(),
+                });
+                for m in &c.machines {
+                    let dest_ok = |d: u32| if d >= SELECTOR_BASE { ((d - SELECTOR_BASE) as usize) < m.selectors.len() } else { (d as usize) < m.states.len() };
+                    if !(m.states.is_empty() || (m.default_state as usize) < m.states.len()) { why.push("default state".into()) }
+                    for t in m.states.iter().flat_map(|s| &s.transitions).chain(&m.any_state) {
+                        transitions += 1;
+                        if !dest_ok(t.dest) { why.push(format!("dest {}", t.dest)) }
+                        for k in t.conditions.iter().filter(|k| k.mode != 5 && !pok(k.param)) { why.push(format!("cond param {} mode {}", k.param, k.mode)) }
+                    }
+                    for s in &m.selectors {
+                        if !s.transitions.iter().all(|(d, ks)| (*d == u32::MAX || dest_ok(*d)) && ks.iter().all(|k| pok(k.param))) { why.push("selector".into()) }
+                    }
+                    for s in &m.states {
+                        states += 1;
+                        named += !c.name(s.full_path).is_empty() as usize;
+                        if !s.speed_param.is_none_or(pok) { why.push(format!("speed param {:?}", s.speed_param)) }
+                        for n in s.trees.iter().flatten() {
+                            if !n.clip.is_none_or(|i| (i as usize) < c.clips.len()) { why.push("clip".into()) }
+                            if !n.children.iter().all(|&ch| s.trees.iter().any(|t| (ch as usize) < t.len())) { why.push("child".into()) }
+                            if !n.children.is_empty() {
+                                blends += 1;
+                                if !match n.kind { 0 => pok(n.param), 4 => n.direct_params.iter().all(|&p| pok(p)), _ => pok(n.param) && pok(n.param_y) } { why.push(format!("blend kind {} param", n.kind)) }
+                            }
+                        }
+                    }
+                }
+                if why.is_empty() {
+                    ctrl_ok += 1;
+                } else if bad.len() < 5 {
+                    why.dedup();
+                    bad.push(format!("controller {}: dangling {}", c.name, why.join(", ")));
+                }
+            }
             for o in f.objects.iter().filter(|o| o.class_id == 74) {
                 if !seen.insert((f.name.clone(), o.path_id)) {
                     continue;
@@ -44,7 +92,7 @@ pub fn all_clips(install: &Path, r: &mut Report) {
                 if c.curve_count() == c.bound_curves() {
                     counts_ok += 1;
                 } else if bad.len() < 5 {
-                    bad.push(format!("{} curves {} bound {}", c.name, c.curve_count(), c.bound_curves()));
+                    bad.push(format!("clip {} curves {} bound {}", c.name, c.curve_count(), c.bound_curves()));
                 }
                 let n = 8;
                 let (mut fin, mut qok, mut qn) = (true, true, 0);
@@ -83,8 +131,14 @@ pub fn all_clips(install: &Path, r: &mut Report) {
     r.higher("anim.unit_quat_pct", pct(quat_ok, quats));
     r.higher("anim.streamed_continuous_pct", pct(joints - jumps, joints));
     r.info("anim.events", events as f64);
+    r.higher("anim.controllers", ctrls as f64);
+    r.higher("anim.controller_refs_ok_pct", pct(ctrl_ok, ctrls));
+    r.higher("anim.state_names_pct", pct(named, states));
+    r.info("anim.states", states as f64);
+    r.info("anim.transitions", transitions as f64);
+    r.info("anim.blend_trees", blends as f64);
     r.lower("perf.anim.decode_all_s", t0.elapsed().as_secs_f64(), 0.5);
     for b in bad {
-        r.note(format!("gap: anim clip {b}"));
+        r.note(format!("gap: anim {b}"));
     }
 }
