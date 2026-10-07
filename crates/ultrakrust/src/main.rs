@@ -718,7 +718,7 @@ fn sync_level(
 
 #[allow(clippy::type_complexity)]
 fn apply_view(
-    sim: Res<Sim>,
+    mut sim: ResMut<Sim>,
     fixed: Res<Time<Fixed>>,
     tour: Option<Res<tour::Tour>>,
     mut cam: Single<(&mut Transform, &mut Projection), With<MainCam>>,
@@ -737,6 +737,45 @@ fn apply_view(
         cam.0.rotation = Quat::from_rotation_y(-yaw.to_radians()) * Quat::from_rotation_x(pitch.to_radians());
         if let Projection::Perspective(p) = cam.1.as_mut() {
             p.fov = 75f32.to_radians();
+        }
+    }
+    // UNITY_PROBE_ENEMY: frame the enemy nearest the player from 4 m, for the outline buffer stats
+    if std::env::var_os("UNITY_PROBE_ENEMY").is_some() {
+        // once: stand on the nearest enemy so its room's triggers activate it
+        static MOVED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if MOVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 30 {
+            let p = sim.game.s.player.pos;
+            if let Some((node, pos)) = sim.game.s.enemies.iter().min_by(|a, b| a.pos.distance(p).total_cmp(&b.pos.distance(p))).map(|e| (e.node, e.pos)) {
+                let to = pos + Vec3::Y;
+                info!("enemy probe: player moved to node {node} at {to:.1?}");
+                sim.game.s.player.pos = to;
+                // the room's trigger may not fire: activate the enemy and its ancestors directly
+                let mut n = Some(node);
+                let mut chain = vec![];
+                while let Some(i) = n {
+                    chain.push(i);
+                    n = sim.game.def.nodes[i as usize].parent;
+                }
+                for i in chain.into_iter().rev() {
+                    sim.game.set_active(i, true);
+                }
+            }
+        }
+        let p = sim.game.s.player.pos;
+        if let Some(e) = sim.game.s.enemies.iter().filter(|e| e.alive && sim.game.active(e.node)).min_by(|a, b| a.pos.distance(p).total_cmp(&b.pos.distance(p))) {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 120 == 0 {
+                info!("enemy probe: framing node {} {:?} at {:.1?} ({} active of {})", e.node, e.kind, e.pos, sim.game.s.enemies.iter().filter(|e| e.alive && sim.game.active(e.node)).count(), sim.game.s.enemies.len());
+            }
+            let target = e.pos + Vec3::Y;
+            let dir = (p - e.pos).with_y(0.0).normalize_or(Vec3::Z);
+            cam.0.translation = target + dir * 4.0 + Vec3::Y;
+            cam.0.look_at(target, Vec3::Y);
+        } else {
+            static M: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if M.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 120 == 0 {
+                info!("enemy probe: none active ({} alive of {})", sim.game.s.enemies.iter().filter(|e| e.alive).count(), sim.game.s.enemies.len());
+            }
         }
     }
     let (Some(mut vm), Some(mut fist)) = (vm, fist) else { return };

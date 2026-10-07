@@ -216,3 +216,17 @@ CPU-skinned enemies, 3,393 colliders/569 triggers, 11,758 MonoBehaviours with ty
   Dark results trace to the data: 0-5 "BlackNoFog", 7-3 night texture (mean 1.6/255), 7-2 tint 0.113, and 1-3/1-4 where
   no level sets `m_Sun` and the brightest active directional light (Unity's fallback) is below the horizon
   (`examples/suns.rs`). 4-2 GreedSky2: mean_lum 0.60, lit 1.0 (was black).
+
+## PostProcessV2 outlines (2026-10-07)
+- The main camera renders color + an RG8 outline buffer (Unity RG16, cleared black). Master's `rtBlend1` state is read
+  per pass (`rtSeparateBlend`); Min/Max ops get One factors (WebGPU requires them, D3D/Vulkan ignore them).
+- `EnemySimplifier` (enabled, on the renderer's own GameObject) gives the renderer a property block: `_Outline` = prefs
+  simplifyEnemies (default 0), `_ForceOutline` 0.5 (both 0 with `neverOutlineAndRemoveSimplifier`), `_BlendOp1` 0,
+  `_SrcBlend1` 1, `_DstBlend1` 0, `_ForceOutlineBehind` 0.
+- OutlinePx pass 3 "Composite1Px" (blend DstColor Zero) runs after the main camera, before the HUD Camera: a pixel
+  that is unmarked but has a marked neighbour (R > 0.999 or R + G > 1) turns black.
+- Probes: `UNITY_PROBE_ENEMY=1` activates the enemy nearest the player (and its ancestors) and frames it from 4 m;
+  `UNITY_SIMPLIFY_ENEMIES=1` sets `_Outline` 1; `UNITY_NO_OUTLINE=1` skips the composite; `examples/outline_px.rs`
+  dumps the shader's passes and blend states. 0-1 Filth: default prefs write 0.63% of the buffer, all R = 0.5, 0 marked
+  (no visible outline, as in ULTRAKILL). With simplifyEnemies: 0.64% marked, 533 outline pixels predicted, 533 black.
+- Harness: `pass.render.<level>.outline_composite`, `render.<level>.outline_buffer_pct`.

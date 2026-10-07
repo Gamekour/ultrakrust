@@ -76,6 +76,8 @@ pub struct Variant {
     /// (location, Unity channel, component count)
     pub inputs: Vec<(u32, u32, u32)>,
     pub stride: u64,
+    /// Fragment output locations (ULTRAKILL/Master writes 0 color, 1 outline RG, 2 view normal).
+    pub outputs: Vec<u32>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -89,6 +91,8 @@ pub struct DrawState {
     pub dst_a: u8,
     pub op: u8,
     pub mask: u8,
+    /// Render target 1 (the outline buffer): src, dst, op, mask.
+    pub rt1: [u8; 4],
 }
 
 pub struct Draw {
@@ -148,6 +152,13 @@ pub struct SceneData {
     pub post: Option<PostDef>,
     /// HUD Camera (renders layer 13 only): load-time Bevy-space transform and vertical fov (deg).
     pub hud_cam: Option<(Mat4, f32)>,
+    /// PostProcessV2_Handler.outlinePx pass 3 ("Composite1Px"): the default 1 px outline blit.
+    pub outline: Option<OutlineDef>,
+}
+
+pub struct OutlineDef {
+    pub variant: u32,
+    pub state: DrawState,
 }
 
 pub struct PostDef {
@@ -339,6 +350,15 @@ fn make_variant(sh: &ShaderAsset, vsub: &uk_assets::shader::SubProgram, shaders:
         link_stages(&mut vm, &fm)?;
         let vsrc = to_wgsl(&vm)?;
         let mut fsrc = to_wgsl(&fm)?;
+        // UNITY_DUMP_WGSL=<dir outside the repo>: every variant's stages, for reading what a shader does
+        if let Ok(dir) = std::env::var("UNITY_DUMP_WGSL") {
+            let stem = format!("{dir}/{}_{}", sh.name.replace('/', "_"), vsub.blob);
+            let cbs: String = params.constant_buffers.iter().map(|cb| format!("// CB {} size {}: {}
+", cb.name, cb.size, cb.params.iter().map(|p| format!("{}@{}", p.name, p.offset)).collect::<Vec<_>>().join(" "))).collect();
+            let _ = std::fs::write(format!("{stem}_vs.wgsl"), &vsrc);
+            let _ = std::fs::write(format!("{stem}_fs.wgsl"), format!("// keywords {:?}
+{cbs}{fsrc}", prog.keywords));
+        }
         // Diagnostics: UNITY_DEBUG_FS="<wgsl expr over the fragment's inputs>" replaces the
         // color output, so frame statistics can show which input is wrong (no screenshots).
         let debug_this = std::env::var("UNITY_DEBUG_VARIANT").ok().and_then(|s| s.parse::<u32>().ok()) == Some(vsub.blob);
@@ -378,6 +398,18 @@ fn make_variant(sh: &ShaderAsset, vsub: &uk_assets::shader::SubProgram, shaders:
         }
         inputs.sort();
         let stride = inputs.iter().map(|i| i.2 as u64 * 4).sum();
+        let fep = fm.entry_points.iter().find(|e| e.stage == naga::ShaderStage::Fragment).ok_or("no fragment entry")?;
+        let mut outputs = Vec::new();
+        if let Some(r) = &fep.function.result {
+            let loc = |b: &Option<naga::Binding>| match b {
+                Some(naga::Binding::Location { location, .. }) => Some(*location),
+                _ => None,
+            };
+            match &fm.types[r.ty].inner {
+                naga::TypeInner::Struct { members, .. } => outputs.extend(members.iter().filter_map(|m| loc(&m.binding))),
+                _ => outputs.extend(loc(&r.binding)),
+            }
+        }
         // unique per variant: levels can carry several copies of one shader (same name and
         // blob index, different programs), and pipeline/layout caches must not mix them up
         let label = format!("{}#{}@{}", sh.name, vsub.blob, index);
@@ -389,6 +421,7 @@ fn make_variant(sh: &ShaderAsset, vsub: &uk_assets::shader::SubProgram, shaders:
             params,
             inputs,
             stride,
+            outputs,
         })
 }
 
@@ -422,6 +455,13 @@ pub fn build(
         enabled: true,
         skin: None,
     });
+    // EnemySimplifier (on the renderer's GameObject) sets its property block in Start: at default
+    // prefs (simplifyEnemies off) _Outline 0 and _ForceOutline 0.5, so enemies write R = 0.5 into the
+    // outline buffer, unmarked; and the forced SV_Target1 blend One/Zero/Add.
+    // neverOutlineAndRemoveSimplifier zeroes both instead.
+    let simplifiers: HashMap<u32, bool> =
+        def.scripts.iter().filter(|s| s.class == "EnemySimplifier" && s.enabled).map(|s| (s.node, s.data.get("neverOutlineAndRemoveSimplifier").i64() != 0)).collect();
+    let mut simplified: HashMap<(String, i64, bool), Arc<MaterialProps>> = HashMap::new();
     for (ri, r) in def.renderers.iter().chain(sky_def.iter()).enumerate() {
         let sky = ri == def.renderers.len();
         if r.batch.indices.is_empty() || (!sky && skip_node(r.node)) {
@@ -438,10 +478,25 @@ pub fn build(
                 Some((Arc::new(props), (sf.name.clone(), sid)))
             })
             .clone();
-        let Some((mat, skey)) = mat else {
+        let Some((mut mat, skey)) = mat else {
             *skipped.entry("material unreadable".into()).or_default() += 1;
             continue;
         };
+        if let Some(&never) = simplifiers.get(&r.node).filter(|_| !sky) {
+            mat = simplified
+                .entry((key.file.clone(), key.path_id, never))
+                .or_insert_with(|| {
+                    let mut m = (*mat).clone();
+                    // prefs simplifyEnemies (default off; UNITY_SIMPLIFY_ENEMIES probes it, ignoring
+                    // simplifiedDistance): SetOutline's shouldBeOutlined
+                    let simplify_enemies = if !never && std::env::var_os("UNITY_SIMPLIFY_ENEMIES").is_some() { 1.0 } else { 0.0 };
+                    for (k, v) in [("_Outline", simplify_enemies), ("_ForceOutline", if never { 0.0 } else { 0.5 }), ("_BlendOp1", 0.0), ("_SrcBlend1", 1.0), ("_DstBlend1", 0.0), ("_ForceOutlineBehind", 0.0)] {
+                        m.floats.insert(k.into(), v);
+                    }
+                    Arc::new(m)
+                })
+                .clone();
+        }
         let sh = shader_assets
             .entry(skey.clone())
             .or_insert_with(|| {
@@ -549,6 +604,7 @@ pub fn build(
             dst_a: state_u8(&st.dst_blend_alpha, &mat),
             op: state_u8(&st.blend_op, &mat),
             mask: state_u8(&st.color_mask, &mat),
+            rt1: st.rt[0].each_ref().map(|v| state_u8(v, &mat)),
         };
         if sky {
             // behind everything: drawn first, never tested or written (Unity's skybox sits at the far plane)
@@ -620,6 +676,32 @@ pub fn build(
         });
         Some(PostDef { variant: variants.len() as u32 - 1, material: Arc::new(props), dither })
     })();
+    // the outline composite: at default prefs (simplifyEnemies off) the handler blits the outline
+    // buffer onto the scene with OutlinePx pass 3 at CameraEvent.AfterEverything
+    let outline = (|| {
+        let h = def.scripts.iter().find(|s| s.class == "PostProcessV2_Handler")?;
+        let f = db.file(&def.scene_file).ok()?;
+        let (sf, sid) = db.resolve(&f, h.data.get("outlinePx").pptr()).ok().flatten()?;
+        let sh = ShaderAsset::from_value(&sf.read_id(sid).ok()?).ok()?;
+        let pass = sh.passes.get(3)?;
+        let vsub = sh.select(&pass.vertex, &[])?.clone();
+        let var = make_variant(&sh, &vsub, shaders, variants.len()).map_err(|e| warn!("outline variant: {e}")).ok()?;
+        variants.push(var);
+        let (st, m) = (&pass.state, &MaterialProps::default());
+        let state = DrawState {
+            cull: state_u8(&st.cull, m),
+            zwrite: false,
+            ztest: 8,
+            src: state_u8(&st.src_blend, m),
+            dst: state_u8(&st.dst_blend, m),
+            src_a: state_u8(&st.src_blend_alpha, m),
+            dst_a: state_u8(&st.dst_blend_alpha, m),
+            op: state_u8(&st.blend_op, m),
+            mask: state_u8(&st.color_mask, m),
+            rt1: [1, 0, 0, 0],
+        };
+        Some(OutlineDef { variant: variants.len() as u32 - 1, state })
+    })();
     let rs = &def.render_settings;
     let lights = def
         .lights
@@ -629,11 +711,17 @@ pub fn build(
     let total: usize = draws.len() + skipped.values().sum::<usize>();
     let mut sk: Vec<_> = skipped.into_iter().collect();
     sk.sort_by(|a, b| b.1.cmp(&a.1));
+    let enemy_draws: Vec<&Draw> = draws.iter().filter(|d| simplifiers.contains_key(&d.node)).collect();
     let summary = format!(
-        "unity shaders: post-process {}, sky {} (camera {:?}), {} variants, {}/{} renderers drawn, {} textures, {} lights; skipped: {:?}",
+        "unity shaders: post-process {}, outline {}, sky {} (camera {:?}), enemy simplifiers {} on {} draws ({} write SV_Target1: {:?}), {} variants, {}/{} renderers drawn, {} textures, {} lights; skipped: {:?}",
         post.as_ref().map_or("missing".to_string(), |p| format!("{} dither {:?}", variants[p.variant as usize].label, p.dither.map(|t| (textures[t as usize].width, textures[t as usize].height)))),
+        outline.as_ref().map_or("missing".to_string(), |o| format!("{} state {:?}", variants[o.variant as usize].label, o.state)),
         draws.iter().find(|d| d.sky).map_or("none".to_string(), |d| format!("{} {:?} textures {:?}", variants[d.variant as usize].label, d.material.name, d.textures.values().map(|&t| (textures[t as usize].width, textures[t as usize].layers)).collect::<Vec<_>>())),
         def.render_settings.camera_clear,
+        simplifiers.len(),
+        enemy_draws.len(),
+        enemy_draws.iter().filter(|d| variants[d.variant as usize].outputs.contains(&1)).count(),
+        enemy_draws.iter().map(|d| (variants[d.variant as usize].label.as_str(), variants[d.variant as usize].outputs.clone(), d.state.rt1)).collect::<std::collections::BTreeSet<_>>(),
         variants.len(),
         draws.len(),
         total,
@@ -654,6 +742,7 @@ pub fn build(
         post,
         // the HUD Camera component: fov 90, culling mask layer 13, depth-only clear
         hud_cam: def.find("HUD Camera").map(|h| (def.nodes[h as usize].world0, 90.0)),
+        outline,
     };
     (scene, summary)
 }
@@ -779,8 +868,14 @@ struct UnityGpu {
     generation: u64,
     draws: Vec<Option<GpuDraw>>,
     layouts: Vec<[BindGroupLayoutDescriptor; 2]>,
-    pipelines: HashMap<(u32, DrawState), CachedRenderPipelineId>,
+    /// keyed by (variant, state, main camera): the main camera renders color + the outline buffer,
+    /// the HUD Camera color only
+    pipelines: HashMap<(u32, DrawState, bool), CachedRenderPipelineId>,
     target: Option<(UVec2, Texture, TextureView, TextureView)>,
+    /// PostProcessV2's reusableBufferA: the main camera's second target (outline RG), cleared black each frame.
+    outline_target: Option<(Texture, TextureView)>,
+    outline: Option<OutlineGpu>,
+    outline_readback: std::sync::Mutex<Option<Buffer>>,
     /// `UNITY_FRAME_STATS`: one frame of the scene target copied back for numeric checks.
     readback: std::sync::Mutex<Option<(Buffer, u32, UVec2, bool)>>,
     frames: std::sync::atomic::AtomicU32,
@@ -798,6 +893,13 @@ struct UnityGpu {
     /// PostProcessV2 output (what the Virtual Camera puts on screen), same size as the scene target.
     post_target: Option<(Texture, TextureView)>,
     post_readback: std::sync::Mutex<Option<Buffer>>,
+}
+
+struct OutlineGpu {
+    pipeline: CachedRenderPipelineId,
+    layouts: [BindGroupLayoutDescriptor; 2],
+    ubufs: Vec<(u32, Buffer, usize)>,
+    sampler: Sampler,
 }
 
 struct PostGpu {
@@ -826,6 +928,11 @@ fn fill_post_cb(out: &mut [u8], cb: &uk_assets::shader::ConstantBuffer, mat: &Ma
                 "_DitherStrength" => [0.2, 0.0, 0.0, 0.0],
                 "_Gamma" => [1.0, 0.0, 0.0, 0.0],
                 "_HurtScreenColor" => [0.0; 4],
+                // OutlinePx: SetupOutlines at full resolution, forced to one pixel
+                "_OutlineTex_TexelSize" | "_MainTex_TexelSize" => [1.0 / size.x as f32, 1.0 / size.y as f32, size.x as f32, size.y as f32],
+                "_Resolution" => [size.x as f32, size.y as f32, 0.0, 0.0],
+                "_ResolutionDiff" => [1.0, 1.0, 0.0, 0.0],
+                "_OutlineDistance" => [1.0, 0.0, 0.0, 0.0],
                 n => mat.vector(n).unwrap_or([0.0; 4]),
             };
             v[..p.cols.clamp(1, 4) as usize].to_vec()
@@ -841,6 +948,8 @@ fn fill_post_cb(out: &mut [u8], cb: &uk_assets::shader::ConstantBuffer, mat: &Ma
 }
 
 const COLOR_FORMAT: TextureFormat = TextureFormat::Rgba8Unorm;
+/// Unity RenderTextureFormat.RG16: two 8-bit channels.
+const OUTLINE_FORMAT: TextureFormat = TextureFormat::Rg8Unorm;
 const DEPTH_FORMAT: TextureFormat = TextureFormat::Depth32Float;
 
 fn blend_factor(f: u8) -> BlendFactor {
@@ -857,6 +966,15 @@ fn blend_factor(f: u8) -> BlendFactor {
         9 => BlendFactor::SrcAlphaSaturated,
         _ => BlendFactor::OneMinusSrcAlpha,
     }
+}
+
+/// Min/Max ignore the factors in D3D/Vulkan; WebGPU requires them to be One.
+fn component(src: u8, dst: u8, op: u8) -> BlendComponent {
+    let operation = blend_op(op);
+    if matches!(operation, BlendOperation::Min | BlendOperation::Max) {
+        return BlendComponent { src_factor: BlendFactor::One, dst_factor: BlendFactor::One, operation };
+    }
+    BlendComponent { src_factor: blend_factor(src), dst_factor: blend_factor(dst), operation }
 }
 
 fn blend_op(o: u8) -> BlendOperation {
@@ -1317,8 +1435,8 @@ fn prepare(
             let bg1 = dev.create_bind_group("unity g1", &l1, &e1);
             let vbuf = dev.create_buffer_with_data(&BufferInitDescriptor { label: Some("unity vb"), contents: &d.vertices, usage: BufferUsages::VERTEX | BufferUsages::COPY_DST });
             let ibuf = dev.create_buffer_with_data(&BufferInitDescriptor { label: Some("unity ib"), contents: bytemuck::cast_slice(&d.indices), usage: BufferUsages::INDEX });
-            let key = (d.variant, d.state);
-            let pipeline = *gpu.pipelines.entry(key).or_insert_with(|| cache.queue_render_pipeline(pipeline_descriptor(var, layouts, d.state)));
+            let key = (d.variant, d.state, !d.hud);
+            let pipeline = *gpu.pipelines.entry(key).or_insert_with(|| cache.queue_render_pipeline(pipeline_descriptor(var, layouts, d.state, !d.hud)));
             draws.push(Some(GpuDraw { vbuf, ibuf, count: d.indices.len() as u32, ubufs: ubufs.clone(), bg0, bg1, pipeline }));
         }
         gpu.draws = draws;
@@ -1351,8 +1469,8 @@ fn prepare(
             }
             let vbuf = dev.create_buffer_with_data(&BufferInitDescriptor { label: Some("unity post vb"), contents: &verts, usage: BufferUsages::VERTEX });
             // PostProcessV2's pass: Cull Off, ZWrite Off, ZTest Always, Blend One Zero
-            let state = DrawState { cull: 0, zwrite: false, ztest: 8, src: 1, dst: 0, src_a: 1, dst_a: 0, op: 0, mask: 15 };
-            let mut desc = pipeline_descriptor(var, &layouts, state);
+            let state = DrawState { cull: 0, zwrite: false, ztest: 8, src: 1, dst: 0, src_a: 1, dst_a: 0, op: 0, mask: 15, rt1: [1, 0, 0, 0] };
+            let mut desc = pipeline_descriptor(var, &layouts, state, false);
             desc.depth_stencil = None;
             let dither = match p.dither {
                 Some(t) => (tex_views[t as usize].clone(), sampler_for(&dev, scene.textures.get(t as usize))),
@@ -1360,6 +1478,35 @@ fn prepare(
             };
             let main_sampler = dev.create_sampler(&SamplerDescriptor { label: Some("unity post main"), ..default() });
             PostGpu { pipeline: cache.queue_render_pipeline(desc), layouts, ubufs, vbuf, dither, main_sampler }
+        });
+        gpu.outline = scene.outline.as_ref().map(|o| {
+            let var = &scene.variants[o.variant as usize];
+            let layouts = [
+                BindGroupLayoutDescriptor::new("unity outline g0", &layout_entries(&var.groups[0])),
+                BindGroupLayoutDescriptor::new("unity outline g1", &layout_entries(&var.groups[1])),
+            ];
+            let ubufs = var.groups[1]
+                .iter()
+                .filter_map(|s| match s {
+                    Slot::Uniform { binding, cb } => {
+                        let size = var.params.constant_buffers.get(*cb).map_or(16, |c| c.size.next_multiple_of(16).max(16)) as u64;
+                        let b = dev.create_buffer(&BufferDescriptor { label: Some("unity outline cb"), size, usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST, mapped_at_creation: false });
+                        Some((*binding, b, *cb))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let mut desc = pipeline_descriptor(var, &layouts, o.state, false);
+            desc.depth_stencil = None;
+            // a Blit is never culled (Unity matches its winding to the flip); ours may wind either way
+            desc.primitive.cull_mode = None;
+            // the pass builds its triangle from the vertex index
+            if var.inputs.is_empty() {
+                desc.vertex.buffers.clear();
+            }
+            // Blit's source: a render texture at its default (bilinear) filtering
+            let sampler = dev.create_sampler(&SamplerDescriptor { label: Some("unity outline"), mag_filter: FilterMode::Linear, min_filter: FilterMode::Linear, ..default() });
+            OutlineGpu { pipeline: cache.queue_render_pipeline(desc), layouts, ubufs, sampler }
         });
     }
     // composite pipeline
@@ -1434,6 +1581,18 @@ fn prepare(
         });
         let pv = post.create_view(&TextureViewDescriptor::default());
         gpu.post_target = Some((post, pv));
+        let ol = dev.create_texture(&TextureDescriptor {
+            label: Some("unity outline buffer"),
+            size: Extent3d { width: size.x, height: size.y, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: OUTLINE_FORMAT,
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let ov = ol.create_view(&TextureViewDescriptor::default());
+        gpu.outline_target = Some((ol, ov));
     }
     // camera: Bevy view -> Unity space (Unity world = Bevy world mirrored in z)
     let mirror = Mat4::from_scale(Vec3::new(1.0, 1.0, -1.0));
@@ -1644,13 +1803,23 @@ fn prepare(
             queue.write_buffer(buf, 0, &bytes);
         }
     }
+    if let (Some(og), Some(od)) = (&gpu.outline, scene.outline.as_ref()) {
+        let var = &scene.variants[od.variant as usize];
+        for (_, buf, cb) in &og.ubufs {
+            let Some(cbd) = var.params.constant_buffers.get(*cb) else { continue };
+            let mut bytes = vec![0u8; buf.size() as usize];
+            fill_post_cb(&mut bytes, cbd, &MaterialProps::default(), size);
+            queue.write_buffer(buf, 0, &bytes);
+        }
+    }
     if std::env::var_os("UNITY_FRAME_STATS").is_some() && gpu.frames.load(std::sync::atomic::Ordering::Relaxed) == 240 {
         let hud = scene.draws.iter().enumerate().filter(|(i, d)| d.hud && gpu.in_view[*i]).count();
         info!("unity prepare: {:.2} ms; draws in view {}/{} (hud camera {hud}/{})", t_prepare.elapsed().as_secs_f64() * 1e3, gpu.in_view.iter().filter(|v| **v).count(), gpu.in_view.len(), scene.draws.iter().filter(|d| d.hud).count());
     }
 }
 
-fn pipeline_descriptor(var: &Variant, layouts: &[BindGroupLayoutDescriptor; 2], s: DrawState) -> RenderPipelineDescriptor {
+/// `mrt`: the main camera's targets (color, outline RG); otherwise color only.
+fn pipeline_descriptor(var: &Variant, layouts: &[BindGroupLayoutDescriptor; 2], s: DrawState, mrt: bool) -> RenderPipelineDescriptor {
     let mut offset = 0;
     let attributes = var
         .inputs
@@ -1668,16 +1837,30 @@ fn pipeline_descriptor(var: &Variant, layouts: &[BindGroupLayoutDescriptor; 2], 
         })
         .collect();
     let opaque = s.src == 1 && s.dst == 0 && s.src_a <= 1 && s.dst_a == 0;
-    let blend = (!opaque).then(|| BlendState {
-        color: BlendComponent { src_factor: blend_factor(s.src), dst_factor: blend_factor(s.dst), operation: blend_op(s.op) },
-        alpha: BlendComponent { src_factor: blend_factor(s.src_a.max(s.src)), dst_factor: blend_factor(s.dst_a.max(s.dst)), operation: blend_op(s.op) },
-    });
+    let blend = (!opaque).then(|| BlendState { color: component(s.src, s.dst, s.op), alpha: component(s.src_a.max(s.src), s.dst_a.max(s.dst), s.op) });
     // Unity ColorWriteMask: A = 1, B = 2, G = 4, R = 8
-    let mut mask = ColorWrites::empty();
-    for (bit, w) in [(8, ColorWrites::RED), (4, ColorWrites::GREEN), (2, ColorWrites::BLUE), (1, ColorWrites::ALPHA)] {
-        if s.mask & bit != 0 {
-            mask |= w;
+    let writes = |m: u8| {
+        let mut mask = ColorWrites::empty();
+        for (bit, w) in [(8, ColorWrites::RED), (4, ColorWrites::GREEN), (2, ColorWrites::BLUE), (1, ColorWrites::ALPHA)] {
+            if m & bit != 0 {
+                mask |= w;
+            }
         }
+        mask
+    };
+    let mask = writes(s.mask);
+    let mut targets = vec![Some(ColorTargetState { format: COLOR_FORMAT, blend, write_mask: mask })];
+    if mrt {
+        // SV_Target1 -> the outline buffer; a shader without that output leaves it untouched.
+        // SV_Target2 (view normal, read only by stains) has no target.
+        let [src, dst, op, m] = s.rt1;
+        let c = component(src, dst, op);
+        let has = var.outputs.contains(&1);
+        targets.push(Some(ColorTargetState {
+            format: OUTLINE_FORMAT,
+            blend: (src != 1 || dst != 0 || op != 0).then_some(BlendState { color: c, alpha: c }),
+            write_mask: if has { writes(m) } else { ColorWrites::empty() },
+        }));
     }
     RenderPipelineDescriptor {
         label: Some(var.label.clone().into()),
@@ -1708,7 +1891,7 @@ fn pipeline_descriptor(var: &Variant, layouts: &[BindGroupLayoutDescriptor; 2], 
         fragment: Some(FragmentState {
             shader: var.fs.clone(),
             entry_point: Some("main".into()),
-            targets: vec![Some(ColorTargetState { format: COLOR_FORMAT, blend, write_mask: mask })],
+            targets,
             ..default()
         }),
         ..default()
@@ -1755,15 +1938,22 @@ fn draw(
         if hud && order.is_empty() {
             continue;
         }
+        if hud {
+            outline_pass(world, gpu, scene, cache, color, &mut ctx);
+        }
         let color_load = if hud { LoadOp::Load } else { LoadOp::Clear(wgpu_types::Color { r: c[0] as f64, g: c[1] as f64, b: c[2] as f64, a: 1.0 }) };
+        let main = Some(RenderPassColorAttachment { view: color, depth_slice: None, resolve_target: None, ops: Operations { load: color_load, store: StoreOp::Store } });
+        // the main camera's second target: the outline buffer, cleared black (OnPreRenderCallback)
+        let outline = gpu.outline_target.as_ref().filter(|_| !hud).map(|(_, v)| RenderPassColorAttachment {
+            view: v,
+            depth_slice: None,
+            resolve_target: None,
+            ops: Operations { load: LoadOp::Clear(wgpu_types::Color::TRANSPARENT), store: StoreOp::Store },
+        });
+        let attachments = if hud { vec![main] } else { vec![main, outline] };
         let mut pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
             label: Some(if hud { "unity hud camera" } else { "unity scene" }),
-            color_attachments: &[Some(RenderPassColorAttachment {
-                view: color,
-                depth_slice: None,
-                resolve_target: None,
-                ops: Operations { load: color_load, store: StoreOp::Store },
-            })],
+            color_attachments: &attachments,
             depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
                 view: depth,
                 depth_ops: Some(Operations { load: LoadOp::Clear(0.0), store: StoreOp::Store }),
@@ -1783,6 +1973,9 @@ fn draw(
             pass.set_index_buffer(d.ibuf.slice(..), IndexFormat::Uint32);
             pass.draw_indexed(0..d.count, 0, 0..1);
         }
+    }
+    if sorted(true).is_empty() {
+        outline_pass(world, gpu, scene, cache, color, &mut ctx);
     }
     // ULTRAKILL's final composite (PostProcessV2) into the post target
     let mut shown = color;
@@ -1848,6 +2041,16 @@ fn draw(
             Extent3d { width: size.x, height: size.y, depth_or_array_layers: 1 },
         );
         *gpu.readback.lock().unwrap() = Some((buf, row, *size, false));
+        if let Some((otex, _)) = gpu.outline_target.as_ref() {
+            let orow = (size.x * 2).next_multiple_of(256);
+            let obuf = dev.create_buffer(&BufferDescriptor { label: Some("unity outline readback"), size: (orow * size.y) as u64, usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ, mapped_at_creation: false });
+            ctx.command_encoder().copy_texture_to_buffer(
+                otex.as_image_copy(),
+                TexelCopyBufferInfo { buffer: &obuf, layout: TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(orow), rows_per_image: Some(size.y) } },
+                Extent3d { width: size.x, height: size.y, depth_or_array_layers: 1 },
+            );
+            *gpu.outline_readback.lock().unwrap() = Some(obuf);
+        }
         if let (Some((ptex, _)), false) = (gpu.post_target.as_ref(), std::ptr::eq(shown, color)) {
             let pbuf = dev.create_buffer(&BufferDescriptor { label: Some("unity post readback"), size: (row * size.y) as u64, usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ, mapped_at_creation: false });
             ctx.command_encoder().copy_texture_to_buffer(
@@ -1877,6 +2080,41 @@ fn draw(
     });
     pass.set_render_pipeline(p);
     pass.set_bind_group(0, &bg, &[]);
+    pass.draw(0..3, 0..1);
+}
+
+/// PostProcessV2's outline composite (OutlinePx pass 3, CameraEvent.AfterEverything on the main
+/// camera, so before the HUD Camera): multiplies color by 1 - (marked neighbour and unmarked self).
+fn outline_pass(world: &World, gpu: &UnityGpu, scene: &SceneData, cache: &PipelineCache, color: &TextureView, ctx: &mut RenderContext) {
+    let (Some(og), Some(od), Some((_, ov))) = (&gpu.outline, scene.outline.as_ref(), gpu.outline_target.as_ref()) else { return };
+    if std::env::var_os("UNITY_NO_OUTLINE").is_some() {
+        return;
+    }
+    let Some(p) = cache.get_render_pipeline(og.pipeline) else { return };
+    let dev = world.resource::<RenderDevice>();
+    let var = &scene.variants[od.variant as usize];
+    let e0: Vec<BindGroupEntry> = var.groups[0]
+        .iter()
+        .filter_map(|s| match s {
+            Slot::Texture { binding, .. } => Some(BindGroupEntry { binding: *binding, resource: BindingResource::TextureView(ov) }),
+            Slot::Sampler { binding, .. } => Some(BindGroupEntry { binding: *binding, resource: BindingResource::Sampler(&og.sampler) }),
+            _ => None,
+        })
+        .collect();
+    let e1: Vec<BindGroupEntry> = og.ubufs.iter().map(|(b, buf, _)| BindGroupEntry { binding: *b, resource: buf.as_entire_binding() }).collect();
+    let bg0 = dev.create_bind_group("unity outline g0", &cache.get_bind_group_layout(&og.layouts[0]), &e0);
+    let bg1 = dev.create_bind_group("unity outline g1", &cache.get_bind_group_layout(&og.layouts[1]), &e1);
+    let mut pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
+        label: Some("unity outline"),
+        color_attachments: &[Some(RenderPassColorAttachment { view: color, depth_slice: None, resolve_target: None, ops: Operations { load: LoadOp::Load, store: StoreOp::Store } })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    pass.set_render_pipeline(p);
+    pass.set_bind_group(0, &bg0, &[]);
+    pass.set_bind_group(1, &bg1, &[]);
     pass.draw(0..3, 0..1);
 }
 
@@ -1944,5 +2182,48 @@ fn frame_stats(gpu: Res<UnityGpu>, dev: Res<RenderDevice>, scene: Res<UnityScene
             }
         }
         info!("unity post stats: mean abs diff vs scene {:.2} (rows flipped {:.2}) distinct colors {}", same as f64 / (3.0 * n), flip as f64 / (3.0 * n), pd.len());
+    }
+    // the outline buffer: coverage, marked pixels (pass 3's test: R > 0.999 or R + G > 1), the
+    // outline pixels that marking predicts, and how many of those the scene target shows black
+    if let Some(obuf) = gpu.outline_readback.lock().unwrap().take() {
+        let os = obuf.slice(..);
+        os.map_async(MapMode::Read, |_| {});
+        let _ = dev.poll(wgpu_types::PollType::wait_indefinitely());
+        let o = os.get_mapped_range();
+        let orow = (size.x * 2).next_multiple_of(256);
+        let rg = |x: u32, y: u32| {
+            let i = (y * orow + x * 2) as usize;
+            (o[i] as u32, o[i + 1] as u32)
+        };
+        let marked = |x: u32, y: u32| {
+            let (r, g) = rg(x, y);
+            r as f32 / 255.0 > 0.999 || r + g > 255
+        };
+        let (mut cover, mut half, mut mk, mut predicted, mut black) = (0u64, 0u64, 0u64, 0u64, 0u64);
+        for y in 0..size.y {
+            for x in 0..size.x {
+                let (r, g) = rg(x, y);
+                cover += (r > 0 || g > 0) as u64;
+                half += (r == 128 || r == 127) as u64;
+                let m = marked(x, y);
+                mk += m as u64;
+                if !m && [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)].iter().any(|&(dx, dy)| {
+                    let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                    nx >= 0 && ny >= 0 && (nx as u32) < size.x && (ny as u32) < size.y && marked(nx as u32, ny as u32)
+                }) {
+                    predicted += 1;
+                    let i = (y * *row + x * 4) as usize;
+                    black += (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0) as u64;
+                }
+            }
+        }
+        info!(
+            "unity outline stats: buffer written {:.2}% (R = 0.5: {:.2}%) marked {:.3}% outline pixels {} black in scene {}",
+            100.0 * cover as f64 / n,
+            100.0 * half as f64 / n,
+            100.0 * mk as f64 / n,
+            predicted,
+            black
+        );
     }
 }

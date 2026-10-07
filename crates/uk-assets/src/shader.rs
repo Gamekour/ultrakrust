@@ -50,6 +50,9 @@ pub struct RenderState {
     pub dst_blend_alpha: StateValue,
     pub blend_op: StateValue,
     pub color_mask: StateValue,
+    /// Render targets 1 and 2 (`rtSeparateBlend`): src, dst, op, mask. Without separate blending
+    /// they share target 0's state.
+    pub rt: [[StateValue; 4]; 2],
 }
 
 /// One compiled variant of a stage.
@@ -239,6 +242,11 @@ impl ShaderAsset {
             for p in ss.get("m_Passes").array() {
                 let st = p.get("m_State");
                 let b = st.get("rtBlend0");
+                let separate = st.get("rtSeparateBlend").i64() != 0;
+                let rt = |i: usize| {
+                    let r = if separate { st.get(&format!("rtBlend{i}")) } else { b };
+                    ["srcBlend", "destBlend", "blendOp", "colMask"].map(|k| StateValue::from(r.get(k)))
+                };
                 passes.push(Pass {
                     name: st.get("m_Name").str().to_string(),
                     tags: st.get("m_Tags").get("tags").array().iter().map(|t| (t.get("first").str().to_string(), t.get("second").str().to_string())).collect(),
@@ -252,6 +260,7 @@ impl ShaderAsset {
                         dst_blend_alpha: StateValue::from(b.get("destBlendAlpha")),
                         blend_op: StateValue::from(b.get("blendOp")),
                         color_mask: StateValue::from(b.get("colMask")),
+                        rt: [rt(1), rt(2)],
                     },
                     vertex: subs(p, "progVertex"),
                     fragment: subs(p, "progFragment"),

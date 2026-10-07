@@ -73,6 +73,13 @@ pub fn levels(install: &Path, filter: Option<&str>, r: &mut Report) {
             }
             None => r.note(format!("gap: render {l}: PostProcessV2 composite not drawn")),
         }
+        // OutlinePx composite: every pixel next to a marked one is black in the scene
+        if let Some(line) = grab(&log, "unity outline stats:") {
+            let num = |key: &str| line.split(key).nth(1).and_then(|s| s.split(|c: char| c == ' ' || c == '%').next()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(-1.0);
+            let (pred, black) = (num("outline pixels "), num("black in scene "));
+            r.pass(&format!("render.{l}.outline_composite"), pred == black, format!("{black} of {pred} outline pixels black"));
+            r.info(&format!("render.{l}.outline_buffer_pct"), num("buffer written "));
+        }
         if let Some(line) = grab(&log, "unity anim stats:") {
             let num = |key: &str| line.split(key).nth(1).and_then(|s| s.split_whitespace().next()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(-1.0);
             let err = num("rest_err ");
