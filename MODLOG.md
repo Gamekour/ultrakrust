@@ -392,3 +392,26 @@ CPU-skinned enemies, 3,393 colliders/569 triggers, 11,758 MonoBehaviours with ty
   - Death audio and the pitch drop.
   - The rb torque roll.
   - The scene reload is our `restart_level` (it respawns at the level start; it does not reload the scene).
+
+## 2026-10-07 — uGUI interpreter, part 1 (layout + meshing)
+- `uk-assets/src/ui.rs`: the UI assets a scene's scripts reference (sprites with outer/inner UV, border, padding,
+  textures with wrap mode, TMP fonts and atlases, legacy fonts, materials, and the built-in UI/Default material).
+- `uk-game/src/ugui.rs`: a pure (bevy_math only) uGUI pass over the scene's real Canvas hierarchies. These are literal ports
+  of the decompiled UnityEngine.UI:
+  - CanvasScaler.Handle (all 3 modes and the world-space dynamic PPU) and RectTransform layout in root-canvas space.
+  - GetPixelAdjustedRect on pixel-perfect screen canvases.
+  - Graphic, Image and RawImage OnPopulateMesh: Simple with PreserveAspect, Sliced, Tiled (incl. the 65000 vertex cap), and
+    Filled (Horizontal, Vertical, Radial90/180/360 with RadialCut).
+  - Shadow and Outline (ApplyShadowZeroAlloc).
+  - Mask and MaskableGraphic stencil materials (StencilMaterial.Add, push and pop).
+  - RectMask2D clip and cull, CanvasGroup alpha, the CanvasRenderer colour, and override-sorting sub-batches.
+  - Output: per-canvas batches of draws (vertices, material, texture, stencil, clip rect).
+- `examples/ugui_frame.rs` (level0-1, 1920×1080, static scene activation):
+  - 11 canvases, 3140 graphics, 38 Masks, 1 RectMask2D. Frame built in 1.7 ms.
+  - Player/Canvas: overlay, order 40, scale 1.5 (1280×720 match 0.5), 28 draws.
+  - Level Stats panel at px [15, 592.5]-[442.5, 1065], sliced 36-vertex quads.
+- Not yet:
+  - Text and TMP meshes.
+  - Slider/layout groups (Slider fills are zero-width until Slider sets their anchors).
+  - The renderer path.
+  - HUD scripts (StatsManager hiding FinalRank, StyleHUD, HudOpenEffect...); the probe shows the scene's initial state.

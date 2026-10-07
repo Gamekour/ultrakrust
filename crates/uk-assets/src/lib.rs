@@ -18,6 +18,7 @@ pub mod shader;
 pub mod smolv;
 pub mod spirv;
 pub mod texture;
+pub mod ui;
 
 #[derive(Debug, Clone)]
 pub struct Error(pub String);
