@@ -230,3 +230,17 @@ CPU-skinned enemies, 3,393 colliders/569 triggers, 11,758 MonoBehaviours with ty
   dumps the shader's passes and blend states. 0-1 Filth: default prefs write 0.63% of the buffer, all R = 0.5, 0 marked
   (no visible outline, as in ULTRAKILL). With simplifyEnemies: 0.64% marked, 533 outline pixels predicted, 533 black.
 - Harness: `pass.render.<level>.outline_composite`, `render.<level>.outline_buffer_pct`.
+
+## PostProcessV2 hurt flash + DEAD (2026-10-07)
+- PostProcessV2's default pass lerps the scene toward `_HurtScreenColor`.rgb by its alpha. NewMovement.GetHurt sets
+  `currentColor.a` to 0.8 (damage >= 50) or 0.5 after its early returns, and Update fades it by dt, dead or alive; the
+  RGB is NewMovement.hurtScreen's Image `m_Color` (1, 0.186, 0), read from the scene. Sim: `State::hurt_alpha`.
+- DeathSequence enables the DEAD keyword and drives `_Sharpness` = `_Deathness` = t * 0.5 for 2 s; `_ChromaticAberration`
+  is never set (0). The DEAD variant gets its own pipeline and constant buffers (`_Time`, `_ScreenParams` filled) and
+  replaces the default pass while `State::dead`. Gap: ULTRAKILL ends the sequence into the death screen; we auto-respawn
+  at 1.5 s, so deathness peaks at 0.75.
+- Heat-wave: `HeatWaves()` has no caller. ColorSchemeSetter is in no campaign scene.
+- Probe: `UNITY_PROBE_HURT=frame:damage`; logs `unity post globals` and `unity post shift` (mean post - scene).
+  `examples/post_vsrm.rs` dumps the shader's keyword variants and constant buffers, `examples/hurt_screen.rs` the color.
+- 0-1: baseline shift (-3.9, -3.8, -4.3). 30 damage at frame 232: alpha 0.433 at frame 240, shift (93.8, 11.1, -6.4) vs
+  predicted (94.0, 11.2, -7.1). 200 damage at frame 200: alpha 0.470, deathness 0.165 (0.33 s), DEAD pass on.

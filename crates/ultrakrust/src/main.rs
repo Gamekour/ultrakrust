@@ -739,6 +739,17 @@ fn apply_view(
             p.fov = 75f32.to_radians();
         }
     }
+    // UNITY_PROBE_HURT=frame:damage: hurt the player once at that frame, for the post hurt/death stats
+    if let Some((at, dmg)) = std::env::var("UNITY_PROBE_HURT").ok().and_then(|v| {
+        let (a, d) = v.split_once(':')?;
+        Some((a.parse::<u32>().ok()?, d.parse::<i32>().ok()?))
+    }) {
+        static FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == at {
+            info!("hurt probe: {dmg} damage at frame {at}");
+            sim.game.hurt_player(dmg, true);
+        }
+    }
     // UNITY_PROBE_ENEMY: frame the enemy nearest the player from 4 m, for the outline buffer stats
     if std::env::var_os("UNITY_PROBE_ENEMY").is_some() {
         // once: stand on the nearest enemy so its room's triggers activate it

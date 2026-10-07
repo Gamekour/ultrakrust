@@ -163,6 +163,10 @@ pub struct OutlineDef {
 
 pub struct PostDef {
     pub variant: u32,
+    /// the same pass with DeathSequence's DEAD keyword (PostProcessV2_Handler.DeathEffect)
+    pub dead_variant: Option<u32>,
+    /// NewMovement.hurtScreen's Image color: the RGB of `_HurtScreenColor`
+    pub hurt_rgb: [f32; 3],
     pub material: Arc<MaterialProps>,
     /// PostProcessV2_Handler.ditherTexture (scene texture index).
     pub dither: Option<u32>,
@@ -182,6 +186,10 @@ pub struct UnityFrame {
     pub skinned: Arc<Vec<(usize, Vec<u8>)>>,
     /// Unity-space light world positions / forward directions, and whether each is active.
     pub lights: Arc<Vec<(Vec3, Vec3, bool)>>,
+    /// NewMovement.currentColor.a (the hurt flash)
+    pub hurt: f32,
+    /// DeathSequence's `_Deathness`/`_Sharpness` while the player is dead (DEAD keyword on)
+    pub dead: Option<f32>,
 }
 
 pub struct UnityRenderPlugin;
@@ -669,12 +677,35 @@ pub fn build(
         let vsub = sh.select(&sh.passes.first()?.vertex, &kw)?.clone();
         let var = make_variant(&sh, &vsub, shaders, variants.len()).map_err(|e| warn!("post-process variant: {e}")).ok()?;
         variants.push(var);
+        let variant = variants.len() as u32 - 1;
+        let mut dkw = kw.clone();
+        dkw.push("DEAD");
+        let dead_variant = sh.select(&sh.passes[0].vertex, &dkw).cloned().and_then(|dsub| {
+            let var = make_variant(&sh, &dsub, shaders, variants.len()).map_err(|e| warn!("post-process DEAD variant: {e}")).ok()?;
+            variants.push(var);
+            Some(variants.len() as u32 - 1)
+        });
+        // the hurt flash color: NewMovement.hurtScreen (a disabled Image the shader stands in for)
+        let hurt_rgb = def
+            .scripts
+            .iter()
+            .find(|s| s.class == "NewMovement")
+            .and_then(|s| {
+                let nf = db.file(s.file.as_deref().unwrap_or(&def.scene_file)).ok()?;
+                let (imf, id) = db.resolve(&nf, s.data.get("hurtScreen").pptr()).ok().flatten()?;
+                let c = imf.read_id(id).ok()?.get("m_Color").clone();
+                Some([c.get("r").f32(), c.get("g").f32(), c.get("b").f32()])
+            })
+            .unwrap_or_else(|| {
+                warn!("NewMovement.hurtScreen unresolved; hurt flash disabled");
+                [0.0; 3]
+            });
         let dither = db.resolve(&f, h.data.get("ditherTexture").pptr()).ok().flatten().and_then(|(tf, tid)| {
             let t = uk_assets::texture::decode_texture(db, &tf.read_id(tid).ok()?).ok()?;
             textures.push(TexCpu { width: t.width, height: t.height, rgba: t.rgba, filter: t.filter, wrap: t.wrap, layers: t.layers });
             Some(textures.len() as u32 - 1)
         });
-        Some(PostDef { variant: variants.len() as u32 - 1, material: Arc::new(props), dither })
+        Some(PostDef { variant, dead_variant, hurt_rgb, material: Arc::new(props), dither })
     })();
     // the outline composite: at default prefs (simplifyEnemies off) the handler blits the outline
     // buffer onto the scene with OutlinePx pass 3 at CameraEvent.AfterEverything
@@ -846,7 +877,17 @@ pub fn frame(game: &uk_game::Game, scene: &SceneData, time: f32) -> UnityFrame {
             (Vec3::new(pos.x, pos.y, -pos.z), Vec3::new(fwd.x, fwd.y, -fwd.z), l.enabled && game.active(l.node))
         })
         .collect();
-    UnityFrame { time, visible: Arc::new(visible), object_to_world: Arc::new(object_to_world), skinned: Arc::new(skinned), lights: Arc::new(lights) }
+    let s = &game.s;
+    UnityFrame {
+        time,
+        visible: Arc::new(visible),
+        object_to_world: Arc::new(object_to_world),
+        skinned: Arc::new(skinned),
+        lights: Arc::new(lights),
+        hurt: s.hurt_alpha,
+        // DeathSequence.Update: timeSinceDeath * 0.5 for its first 2 s, then held
+        dead: s.dead.then(|| s.dead_timer.min(2.0) * 0.5),
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -875,6 +916,8 @@ struct UnityGpu {
     /// PostProcessV2's reusableBufferA: the main camera's second target (outline RG), cleared black each frame.
     outline_target: Option<(Texture, TextureView)>,
     outline: Option<OutlineGpu>,
+    /// the post pass with DEAD on, used while the player is dead
+    post_dead: Option<PostGpu>,
     outline_readback: std::sync::Mutex<Option<Buffer>>,
     /// `UNITY_FRAME_STATS`: one frame of the scene target copied back for numeric checks.
     readback: std::sync::Mutex<Option<(Buffer, u32, UVec2, bool)>>,
@@ -903,6 +946,7 @@ struct OutlineGpu {
 }
 
 struct PostGpu {
+    variant: u32,
     pipeline: CachedRenderPipelineId,
     layouts: [BindGroupLayoutDescriptor; 2],
     ubufs: Vec<(u32, Buffer, usize)>,
@@ -915,7 +959,15 @@ struct PostGpu {
 /// full resolution, colorCompression -> 32 levels, dithering 0.2, gamma 1, no hurt flash). The quad
 /// is a clip-space triangle (identity matrices); `_ProjectionParams.x = -1` is Unity's flipped
 /// render-texture convention, since the scene target is stored top row first.
-fn fill_post_cb(out: &mut [u8], cb: &uk_assets::shader::ConstantBuffer, mat: &MaterialProps, size: UVec2) {
+/// The per-frame globals PostProcessV2 reads beyond the handler's settings.
+#[derive(Default, Clone, Copy)]
+struct PostGlobals {
+    time: f32,
+    hurt: [f32; 4],
+    deathness: f32,
+}
+
+fn fill_post_cb(out: &mut [u8], cb: &uk_assets::shader::ConstantBuffer, mat: &MaterialProps, size: UVec2, g: PostGlobals) {
     out.fill(0);
     for p in &cb.params {
         let v: Vec<f32> = if p.is_matrix {
@@ -927,7 +979,10 @@ fn fill_post_cb(out: &mut [u8], cb: &uk_assets::shader::ConstantBuffer, mat: &Ma
                 "_ColorPrecision" => [32.0, 0.0, 0.0, 0.0],
                 "_DitherStrength" => [0.2, 0.0, 0.0, 0.0],
                 "_Gamma" => [1.0, 0.0, 0.0, 0.0],
-                "_HurtScreenColor" => [0.0; 4],
+                "_HurtScreenColor" => g.hurt,
+                "_Sharpness" | "_Deathness" => [g.deathness, 0.0, 0.0, 0.0],
+                "_Time" => [g.time / 20.0, g.time, g.time * 2.0, g.time * 3.0],
+                "_ScreenParams" => [size.x as f32, size.y as f32, 1.0 + 1.0 / size.x as f32, 1.0 + 1.0 / size.y as f32],
                 // OutlinePx: SetupOutlines at full resolution, forced to one pixel
                 "_OutlineTex_TexelSize" | "_MainTex_TexelSize" => [1.0 / size.x as f32, 1.0 / size.y as f32, size.x as f32, size.y as f32],
                 "_Resolution" => [size.x as f32, size.y as f32, 0.0, 0.0],
@@ -1441,8 +1496,8 @@ fn prepare(
         }
         gpu.draws = draws;
         gpu.ubo = ubo;
-        gpu.post = scene.post.as_ref().map(|p| {
-            let var = &scene.variants[p.variant as usize];
+        let build_post = |p: &PostDef, v: u32| {
+            let var = &scene.variants[v as usize];
             let layouts = [
                 BindGroupLayoutDescriptor::new("unity post g0", &layout_entries(&var.groups[0])),
                 BindGroupLayoutDescriptor::new("unity post g1", &layout_entries(&var.groups[1])),
@@ -1477,8 +1532,10 @@ fn prepare(
                 None => (white.clone(), sampler_for(&dev, None)),
             };
             let main_sampler = dev.create_sampler(&SamplerDescriptor { label: Some("unity post main"), ..default() });
-            PostGpu { pipeline: cache.queue_render_pipeline(desc), layouts, ubufs, vbuf, dither, main_sampler }
-        });
+            PostGpu { variant: v, pipeline: cache.queue_render_pipeline(desc), layouts, ubufs, vbuf, dither, main_sampler }
+        };
+        gpu.post = scene.post.as_ref().map(|p| build_post(p, p.variant));
+        gpu.post_dead = scene.post.as_ref().and_then(|p| Some(build_post(p, p.dead_variant?)));
         gpu.outline = scene.outline.as_ref().map(|o| {
             let var = &scene.variants[o.variant as usize];
             let layouts = [
@@ -1794,13 +1851,21 @@ fn prepare(
     }
     gpu.staging = staging;
     gpu.in_view = in_view;
-    if let (Some(post), Some(pd)) = (&gpu.post, scene.post.as_ref()) {
-        let var = &scene.variants[pd.variant as usize];
-        for (_, buf, cb) in &post.ubufs {
-            let Some(cbd) = var.params.constant_buffers.get(*cb) else { continue };
-            let mut bytes = vec![0u8; buf.size() as usize];
-            fill_post_cb(&mut bytes, cbd, &pd.material, size);
-            queue.write_buffer(buf, 0, &bytes);
+    if let Some(pd) = scene.post.as_ref() {
+        let g = PostGlobals {
+            time: frame.time,
+            // NewMovement.Update: _HurtScreenColor = hurtColor with currentColor.a
+            hurt: [pd.hurt_rgb[0], pd.hurt_rgb[1], pd.hurt_rgb[2], frame.hurt],
+            deathness: frame.dead.unwrap_or(0.0),
+        };
+        for post in [&gpu.post, &gpu.post_dead].into_iter().flatten() {
+            let var = &scene.variants[post.variant as usize];
+            for (_, buf, cb) in &post.ubufs {
+                let Some(cbd) = var.params.constant_buffers.get(*cb) else { continue };
+                let mut bytes = vec![0u8; buf.size() as usize];
+                fill_post_cb(&mut bytes, cbd, &pd.material, size, g);
+                queue.write_buffer(buf, 0, &bytes);
+            }
         }
     }
     if let (Some(og), Some(od)) = (&gpu.outline, scene.outline.as_ref()) {
@@ -1808,7 +1873,7 @@ fn prepare(
         for (_, buf, cb) in &og.ubufs {
             let Some(cbd) = var.params.constant_buffers.get(*cb) else { continue };
             let mut bytes = vec![0u8; buf.size() as usize];
-            fill_post_cb(&mut bytes, cbd, &MaterialProps::default(), size);
+            fill_post_cb(&mut bytes, cbd, &MaterialProps::default(), size, PostGlobals::default());
             queue.write_buffer(buf, 0, &bytes);
         }
     }
@@ -1979,10 +2044,12 @@ fn draw(
     }
     // ULTRAKILL's final composite (PostProcessV2) into the post target
     let mut shown = color;
-    if let (Some(post), Some(pd), Some((_, pv))) = (&gpu.post, scene.post.as_ref(), gpu.post_target.as_ref()) {
+    let dead = world.resource::<UnityFrame>().dead.is_some();
+    let post = if dead && gpu.post_dead.is_some() { &gpu.post_dead } else { &gpu.post };
+    if let (Some(post), Some((_, pv))) = (post, gpu.post_target.as_ref()) {
         if let Some(p) = cache.get_render_pipeline(post.pipeline) {
             let dev = world.resource::<RenderDevice>();
-            let var = &scene.variants[pd.variant as usize];
+            let var = &scene.variants[post.variant as usize];
             let mut e0 = Vec::new();
             for s in &var.groups[0] {
                 match s {
@@ -2031,6 +2098,8 @@ fn draw(
         *gpu.started.lock().unwrap() = Some(std::time::Instant::now());
     }
     if n == 240 && std::env::var_os("UNITY_FRAME_STATS").is_some() {
+        let f = world.resource::<UnityFrame>();
+        info!("unity post globals: hurt alpha {:.3} deathness {:?} DEAD pass {}", f.hurt, f.dead, f.dead.is_some() && gpu.post_dead.is_some());
         let (size, tex, _, _) = gpu.target.as_ref().unwrap();
         let row = (size.x * 4).next_multiple_of(256);
         let dev = world.resource::<RenderDevice>();
@@ -2169,6 +2238,7 @@ fn frame_stats(gpu: Res<UnityGpu>, dev: Res<RenderDevice>, scene: Res<UnityScene
         let _ = dev.poll(wgpu_types::PollType::wait_indefinitely());
         let post = ps.get_mapped_range();
         let (mut same, mut flip) = (0u64, 0u64);
+        let mut shift = [0i64; 3];
         let mut pd = std::collections::HashSet::new();
         for y in 0..size.y {
             for x in 0..size.x {
@@ -2177,11 +2247,14 @@ fn frame_stats(gpu: Res<UnityGpu>, dev: Res<RenderDevice>, scene: Res<UnityScene
                 for k in 0..3 {
                     same += (post[i + k] as i32 - data[i + k] as i32).unsigned_abs() as u64;
                     flip += (post[i + k] as i32 - data[j + k] as i32).unsigned_abs() as u64;
+                    shift[k] += post[i + k] as i64 - data[i + k] as i64;
                 }
                 pd.insert((post[i] >> 2, post[i + 1] >> 2, post[i + 2] >> 2));
             }
         }
         info!("unity post stats: mean abs diff vs scene {:.2} (rows flipped {:.2}) distinct colors {}", same as f64 / (3.0 * n), flip as f64 / (3.0 * n), pd.len());
+        // the hurt flash lerps toward _HurtScreenColor by its alpha: a signed per-channel shift
+        info!("unity post shift: mean rgb post - scene ({:.1}, {:.1}, {:.1})", shift[0] as f64 / n, shift[1] as f64 / n, shift[2] as f64 / n);
     }
     // the outline buffer: coverage, marked pixels (pass 3's test: R > 0.999 or R + G > 1), the
     // outline pixels that marking predicts, and how many of those the scene target shows black

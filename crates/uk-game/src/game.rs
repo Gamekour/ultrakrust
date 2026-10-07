@@ -78,6 +78,8 @@ pub struct State {
     pub hp: i32,
     pub dead: bool,
     pub dead_timer: f32,
+    /// NewMovement.currentColor.a: the hurt flash fed to PostProcessV2's `_HurtScreenColor`
+    pub hurt_alpha: f32,
     pub has_revolver: bool,
     pub enemies: Vec<Enemy>,
     pub projectiles: Vec<Projectile>,
@@ -285,6 +287,7 @@ impl Game {
             hp: 100,
             dead: false,
             dead_timer: 0.0,
+            hurt_alpha: 0.0,
             has_revolver: false,
             enemies,
             projectiles: Vec::new(),
@@ -1721,8 +1724,9 @@ impl Game {
         if invincible && self.s.player.invincible_layer {
             return;
         }
+        self.s.hurt_alpha = if damage >= 50 { 0.8 } else { 0.5 };
         if invincible {
-            self.s.player.hurt_invincibility = if damage >= 50 { 0.8 } else { 0.5 };
+            self.s.player.hurt_invincibility = self.s.hurt_alpha;
             self.s.player.invincible_layer = true;
         }
         self.s.hp = (self.s.hp - damage).max(0);
@@ -1849,6 +1853,10 @@ impl Game {
     /// Unity Update (once per rendered frame).
     pub fn update(&mut self, input: &Input, dt: f32, now: f64) {
         self.s.time += dt as f64;
+        // NewMovement.Update fades the hurt flash, dead or alive
+        if self.s.hurt_alpha > 0.0 {
+            self.s.hurt_alpha -= dt;
+        }
         if self.s.dead {
             self.s.dead_timer += dt;
             if self.s.dead_timer > 1.5 {
