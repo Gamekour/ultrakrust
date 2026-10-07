@@ -73,8 +73,18 @@ pub fn load(
     let (mut tris, mut textured, mut ents) = (0usize, 0usize, 0usize);
     let player = game.player_node;
     let unity = unity_shaders.map(|shaders| {
+        // the player's own Preferences (read-only); UNITY_PREFS=pixelization=4,dithering=0.5 overrides
+        // keys for this run
+        let mut prefs = uk_assets::prefs::Prefs::load(&install);
+        for kv in std::env::var("UNITY_PREFS").unwrap_or_default().split(',').filter(|s| !s.is_empty()) {
+            if let Some((k, v)) = kv.split_once('=').and_then(|(k, v)| Some((k.trim(), v.trim().parse::<f64>().ok()?))) {
+                prefs.set(k, v);
+            }
+        }
+        let gfx = crate::unity_render::GraphicsPrefs::from_prefs(&prefs);
+        info!("graphics prefs: {gfx:?}");
         let t = std::time::Instant::now();
-        let (scene, summary) = crate::unity_render::build(&mut db, &def, |n| def.nodes[n as usize].layer != scenedef::VIEWMODEL_LAYER && player.is_some_and(|p| def.is_descendant(n, p)), shaders, generation);
+        let (scene, summary) = crate::unity_render::build(&mut db, &def, |n| def.nodes[n as usize].layer != scenedef::VIEWMODEL_LAYER && player.is_some_and(|p| def.is_descendant(n, p)), shaders, generation, gfx);
         info!("{summary} ({:.2}s)", t.elapsed().as_secs_f32());
         scene
     });

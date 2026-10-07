@@ -332,6 +332,13 @@ fn setup(
         commands.insert_resource(t);
     }
     let mut cam = FpCamera::default();
+    // CameraController.Start: fieldOfView and cameraTilt from the player's prefs
+    if let Some(install) = uk_assets::find_install() {
+        let prefs = uk_assets::prefs::Prefs::load(&install);
+        (cam.default_fov, cam.fov) = (prefs.float("fieldOfView"), prefs.float("fieldOfView"));
+        cam.tilt_enabled = prefs.bool("cameraTilt", true);
+        info!("camera prefs: fov {} tilt {}", cam.fov, cam.tilt_enabled);
+    }
     cam.rotation_y = spawn_yaw;
     commands.insert_resource(Sim {
         game,
@@ -685,8 +692,9 @@ fn change_level(
         // weapons are unlocks (GameProgressSaver), not per-level state
         give_all_weapons(&mut game);
     }
-    let (sensitivity, tilt) = (sim.cam.sensitivity, sim.cam.tilt_enabled);
+    let (sensitivity, tilt, fov) = (sim.cam.sensitivity, sim.cam.tilt_enabled, sim.cam.default_fov);
     sim.cam = FpCamera::default();
+    (sim.cam.default_fov, sim.cam.fov) = (fov, fov);
     sim.cam.sensitivity = sensitivity;
     sim.cam.tilt_enabled = tilt;
     sim.cam.rotation_y = game.spawn_yaw;

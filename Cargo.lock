@@ -5163,6 +5163,7 @@ dependencies = [
  "lz4_flex",
  "lzma-rs",
  "naga",
+ "serde_json",
 ]
 
 [[package]]

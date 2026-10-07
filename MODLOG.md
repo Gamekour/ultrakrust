@@ -278,3 +278,33 @@ CPU-skinned enemies, 3,393 colliders/569 triggers, 11,758 MonoBehaviours with ty
   - 1-2 rodent, player 10 m from the field (sphere radius 7.5, so d = 2.5): noise 0.27729, predicted 0.27729.
   - 1-2 rodent, 40 m: noise 0.0. WICKED stays on because the field is enabled.
   - 0-S Wicked, 20 m (radius 3.75, so d = 16.25): noise 0.19457, predicted 0.19457.
+
+## Graphics prefs: pixelization, color compression, dithering, gamma, warping, FOV (2026-10-07)
+
+- New `uk_assets::prefs`: reads `<install>/Preferences/Prefs.json` + `LocalPrefs.json` (never written).
+  - Ports GraphicsSettings' GetPixelizationValue, GetColorCompressionValue and GetVertexWarpingValue.
+  - `UNITY_PREFS="k=v,..."` overrides values in memory for probes.
+- `GraphicsPrefs` feeds the globals:
+  - `_ResY`, `_ColorPrecision`, `_DitherStrength`, `_Gamma`, `_VertexWarping`, `_TextureWarping` (clamp01 × 0.5)
+    and `_StainWarping`.
+  - The VERTEX_WARPING keyword is on when vertex warping is nonzero.
+- Pixelization follows PostProcessV2_Handler.SetupRTs:
+  - The scene, depth and outline targets are (w/min, h/min) × resY, point filtered.
+  - PostProcessV2 writes a screen-size target with `_VirtualRes`, `_ScreenRatio`, outline `_Resolution` and
+    `_ResolutionDiff` from that.
+- CameraController.Start: `fieldOfView` and `cameraTilt` prefs reach the sim camera, kept across reloads.
+- Gaps:
+  - colorPalette / PALETTIZE (off in the user's prefs).
+  - mouseSensitivity's scale (Input System delta units).
+  - outlineThickness.
+- Probes, 1-2 at frame 240 (1600×900 window):
+  - User prefs: precision 2048, post equals scene (diff 0.00), 240 red levels.
+  - colorCompression=2, dithering=0.2: 32 red levels, diff 2.27.
+  - colorCompression=5: precision 3, exactly 4 red levels (0, 1/3, 2/3, 1).
+  - pixelization=4: scene 426×240 (1600/900 × 240), post 1600×900. 93% of post pixels equal their left neighbour;
+    post vs the covering scene pixel diff 0.33.
+  - pixelization=6, colorCompression=2: scene 64×36, 32 red levels.
+  - pixelization=1: scene 1280×720 with mean rgb (177.3, 80.0, 51.7) vs (177.2, 79.9, 51.7) native.
+  - The darker pixelization=4 frame was timing: at 143 fps, frame 240 is 2.16 s in, with the camera still dropping
+    (y 13.4 vs 1.9). The camera log now prints shader time.
+  - `camera prefs: fov 105 tilt true` from the user's Prefs.json.

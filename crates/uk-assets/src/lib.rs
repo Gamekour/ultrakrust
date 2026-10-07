@@ -8,6 +8,7 @@ pub mod bundle;
 mod common_strings;
 pub mod db;
 pub mod mesh;
+pub mod prefs;
 pub mod navmesh;
 pub mod reader;
 pub mod scene;

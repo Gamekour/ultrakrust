@@ -154,6 +154,55 @@ pub struct SceneData {
     pub hud_cam: Option<(Mat4, f32)>,
     /// PostProcessV2_Handler.outlinePx pass 3 ("Composite1Px"): the default 1 px outline blit.
     pub outline: Option<OutlineDef>,
+    pub prefs: GraphicsPrefs,
+}
+
+/// The shader globals GraphicsSettings / PostProcessV2_Handler derive from the player's prefs.
+#[derive(Clone, Copy, Debug)]
+pub struct GraphicsPrefs {
+    /// `_ResY` / downscaleResolution: the virtual resolution's short side, 0 = native
+    pub res_y: f32,
+    pub color_precision: f32,
+    pub dither: f32,
+    pub gamma: f32,
+    pub texture_warping: f32,
+    /// `_VertexWarping` (VERTEX_WARPING keyword on when nonzero)
+    pub vertex_warping: f32,
+    /// BloodsplatterManager: `_StainWarping` = the raw vertexWarping option
+    pub stain_warping: f32,
+}
+
+impl GraphicsPrefs {
+    pub fn from_prefs(p: &uk_assets::prefs::Prefs) -> Self {
+        use uk_assets::prefs::*;
+        let vw = p.int("vertexWarping");
+        GraphicsPrefs {
+            res_y: pixelization_value(p.int("pixelization")),
+            // a saved colorPalette (PALETTIZE) forces 2048; palettes are not supported yet
+            color_precision: color_compression_value(p.int("colorCompression")),
+            dither: p.float("dithering"),
+            gamma: p.float("gamma"),
+            texture_warping: p.float("textureWarping").clamp(0.0, 1.0) * 0.5,
+            vertex_warping: vertex_warping_value(vw),
+            stain_warping: vw as f32,
+        }
+    }
+
+    /// PostProcessV2_Handler.SetupRTs: the render size for a screen size
+    pub fn virtual_size(&self, screen: UVec2) -> UVec2 {
+        if self.res_y == 0.0 {
+            return screen;
+        }
+        let (w, h) = (screen.x as f32, screen.y as f32);
+        let m = w.min(h);
+        UVec2::new(((w / m) * self.res_y) as u32, ((h / m) * self.res_y) as u32).max(UVec2::ONE)
+    }
+}
+
+impl Default for GraphicsPrefs {
+    fn default() -> Self {
+        Self::from_prefs(&uk_assets::prefs::Prefs::default())
+    }
 }
 
 pub struct OutlineDef {
@@ -463,6 +512,7 @@ pub fn build(
     skip_node: impl Fn(u32) -> bool,
     shaders: &mut Assets<Shader>,
     generation: u64,
+    prefs: GraphicsPrefs,
 ) -> (SceneData, String) {
     let mut shader_assets: HashMap<(String, i64), Option<Arc<ShaderAsset>>> = HashMap::new();
     let mut variants: Vec<Variant> = Vec::new();
@@ -540,7 +590,11 @@ pub fn build(
         let vsub = match chosen.get(&(key.file.clone(), key.path_id)) {
             Some(s) => s.clone(),
             None => {
-                let enabled: Vec<&str> = mat.keywords.iter().map(|s| s.as_str()).collect();
+                let mut enabled: Vec<&str> = mat.keywords.iter().map(|s| s.as_str()).collect();
+                // global keywords (GraphicsSettings)
+                if prefs.vertex_warping != 0.0 {
+                    enabled.push("VERTEX_WARPING");
+                }
                 let s = sh.select(&pass.vertex, &enabled).cloned();
                 chosen.insert((key.file.clone(), key.path_id), s.clone());
                 s
@@ -817,6 +871,7 @@ pub fn build(
         // the HUD Camera component: fov 90, culling mask layer 13, depth-only clear
         hud_cam: def.find("HUD Camera").map(|h| (def.nodes[h as usize].world0, 90.0)),
         outline,
+        prefs,
     };
     (scene, summary)
 }
@@ -981,7 +1036,8 @@ struct UnityGpu {
     post: Vec<Option<PostGpu>>,
     /// PostProcessV2 output (what the Virtual Camera puts on screen), same size as the scene target.
     post_target: Option<(Texture, TextureView)>,
-    post_readback: std::sync::Mutex<Option<Buffer>>,
+    /// the post output's readback: buffer, row pitch, size (the screen's)
+    post_readback: std::sync::Mutex<Option<(Buffer, u32, UVec2)>>,
 }
 
 impl UnityGpu {
@@ -1031,7 +1087,11 @@ struct PostGlobals {
     noise: f32,
 }
 
-fn fill_post_cb(out: &mut [u8], cb: &uk_assets::shader::ConstantBuffer, mat: &MaterialProps, size: UVec2, g: PostGlobals) {
+/// `vsize` is the virtual (pixelized) render size, `screen` the window's, `target` the size of the
+/// texture the pass draws into (`_ScreenParams`).
+#[allow(clippy::too_many_arguments)]
+fn fill_post_cb(out: &mut [u8], cb: &uk_assets::shader::ConstantBuffer, mat: &MaterialProps, vsize: UVec2, screen: UVec2, target: UVec2, prefs: &GraphicsPrefs, g: PostGlobals) {
+    let (size, t) = (vsize.as_vec2(), target.as_vec2());
     out.fill(0);
     for p in &cb.params {
         let v: Vec<f32> = if p.is_matrix {
@@ -1039,21 +1099,22 @@ fn fill_post_cb(out: &mut [u8], cb: &uk_assets::shader::ConstantBuffer, mat: &Ma
         } else {
             let v = match p.name.as_str() {
                 "_ProjectionParams" => [-1.0, NEAR, FAR, 1.0 / FAR],
-                "_VirtualRes" => [size.x as f32, size.y as f32, 0.0, 0.0],
-                "_ColorPrecision" => [32.0, 0.0, 0.0, 0.0],
-                "_DitherStrength" => [0.2, 0.0, 0.0, 0.0],
-                "_Gamma" => [1.0, 0.0, 0.0, 0.0],
+                "_VirtualRes" => [size.x, size.y, 0.0, 0.0],
+                "_ColorPrecision" => [prefs.color_precision, 0.0, 0.0, 0.0],
+                "_DitherStrength" => [prefs.dither, 0.0, 0.0, 0.0],
+                "_Gamma" => [prefs.gamma, 0.0, 0.0, 0.0],
+                "_ResY" => [prefs.res_y, 0.0, 0.0, 0.0],
                 "_HurtScreenColor" => g.hurt,
                 "_Sharpness" | "_Deathness" => [g.deathness, 0.0, 0.0, 0.0],
                 "_UnderwaterOverlay" => g.underwater,
                 "_VignetteColor" => g.vignette,
                 "_RandomNoiseStrength" => [g.noise, 0.0, 0.0, 0.0],
                 "_Time" => [g.time / 20.0, g.time, g.time * 2.0, g.time * 3.0],
-                "_ScreenParams" => [size.x as f32, size.y as f32, 1.0 + 1.0 / size.x as f32, 1.0 + 1.0 / size.y as f32],
-                // OutlinePx: SetupOutlines at full resolution, forced to one pixel
-                "_OutlineTex_TexelSize" | "_MainTex_TexelSize" => [1.0 / size.x as f32, 1.0 / size.y as f32, size.x as f32, size.y as f32],
-                "_Resolution" => [size.x as f32, size.y as f32, 0.0, 0.0],
-                "_ResolutionDiff" => [1.0, 1.0, 0.0, 0.0],
+                "_ScreenParams" => [t.x, t.y, 1.0 + 1.0 / t.x, 1.0 + 1.0 / t.y],
+                // OutlinePx: SetupOutlines (mainTex size vs the screen), forced to one pixel
+                "_OutlineTex_TexelSize" | "_MainTex_TexelSize" => [1.0 / size.x, 1.0 / size.y, size.x, size.y],
+                "_Resolution" => [size.x, size.y, 0.0, 0.0],
+                "_ResolutionDiff" => [size.x / screen.x as f32, size.y / screen.y as f32, 0.0, 0.0],
                 "_OutlineDistance" => [1.0, 0.0, 0.0, 0.0],
                 n => mat.vector(n).unwrap_or([0.0; 4]),
             };
@@ -1401,8 +1462,12 @@ fn fill_cb(out: &mut [u8], cb: &uk_assets::shader::ConstantBuffer, scene: &Scene
                 None => [0.0; 4],
             },
             "_PortalClipPlane" | "_WorldSpaceLightPos0" | "_LightColor0" => [0.0; 4],
-            // global options at their defaults (PrefsManager: vertexWarping 0, textureWarping 0)
-            "_VertexWarping" | "_TextureWarping" | "_HeightFog" => [0.0; 4],
+            // GraphicsSettings' globals from the player's prefs
+            "_VertexWarping" => [scene.prefs.vertex_warping, 0.0, 0.0, 0.0],
+            "_TextureWarping" => [scene.prefs.texture_warping, 0.0, 0.0, 0.0],
+            "_StainWarping" => [scene.prefs.stain_warping, 0.0, 0.0, 0.0],
+            "_ResY" => [scene.prefs.res_y, 0.0, 0.0, 0.0],
+            "_HeightFog" => [0.0; 4],
             // PostProcessV2_Handler: (width, height) / max(width, height)
             "_ScreenRatio" => {
                 let m = ctx.size.x.max(ctx.size.y) as f32;
@@ -1679,8 +1744,10 @@ fn prepare(
     }
     // per-frame: offscreen target, constant buffers
     let Some((view, _)) = views.iter().next() else { return };
-    let size = UVec2::new(view.viewport.z.max(1), view.viewport.w.max(1));
-    if gpu.target.as_ref().is_none_or(|t| t.0 != size) {
+    let screen = UVec2::new(view.viewport.z.max(1), view.viewport.w.max(1));
+    // pixelization: the cameras render at the virtual size, PostProcessV2 draws at the screen's
+    let size = scene.prefs.virtual_size(screen);
+    if gpu.target.as_ref().is_none_or(|t| t.0 != size) || gpu.post_target.as_ref().is_none_or(|t| t.0.width() != screen.x || t.0.height() != screen.y) {
         let color = dev.create_texture(&TextureDescriptor {
             label: Some("unity scene color"),
             size: Extent3d { width: size.x, height: size.y, depth_or_array_layers: 1 },
@@ -1706,7 +1773,7 @@ fn prepare(
         gpu.target = Some((size, color, cv, dv));
         let post = dev.create_texture(&TextureDescriptor {
             label: Some("unity post output"),
-            size: Extent3d { width: size.x, height: size.y, depth_or_array_layers: 1 },
+            size: Extent3d { width: screen.x, height: screen.y, depth_or_array_layers: 1 },
             mip_level_count: 1,
             sample_count: 1,
             dimension: TextureDimension::D2,
@@ -1806,7 +1873,7 @@ fn prepare(
                 nearest = Some((dist, di));
             }
         }
-        info!("unity camera (unity space) {:?}; sampled vertices inside frustum {inside}/{total}", ctx.cam_pos);
+        info!("unity camera (unity space) {:?} time {:.3}; sampled vertices inside frustum {inside}/{total}", ctx.cam_pos, ctx.time);
         if let Some(h) = &hud_ctx {
             // the viewmodel at rest through the HUD Camera: vertices on screen, and their screen bounds
             let (mut inside, mut total) = (0usize, 0usize);
@@ -1944,7 +2011,7 @@ fn prepare(
             for (_, buf, cb) in &post.ubufs {
                 let Some(cbd) = var.params.constant_buffers.get(*cb) else { continue };
                 let mut bytes = vec![0u8; buf.size() as usize];
-                fill_post_cb(&mut bytes, cbd, &pd.material, size, g);
+                fill_post_cb(&mut bytes, cbd, &pd.material, size, screen, screen, &scene.prefs, g);
                 queue.write_buffer(buf, 0, &bytes);
             }
         }
@@ -1954,7 +2021,7 @@ fn prepare(
         for (_, buf, cb) in &og.ubufs {
             let Some(cbd) = var.params.constant_buffers.get(*cb) else { continue };
             let mut bytes = vec![0u8; buf.size() as usize];
-            fill_post_cb(&mut bytes, cbd, &MaterialProps::default(), size, PostGlobals::default());
+            fill_post_cb(&mut bytes, cbd, &MaterialProps::default(), size, screen, size, &scene.prefs, PostGlobals::default());
             queue.write_buffer(buf, 0, &bytes);
         }
     }
@@ -2215,13 +2282,15 @@ fn draw(
             *gpu.outline_readback.lock().unwrap() = Some(obuf);
         }
         if let (Some((ptex, _)), false) = (gpu.post_target.as_ref(), std::ptr::eq(shown, color)) {
-            let pbuf = dev.create_buffer(&BufferDescriptor { label: Some("unity post readback"), size: (row * size.y) as u64, usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ, mapped_at_creation: false });
+            let ps = UVec2::new(ptex.width(), ptex.height());
+            let prow = (ps.x * 4).next_multiple_of(256);
+            let pbuf = dev.create_buffer(&BufferDescriptor { label: Some("unity post readback"), size: (prow * ps.y) as u64, usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ, mapped_at_creation: false });
             ctx.command_encoder().copy_texture_to_buffer(
                 ptex.as_image_copy(),
-                TexelCopyBufferInfo { buffer: &pbuf, layout: TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(size.y) } },
-                Extent3d { width: size.x, height: size.y, depth_or_array_layers: 1 },
+                TexelCopyBufferInfo { buffer: &pbuf, layout: TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(prow), rows_per_image: Some(ps.y) } },
+                Extent3d { width: ps.x, height: ps.y, depth_or_array_layers: 1 },
             );
-            *gpu.post_readback.lock().unwrap() = Some(pbuf);
+            *gpu.post_readback.lock().unwrap() = Some((pbuf, prow, ps));
         }
     }
     // composite onto the camera's view (gamma -> linear): PostProcessV2's output, else the raw scene
@@ -2325,28 +2394,37 @@ fn frame_stats(gpu: Res<UnityGpu>, dev: Res<RenderDevice>, scene: Res<UnityScene
         distinct.len()
     );
     // PostProcessV2 output against the scene it read: mean |post - scene| as stored and with rows
-    // flipped (orientation check), and its distinct colors (dither + 32-level quantization)
-    if let Some(pbuf) = gpu.post_readback.lock().unwrap().take() {
+    // flipped (orientation check), and its distinct colors (dither + quantization). The post output
+    // is screen-sized; each pixel is compared with the scene pixel it covers (pixelization)
+    if let Some((pbuf, prow, psz)) = gpu.post_readback.lock().unwrap().take() {
         let ps = pbuf.slice(..);
         ps.map_async(MapMode::Read, |_| {});
         let _ = dev.poll(wgpu_types::PollType::wait_indefinitely());
         let post = ps.get_mapped_range();
-        let (mut same, mut flip) = (0u64, 0u64);
+        let (mut same, mut flip, mut runs) = (0u64, 0u64, 0u64);
         let mut shift = [0i64; 3];
         let mut pd = std::collections::HashSet::new();
-        for y in 0..size.y {
-            for x in 0..size.x {
+        let mut levels = std::collections::HashSet::new();
+        for py in 0..psz.y {
+            for px in 0..psz.x {
+                let pi = (py * prow + px * 4) as usize;
+                // equal to its left neighbour: ~1 - vsize/screen when pixelized
+                runs += (px > 0 && post[pi..pi + 3] == post[pi - 4..pi - 1]) as u64;
+                let (x, y) = (px * size.x / psz.x, py * size.y / psz.y);
                 let i = (y * *row + x * 4) as usize;
                 let j = ((size.y - 1 - y) * *row + x * 4) as usize;
                 for k in 0..3 {
-                    same += (post[i + k] as i32 - data[i + k] as i32).unsigned_abs() as u64;
-                    flip += (post[i + k] as i32 - data[j + k] as i32).unsigned_abs() as u64;
-                    shift[k] += post[i + k] as i64 - data[i + k] as i64;
+                    same += (post[pi + k] as i32 - data[i + k] as i32).unsigned_abs() as u64;
+                    flip += (post[pi + k] as i32 - data[j + k] as i32).unsigned_abs() as u64;
+                    shift[k] += post[pi + k] as i64 - data[i + k] as i64;
                 }
-                pd.insert((post[i] >> 2, post[i + 1] >> 2, post[i + 2] >> 2));
+                pd.insert((post[pi] >> 2, post[pi + 1] >> 2, post[pi + 2] >> 2));
+                levels.insert(post[pi]);
             }
         }
+        let n = (psz.x * psz.y) as f64;
         info!("unity post stats: mean abs diff vs scene {:.2} (rows flipped {:.2}) distinct colors {}", same as f64 / (3.0 * n), flip as f64 / (3.0 * n), pd.len());
+        info!("unity post size: {}x{} from scene {}x{}, pixels equal to left neighbour {:.3}, red levels {}", psz.x, psz.y, size.x, size.y, runs as f64 / n, levels.len());
         // the hurt flash lerps toward _HurtScreenColor by its alpha: a signed per-channel shift
         info!("unity post shift: mean rgb post - scene ({:.1}, {:.1}, {:.1})", shift[0] as f64 / n, shift[1] as f64 / n, shift[2] as f64 / n);
     }
