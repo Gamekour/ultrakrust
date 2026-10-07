@@ -36,7 +36,7 @@ pub const PORTED: &[(&str, Port)] = &[
     ("UltrakillEvent", Port::Full),
     ("ClimbStep", Port::Full),
     // player (uk-core)
-    ("NewMovement", Port::Partial("no hurt/death anim, sounds, slope/water/jump pad interplay")),
+    ("NewMovement", Port::Partial("no hurt/death anim, sounds, slope/jump pad interplay (water forces ported)")),
     ("GroundCheck", Port::Full),
     ("WallCheck", Port::Full),
     ("CameraController", Port::Partial("no screenshake, no options")),

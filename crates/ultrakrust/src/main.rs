@@ -770,6 +770,68 @@ fn apply_view(
             }
         }
     }
+    // UNITY_PROBE_WATER: list the Water scripts (clr, their child colliders) and UnderwaterController's collider
+    if std::env::var_os("UNITY_PROBE_WATER").is_some() {
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            let def = sim.game.def.clone();
+            let under = |n: u32, root: u32| {
+                let mut c = Some(n);
+                while let Some(i) = c {
+                    if i == root {
+                        return true;
+                    }
+                    c = def.nodes[i as usize].parent;
+                }
+                false
+            };
+            for s in def.scripts.iter().filter(|s| s.class == "Water" || s.class == "UnderwaterController") {
+                let cols: Vec<String> = def
+                    .colliders
+                    .iter()
+                    .filter(|c| under(c.node, s.node))
+                    .map(|c| format!("[{} trig {} en {} layer {} {:?}]", def.path(c.node), c.trigger, c.enabled, c.layer, c.shape).chars().take(260).collect())
+                    .collect();
+                info!("water probe: {} {} enabled {} clr {:?} notWet {:?} visualsOnly {:?} colliders {}: {}", s.class, def.path(s.node), s.enabled, s.data.get("clr"), s.data.get("notWet"), s.data.get("visualsOnly"), cols.len(), cols.join(" "));
+            }
+        }
+    }
+    // UNITY_PROBE_WATER_DROP=<collider path substring>: at frame 30 drop the player 6 m above that
+    // Water box's top, then log height, vertical speed, touchingWaters and the underwater overlay
+    if let Ok(want) = std::env::var("UNITY_PROBE_WATER_DROP") {
+        static FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let f = FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let def = sim.game.def.clone();
+        if f == 30 {
+            if let Some(c) = def.colliders.iter().find(|c| def.path(c.node).contains(&want) && matches!(c.shape, uk_assets::scenedef::ShapeDef::Box { .. })) {
+                if let uk_assets::scenedef::ShapeDef::Box { center, half, rot } = c.shape {
+                    let hy = (rot * Vec3::X).y.abs() * half.x + (rot * Vec3::Y).y.abs() * half.y + (rot * Vec3::Z).y.abs() * half.z;
+                    let to = Vec3::new(center.x, center.y + hy + 6.0, center.z);
+                    info!("water drop: player to {to:.2?} above {} (top {:.2}, bottom {:.2})", def.path(c.node), center.y + hy, center.y - hy);
+                    let mut n = Some(c.node);
+                    let mut chain = vec![];
+                    while let Some(i) = n {
+                        chain.push(i);
+                        n = def.nodes[i as usize].parent;
+                    }
+                    for i in chain.into_iter().rev() {
+                        sim.game.set_active(i, true);
+                    }
+                    sim.game.s.player.pos = to;
+                    sim.game.s.player.vel = Vec3::ZERO;
+                }
+            }
+        } else if f > 30 && f < 400 && f % 4 == 0 {
+            let p = &sim.game.s.player;
+            let w = &sim.game.world;
+            let under = w.raycast(p.pos, Vec3::NEG_Y, 20.0).map(|h| {
+                let o = w.groups[h.collider.group as usize].owners[h.collider.index as usize];
+                let c = def.colliders.get(o as usize);
+                format!("{:.2} {} trig {:?}", h.point.y, c.map(|c| def.path(c.node)).unwrap_or_default(), c.map(|c| c.trigger))
+            });
+            info!("water drop: frame {f} y {:.2} vy {:.2} touching {} overlay {:?} below {under:?}", p.pos.y, p.vel.y, p.touching_waters, sim.game.s.underwater_overlay);
+        }
+    }
     // UNITY_PROBE_DISTORT=meters: hold the player that far along +X from the first
     // ScreenDistortionField's GameObject, for the WICKED noise strength
     if let Some(m) = std::env::var("UNITY_PROBE_DISTORT").ok().and_then(|v| v.parse::<f32>().ok()) {

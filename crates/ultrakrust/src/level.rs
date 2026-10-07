@@ -63,7 +63,17 @@ pub fn load(
     let mut db = AssetDb::open(&install).map_err(|e| e.to_string())?;
     let path = AssetDb::bundle_dir(&install).join(format!("campaign_scenes_level{level}.bundle"));
     let def = Arc::new(scenedef::load_scene(&mut db, &path).map_err(|e| e.to_string())?);
-    let game = Game::new(def.clone());
+    let mut game = Game::new(def.clone());
+    // UnderwaterController.Start: defaultColor = overlay.color with a = 0.3
+    if let Some(c) = def.scripts.iter().find(|s| s.class == "UnderwaterController").and_then(|s| {
+        let nf = db.file(s.file.as_deref().unwrap_or(&def.scene_file)).ok()?;
+        let (imf, id) = db.resolve(&nf, s.data.get("overlay").pptr()).ok().flatten()?;
+        let c = imf.read_id(id).ok()?.get("m_Color").clone();
+        Some([c.get("r").f32(), c.get("g").f32(), c.get("b").f32(), 0.3])
+    }) {
+        game.underwater_default = c;
+    }
+    info!("underwater default color {:?}", game.underwater_default);
 
     let mut mat_cache: HashMap<MaterialKey, Handle<StandardMaterial>> = HashMap::new();
     let mut tex_cache: HashMap<(String, i64), Option<(Handle<Image>, bool)>> = HashMap::new();

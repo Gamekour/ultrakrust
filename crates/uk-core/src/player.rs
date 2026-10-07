@@ -71,6 +71,8 @@ pub struct Player {
     pub prev_pos: Vec3,
     pub vel: Vec3,
     pub use_gravity: bool,
+    /// Water scripts tracking the player's collider (NewMovement.touchingWaters); the game sets it
+    pub touching_waters: u32,
     pending_force: Vec3,
     pending_accel: Vec3,
     pending_dv: Vec3,
@@ -156,6 +158,7 @@ impl Player {
             prev_pos: pos,
             vel: Vec3::ZERO,
             use_gravity: true,
+            touching_waters: 0,
             pending_force: Vec3::ZERO,
             pending_accel: Vec3::ZERO,
             pending_dv: Vec3::ZERO,
@@ -784,7 +787,26 @@ impl Player {
         if !self.boost || self.boost_left <= 0.0 {
             self.pre_dash_speed = self.vel;
         }
+        for _ in 0..self.touching_waters {
+            self.water_forces();
+        }
         self.physics_step(world);
+    }
+
+    /// Water.ApplyWaterForces on the player's rigidbody, once per Water each FixedUpdate: falling
+    /// faster than a fifth of gravity eases toward it, otherwise 75% of gravity is cancelled.
+    fn water_forces(&mut self) {
+        if !self.use_gravity {
+            return;
+        }
+        let g = Vec3::Y * GRAVITY;
+        let scaled = g.y * 0.2;
+        let v = self.vel;
+        if v.y < scaled {
+            self.vel = vmove_towards(v, Vec3::new(v.x, scaled, v.z), FIXED_DT * 10.0 * (v.y - scaled + 0.5).abs());
+        } else {
+            self.pending_force += g * (MASS * -0.75);
+        }
     }
 
     fn do_move(&mut self) {

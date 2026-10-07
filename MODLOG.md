@@ -308,3 +308,31 @@ CPU-skinned enemies, 3,393 colliders/569 triggers, 11,758 MonoBehaviours with ty
   - The darker pixelization=4 frame was timing: at 143 fps, frame 240 is 2.16 s in, with the camera still dropping
     (y 13.4 vs 1.9). The camera log now prints shader time.
   - `camera prefs: fov 105 tilt true` from the user's Prefs.json.
+
+## Water + UnderwaterController (2026-10-07)
+
+- `Game` gathers every `Water` script: its child colliders, `clr` (default (0, 0.5, 1, 1)), and `visualsOnly`.
+- The UnderwaterController's CameraCollisionChecker sphere (r 0.35) is stored relative to the player node.
+  - `water_tracking` runs after `update_triggers`.
+  - Waters whose live colliders contain the sphere are kept in entry order, as UnderwaterController.touchingWaters.
+  - Entering one sets `_UnderwaterOverlay` to its `clr` with a = 0.3.
+  - If `clr` is all zero, it uses the overlay Image's `m_Color` with a = 0.3 instead (read from the scene:
+    (0, 0.497, 1)).
+  - With no waters left, UNDERWATER is off.
+- Waters (not visualsOnly) whose colliders contain the player capsule set `Player::touching_waters`.
+  - Each of them applies ApplyWaterForces before the physics step.
+  - Below −8 m/s, vy eases toward −8 by fixedDt·10·|vy+7.5|. Otherwise −0.75·g·mass.
+- Probes (`UNITY_PROBE_WATER`, `UNITY_PROBE_WATER_DROP=<box path>`; the drop log also names the solid surface
+  under the player):
+  - 5-1 "2B - Arena B/B Nonstuff/Water/Cube" (top −98):
+    - Free fall vy −18.4 entering. Drag settles at about −12.5; the extra difference over plain gravity is
+      NewMovement's +0.4 g fall force.
+    - The overlay is on at y −99.55 = (0, 0.5, 1, 0.3), and stays on at the floor (−106).
+  - 2-1 "0-1 Connector/Water": the player lands on Secret/Cube (61) at −20.75, which is solid. The capsule touches
+    2 Waters while the eye stays above them, so the overlay is None.
+  - 1-2 lava: Decorations/Cube (12) at −19.76 sits above the lava trigger (top −20), so the player never touches it.
+- Gaps:
+  - DryZoneController.
+  - Wetness and notWet.
+  - Splash and audio.
+  - Forces on non-player rigidbodies (layers 9/10 get −0.45).

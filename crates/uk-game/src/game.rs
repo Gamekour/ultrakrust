@@ -86,6 +86,8 @@ pub struct State {
     pub vignette: Option<[f32; 4]>,
     /// ScreenDistortionController: `_RandomNoiseStrength` while WICKED is on (any field active)
     pub screen_noise: Option<f32>,
+    /// UnderwaterController.touchingWaters (indices into `Game::waters`), in entry order
+    pub uwc_waters: Vec<u32>,
     pub has_revolver: bool,
     pub enemies: Vec<Enemy>,
     pub projectiles: Vec<Projectile>,
@@ -149,6 +151,19 @@ pub struct Game {
     pub vm_rigs: (Option<usize>, Option<usize>),
     /// ScreenDistortionField scripts: (script, its first collider, distance, strength)
     distortion_fields: Vec<(u32, Option<u32>, f32, f32)>,
+    /// Water scripts: their colliders (GetComponentsInChildren) and clr
+    waters: Vec<WaterDef>,
+    /// UnderwaterController's sphere trigger: (offset from the player in the rig's local space, radius)
+    uwc: Option<(Vec3, f32)>,
+    /// UnderwaterController.defaultColor: its overlay Image's color with a = 0.3 (the app resolves the Image)
+    pub underwater_default: [f32; 4],
+}
+
+struct WaterDef {
+    script: u32,
+    colliders: Vec<u32>,
+    clr: [f32; 4],
+    visuals_only: bool,
 }
 
 fn layer_solid(l: u8) -> bool {
@@ -297,6 +312,7 @@ impl Game {
             dead_timer: 0.0,
             hurt_alpha: 0.0,
             underwater_overlay: None,
+            uwc_waters: Vec::new(),
             vignette: None,
             screen_noise: None,
             has_revolver: false,
@@ -339,6 +355,9 @@ impl Game {
             vm_revolver: def.scripts.iter().find(|s| s.class == "Revolver" && s.file.is_some()).map(|s| s.node),
             vm_rigs: (None, None),
             distortion_fields: Vec::new(),
+            waters: Vec::new(),
+            uwc: None,
+            underwater_default: [0.0, 0.0, 0.0, 0.3],
         };
         g.distortion_fields = (0..def.scripts.len() as u32)
             .filter(|&i| def.scripts[i as usize].class == "ScreenDistortionField")
@@ -347,6 +366,27 @@ impl Game {
                 (i, g.node_colliders(s.node).first().copied(), s.data.get("distance").f32(), s.data.get("strength").f32())
             })
             .collect();
+        // Water.Start: waterColliders = GetComponentsInChildren<Collider>(); clr defaults to (0, 0.5, 1, 1)
+        g.waters = (0..def.scripts.len() as u32)
+            .filter(|&i| def.scripts[i as usize].class == "Water")
+            .map(|i| {
+                let s = &def.scripts[i as usize];
+                let c = s.data.get("clr");
+                let clr = if !c.has("r") { [0.0, 0.5, 1.0, 1.0] } else { [c.get("r").f32(), c.get("g").f32(), c.get("b").f32(), c.get("a").f32()] };
+                let colliders = (0..def.colliders.len() as u32).filter(|&ci| def.is_descendant(def.colliders[ci as usize].node, s.node)).collect();
+                WaterDef { script: i, colliders, clr, visuals_only: s.data.get("visualsOnly").bool() }
+            })
+            .collect();
+        // UnderwaterController sits on the player rig (CameraCollisionChecker): keep its sphere's
+        // offset from the rig root
+        g.uwc = def.scripts.iter().find(|s| s.class == "UnderwaterController").and_then(|s| {
+            let root = def.nodes[g.player_node? as usize].world0;
+            let c = g.node_colliders(s.node).into_iter().find_map(|ci| match def.colliders[ci as usize].shape {
+                ShapeDef::Sphere { center, radius } => Some((center, radius)),
+                _ => None,
+            })?;
+            Some((root.inverse().transform_point3(c.0), c.1))
+        });
         // viewmodel animators by the parameters their scripts drive (Revolver.Shoot, Punch.PunchStart)
         let vm_rig = |param: &str| {
             (0..def.animators.len() as u32).find_map(|a| {
@@ -488,6 +528,51 @@ impl Game {
             }
         }
         self.s.screen_noise = on.then_some(noise);
+    }
+
+    /// Water.OnTriggerEnter/Exit + FixedUpdate's IsCollidingWithWater pruning: the waters overlapping
+    /// the player's capsule each run ApplyWaterForces next step (NewMovement.touchingWaters), and the
+    /// ones overlapping UnderwaterController's sphere drive UNDERWATER / `_UnderwaterOverlay`
+    /// (EnterWater -> UpdateColor(clr) for the latest entered; RemoveFromWater once none remain).
+    fn water_tracking(&mut self) {
+        let cap = self.s.player.capsule();
+        let eye = self.uwc.map(|(off, r)| {
+            let rot = Quat::from_rotation_y(-self.s.player.yaw_deg.to_radians());
+            let p = self.s.player.pos + rot * off;
+            Capsule { a: p, b: p, radius: r }
+        });
+        let mut forces = 0;
+        let mut now = Vec::new();
+        for (wi, w) in self.waters.iter().enumerate() {
+            let live: Vec<u32> = w
+                .colliders
+                .iter()
+                .copied()
+                .filter(|&ci| self.s.active[self.def.colliders[ci as usize].node as usize] && self.s.collider_enabled[ci as usize])
+                .collect();
+            if self.script_live(w.script) && !w.visuals_only && live.iter().any(|&ci| self.trigger_contains(ci, &cap)) {
+                forces += 1;
+            }
+            if let Some(eye) = &eye {
+                if live.iter().any(|&ci| self.trigger_contains(ci, eye)) {
+                    now.push(wi as u32);
+                }
+            }
+        }
+        self.s.player.touching_waters = forces;
+        let prev = std::mem::take(&mut self.s.uwc_waters);
+        let mut kept: Vec<u32> = prev.iter().copied().filter(|w| now.contains(w)).collect();
+        for &w in &now {
+            if !prev.contains(&w) {
+                kept.push(w);
+                let c = self.waters[w as usize].clr;
+                self.s.underwater_overlay = Some(if c == [0.0; 4] { self.underwater_default } else { [c[0], c[1], c[2], 0.3] });
+            }
+        }
+        if kept.is_empty() {
+            self.s.underwater_overlay = None;
+        }
+        self.s.uwc_waters = kept;
     }
 
     fn script_live(&self, sc: u32) -> bool {
@@ -1889,6 +1974,7 @@ impl Game {
         self.s.player.fixed_update(&world, input);
         self.world = world;
         self.update_triggers();
+        self.water_tracking();
         self.update_contacts();
         self.final_pits_fixed();
         for sc in 0..self.s.scripts.len() as u32 {
