@@ -94,14 +94,14 @@ pub const NATIVE: &[(i32, &str, f64)] = &[
     (195, "NavMeshAgent", 0.3), // path following via TrackTick/SetDestination; no avoidance, off-mesh links walked, no autoBraking
     (208, "NavMeshObstacle", 0.0),
     (238, "NavMeshData", 0.8),  // tiles + off-mesh links decoded and queried; area costs/masks not applied
-    (224, "RectTransform", 0.0),
-    (222, "CanvasRenderer", 0.0),
-    (223, "Canvas", 0.0),
-    (225, "CanvasGroup", 0.0),
+    (224, "RectTransform", 0.8), // anchors, pivots, scaler; no layout groups/fitters
+    (222, "CanvasRenderer", 0.7), // meshes drawn with the game's UI shaders, stencil, clip rect; no text
+    (223, "Canvas", 0.7), // overlay + world modes, sorting, override sorting; camera mode drawn as overlay
+    (225, "CanvasGroup", 0.8), // alpha; interactable/blocksRaycasts unused (no EventSystem)
     (20, "Camera", 0.3),
     (48, "Shader", 0.0),
     (21, "Material", 0.4), // main texture + colour only
-    (28, "Texture2D", 0.9), // no BC7
+    (28, "Texture2D", 0.95),
     (89, "Cubemap", 0.0),
     (328, "VideoPlayer", 0.0),
 ];

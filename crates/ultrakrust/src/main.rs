@@ -1147,10 +1147,18 @@ fn results_text(sim: &Sim) -> String {
 }
 
 /// Per-frame game state for the Unity-shader renderer: visibility, movers, lights.
-fn unity_frame(sim: Res<Sim>, scene: Res<unity_render::UnityScene>, time: Res<Time>, mut out: ResMut<unity_render::UnityFrame>, mut n: Local<u32>) {
+fn unity_frame(
+    sim: Res<Sim>,
+    scene: Res<unity_render::UnityScene>,
+    time: Res<Time>,
+    windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
+    mut out: ResMut<unity_render::UnityFrame>,
+    mut n: Local<u32>,
+) {
     let Some(scene) = scene.0.as_ref() else { return };
     let t = std::time::Instant::now();
-    *out = unity_render::frame(&sim.game, scene, time.elapsed_secs());
+    let screen = windows.single().map_or([1920.0, 1080.0], |w| [w.physical_width() as f32, w.physical_height() as f32]);
+    *out = unity_render::frame(&sim.game, scene, time.elapsed_secs(), screen);
     *n += 1;
     if *n == 120 && std::env::var_os("UNITY_FRAME_STATS").is_some() {
         info!("unity frame state (main world): {:.2} ms", t.elapsed().as_secs_f64() * 1e3);

@@ -93,7 +93,12 @@ pub struct DrawState {
     pub mask: u8,
     /// Render target 1 (the outline buffer): src, dst, op, mask.
     pub rt1: [u8; 4],
+    /// Stencil: read mask, write mask, pass op, fail op, zfail op, comparison (the reference is
+    /// dynamic). STENCIL_OFF for every non-UI draw.
+    pub stencil: [u8; 6],
 }
+
+pub const STENCIL_OFF: [u8; 6] = [255, 255, 0, 0, 0, 8];
 
 pub struct Draw {
     pub node: u32,
@@ -155,6 +160,7 @@ pub struct SceneData {
     /// PostProcessV2_Handler.outlinePx pass 3 ("Composite1Px"): the default 1 px outline blit.
     pub outline: Option<OutlineDef>,
     pub prefs: GraphicsPrefs,
+    pub ui: Option<UiScene>,
 }
 
 /// The shader globals GraphicsSettings / PostProcessV2_Handler derive from the player's prefs.
@@ -226,12 +232,38 @@ pub struct PostDef {
     pub textures: Vec<(String, u32)>,
 }
 
+/// A UI material's shader: the four UNITY_UI_CLIP_RECT / UNITY_UI_ALPHACLIP variants and its
+/// fixed state. CanvasRenderer.SetTexture overrides `_MainTex`; MaskUtilities' StencilMaterial
+/// copies override the stencil properties and `_ColorMask` per draw.
+pub struct UiMat {
+    pub props: Arc<MaterialProps>,
+    /// bit 0 UNITY_UI_CLIP_RECT, bit 1 UNITY_UI_ALPHACLIP
+    pub variants: [Option<u32>; 4],
+    /// the pass state with `unity_GUIZTestMode` resolved for [overlay, world/camera] canvases
+    pub state: [DrawState; 2],
+    /// the material's stencil reference
+    pub stencil_ref: u8,
+    /// texture binding name -> scene texture index (the material's own)
+    pub textures: HashMap<String, u32>,
+}
+
+pub struct UiScene {
+    pub def: Arc<uk_game::ugui::UiDef>,
+    pub assets: Arc<uk_assets::ui::UiAssets>,
+    /// UiAssets texture -> scene texture
+    pub tex: Vec<Option<u32>>,
+    /// UiAssets material -> its shader
+    pub mats: Vec<Option<UiMat>>,
+}
+
 #[derive(Resource, Clone, Default, ExtractResource)]
 pub struct UnityScene(pub Option<Arc<SceneData>>);
 
 /// Per-frame dynamic state from the game.
 #[derive(Resource, Clone, Default, ExtractResource)]
 pub struct UnityFrame {
+    /// this frame's uGUI meshes, and each batch's object-to-world (overlay: root to screen pixels)
+    pub ui: Option<(Arc<uk_game::ugui::UiFrame>, Arc<Vec<Mat4>>)>,
     pub time: f32,
     pub visible: Arc<Vec<bool>>,
     /// Unity-space object-to-world per draw (identity unless moved by a mover).
@@ -509,6 +541,7 @@ fn state_u8(v: &uk_assets::shader::StateValue, m: &MaterialProps) -> u8 {
 pub fn build(
     db: &mut AssetDb,
     def: &SceneDef,
+    ui: Option<(Arc<uk_game::ugui::UiDef>, Arc<uk_assets::ui::UiAssets>)>,
     skip_node: impl Fn(u32) -> bool,
     shaders: &mut Assets<Shader>,
     generation: u64,
@@ -685,6 +718,7 @@ pub fn build(
             op: state_u8(&st.blend_op, &mat),
             mask: state_u8(&st.color_mask, &mat),
             rt1: st.rt[0].each_ref().map(|v| state_u8(v, &mat)),
+            stencil: STENCIL_OFF,
         };
         if sky {
             // behind everything: drawn first, never tested or written (Unity's skybox sits at the far plane)
@@ -823,10 +857,98 @@ pub fn build(
             op: state_u8(&st.blend_op, m),
             mask: state_u8(&st.color_mask, m),
             rt1: [1, 0, 0, 0],
+            stencil: STENCIL_OFF,
         };
         Some(OutlineDef { variant: variants.len() as u32 - 1, state })
     })();
     let rs = &def.render_settings;
+    // uGUI: every texture a Graphic can show and every material a Graphic can draw with
+    let mut ui_skipped: Vec<String> = Vec::new();
+    let ui = ui.map(|(udef, assets)| {
+        let mut decode = |db: &mut AssetDb, file: &str, path_id: i64| -> Option<u32> {
+            *texture_ids.entry((file.to_string(), path_id)).or_insert_with(|| {
+                let v = db.file(file).ok()?.read_id(path_id).ok()?;
+                let t = uk_assets::texture::decode_texture(db, &v).ok()?;
+                textures.push(TexCpu { width: t.width, height: t.height, rgba: t.rgba, filter: t.filter, wrap: t.wrap, layers: t.layers });
+                Some(textures.len() as u32 - 1)
+            })
+        };
+        let tex: Vec<Option<u32>> = assets.textures.iter().map(|t| decode(db, &t.file, t.path_id)).collect();
+        let mut mats = Vec::new();
+        for m in &assets.materials {
+            let Some(sh) = db.file(&m.shader.0).ok().and_then(|f| f.read_id(m.shader.1).ok()).and_then(|v| ShaderAsset::from_value(&v).ok()) else {
+                ui_skipped.push(format!("{}: shader unreadable", m.name));
+                mats.push(None);
+                continue;
+            };
+            let Some(pass) = sh.passes.first() else {
+                mats.push(None);
+                continue;
+            };
+            let base: Vec<&str> = m.props.keywords.iter().map(|s| s.as_str()).filter(|k| *k != "UNITY_UI_CLIP_RECT" && *k != "UNITY_UI_ALPHACLIP").collect();
+            let mut vs = [None; 4];
+            for (bits, slot) in vs.iter_mut().enumerate() {
+                let mut kw = base.clone();
+                if bits & 1 != 0 {
+                    kw.push("UNITY_UI_CLIP_RECT");
+                }
+                if bits & 2 != 0 {
+                    kw.push("UNITY_UI_ALPHACLIP");
+                }
+                let Some(vsub) = sh.select(&pass.vertex, &kw).cloned() else { continue };
+                if let Some(&v) = variant_ids.get(&(m.shader.0.clone(), m.shader.1, vsub.blob)) {
+                    *slot = v;
+                    continue;
+                }
+                let v = match make_variant(&sh, &vsub, shaders, variants.len()) {
+                    Ok(var) => {
+                        variants.push(var);
+                        Some(variants.len() as u32 - 1)
+                    }
+                    Err(e) => {
+                        ui_skipped.push(format!("{} {kw:?}: {}", sh.name, e.chars().take(80).collect::<String>()));
+                        None
+                    }
+                };
+                variant_ids.insert((m.shader.0.clone(), m.shader.1, vsub.blob), v);
+                *slot = v;
+            }
+            let Some(v0) = vs.iter().flatten().next().copied() else {
+                mats.push(None);
+                continue;
+            };
+            let mut textures_m = HashMap::new();
+            let mf = db.file(&m.file).ok();
+            for s in variants[v0 as usize].groups[0].clone().iter() {
+                let Slot::Texture { name, dim: TexDim::D2, .. } = s else { continue };
+                let Some(env) = m.props.textures.get(name) else { continue };
+                let Some((tf, tid)) = mf.as_ref().and_then(|f| db.resolve(f, env.texture).ok().flatten()) else { continue };
+                if let Some(t) = decode(db, &tf.name.clone(), tid) {
+                    textures_m.insert(name.clone(), t);
+                }
+            }
+            let st = &pass.state;
+            let state = [8.0, 4.0].map(|zt| {
+                let mut p = (*m.props).clone();
+                p.floats.insert("unity_GUIZTestMode".into(), zt);
+                DrawState {
+                    cull: state_u8(&st.cull, &p),
+                    zwrite: st.zwrite.resolve(&p.floats) >= 0.5,
+                    ztest: state_u8(&st.ztest, &p),
+                    src: state_u8(&st.src_blend, &p),
+                    dst: state_u8(&st.dst_blend, &p),
+                    src_a: state_u8(&st.src_blend_alpha, &p),
+                    dst_a: state_u8(&st.dst_blend_alpha, &p),
+                    op: state_u8(&st.blend_op, &p),
+                    mask: state_u8(&st.color_mask, &p),
+                    rt1: st.rt[0].each_ref().map(|v| state_u8(v, &p)),
+                    stencil: [1, 2, 3, 4, 5, 6].map(|i| state_u8(&st.stencil[i], &p)),
+                }
+            });
+            mats.push(Some(UiMat { props: m.props.clone(), variants: vs, state, stencil_ref: state_u8(&st.stencil[0], &m.props), textures: textures_m }));
+        }
+        UiScene { def: udef, assets, tex, mats }
+    });
     let lights = def
         .lights
         .iter()
@@ -837,7 +959,7 @@ pub fn build(
     sk.sort_by(|a, b| b.1.cmp(&a.1));
     let enemy_draws: Vec<&Draw> = draws.iter().filter(|d| simplifiers.contains_key(&d.node)).collect();
     let summary = format!(
-        "unity shaders: post-process {}, outline {}, sky {} (camera {:?}), enemy simplifiers {} on {} draws ({} write SV_Target1: {:?}), {} variants, {}/{} renderers drawn, {} textures, {} lights; skipped: {:?}",
+        "unity shaders: post-process {}, outline {}, sky {} (camera {:?}), enemy simplifiers {} on {} draws ({} write SV_Target1: {:?}), {} variants, {}/{} renderers drawn, {} textures, {} lights; skipped: {:?}; ui: {}",
         post.as_ref().map_or("missing".to_string(), |p| {
             let n = p.variants.iter().flatten().count();
             let tex: Vec<String> = p.textures.iter().map(|(n, t)| format!("{n} {}x{}", textures[*t as usize].width, textures[*t as usize].height)).collect();
@@ -855,7 +977,18 @@ pub fn build(
         total,
         textures.len(),
         def.lights.len(),
-        sk.iter().take(6).collect::<Vec<_>>()
+        sk.iter().take(6).collect::<Vec<_>>(),
+        ui.as_ref().map_or("none".to_string(), |u| format!(
+            "{} canvases, {}/{} textures, {}/{} materials ({} variants: {:?}), skipped {:?}",
+            u.def.canvases.len(),
+            u.tex.iter().flatten().count(),
+            u.tex.len(),
+            u.mats.iter().flatten().count(),
+            u.mats.len(),
+            u.mats.iter().flatten().map(|m| m.variants.iter().flatten().count()).sum::<usize>(),
+            u.mats.iter().zip(&u.assets.materials).filter_map(|(m, a)| m.as_ref().map(|m| (a.name.as_str(), m.state[0].ztest, m.state[0].src, m.state[0].dst, m.state[0].zwrite))).collect::<Vec<_>>(),
+            ui_skipped
+        ))
     );
     let scene = SceneData {
         generation,
@@ -872,6 +1005,7 @@ pub fn build(
         hud_cam: def.find("HUD Camera").map(|h| (def.nodes[h as usize].world0, 90.0)),
         outline,
         prefs,
+        ui,
     };
     (scene, summary)
 }
@@ -926,7 +1060,7 @@ pub fn skin_rest_error(game: &uk_game::Game, scene: &SceneData) -> (usize, f32) 
 }
 
 /// Per-frame state from the game: what is visible, where movers have moved things, lights.
-pub fn frame(game: &uk_game::Game, scene: &SceneData, time: f32) -> UnityFrame {
+pub fn frame(game: &uk_game::Game, scene: &SceneData, time: f32, screen: [f32; 2]) -> UnityFrame {
     let m = Mat4::from_scale(Vec3::new(1.0, 1.0, -1.0));
     let visible: Vec<bool> = scene.draws.iter().map(|d| d.sky || (d.enabled && game.active(d.node))).collect();
     let object_to_world = scene
@@ -976,7 +1110,24 @@ pub fn frame(game: &uk_game::Game, scene: &SceneData, time: f32) -> UnityFrame {
         })
         .collect();
     let s = &game.s;
+    // uGUI: canvases laid out and meshed at the window's pixel size (Screen.width/height)
+    let ui = scene.ui.as_ref().map(|u| {
+        let f = uk_game::ugui::build_frame(&uk_game::ugui::UiInput {
+            def: &game.def,
+            ui: &u.def,
+            assets: &u.assets,
+            state: &s.ui,
+            active: &s.active,
+            script_enabled: &s.script_enabled,
+            screen,
+            dpi: 96.0,
+        });
+        // a world-space root draws with its node's current (Unity-space) world matrix
+        let world = f.batches.iter().map(|b| if b.mode == uk_game::ugui::RenderMode::World { game.anim.world_of(b.root_node) } else { b.to_screen }).collect();
+        (Arc::new(f), Arc::new(world))
+    });
     UnityFrame {
+        ui,
         time,
         visible: Arc::new(visible),
         object_to_world: Arc::new(object_to_world),
@@ -1038,6 +1189,35 @@ struct UnityGpu {
     post_target: Option<(Texture, TextureView)>,
     /// the post output's readback: buffer, row pitch, size (the screen's)
     post_readback: std::sync::Mutex<Option<(Buffer, u32, UVec2)>>,
+    /// every scene texture, and the stand-ins for unbound slots (kept for the per-frame UI draws)
+    tex_views: Vec<TextureView>,
+    fallback: Option<(TextureView, TextureView, TextureView, Buffer)>,
+    /// this frame's uGUI draws, in draw order
+    ui_draws: Vec<UiGpuDraw>,
+    /// the overlay canvases' depth-stencil (screen size)
+    ui_depth: Option<(UVec2, TextureView)>,
+    /// `UNITY_FRAME_STATS`: the overlay target before the overlay canvases drew
+    ui_readback: std::sync::Mutex<Option<Buffer>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum UiPass {
+    /// Screen Space - Overlay (and Camera, see PARITY.md): after the post pass, at screen resolution
+    Overlay,
+    /// World Space canvases rendered by the Main Camera / the HUD Camera (layer 13)
+    Main,
+    Hud,
+}
+
+struct UiGpuDraw {
+    vbuf: Buffer,
+    ibuf: Buffer,
+    count: u32,
+    bg0: BindGroup,
+    bg1: BindGroup,
+    pipeline: CachedRenderPipelineId,
+    stencil_ref: u32,
+    pass: UiPass,
 }
 
 impl UnityGpu {
@@ -1133,7 +1313,35 @@ fn fill_post_cb(out: &mut [u8], cb: &uk_assets::shader::ConstantBuffer, mat: &Ma
 const COLOR_FORMAT: TextureFormat = TextureFormat::Rgba8Unorm;
 /// Unity RenderTextureFormat.RG16: two 8-bit channels.
 const OUTLINE_FORMAT: TextureFormat = TextureFormat::Rg8Unorm;
-const DEPTH_FORMAT: TextureFormat = TextureFormat::Depth32Float;
+const DEPTH_FORMAT: TextureFormat = TextureFormat::Depth32FloatStencil8;
+
+/// Unity CompareFunction (0 Disabled, 1 Never .. 8 Always) for the stencil test (not reversed)
+fn stencil_compare(c: u8) -> CompareFunction {
+    match c {
+        1 => CompareFunction::Never,
+        2 => CompareFunction::Less,
+        3 => CompareFunction::Equal,
+        4 => CompareFunction::LessEqual,
+        5 => CompareFunction::Greater,
+        6 => CompareFunction::NotEqual,
+        7 => CompareFunction::GreaterEqual,
+        _ => CompareFunction::Always,
+    }
+}
+
+/// Unity StencilOp
+fn stencil_op(o: u8) -> StencilOperation {
+    match o {
+        1 => StencilOperation::Zero,
+        2 => StencilOperation::Replace,
+        3 => StencilOperation::IncrementClamp,
+        4 => StencilOperation::DecrementClamp,
+        5 => StencilOperation::Invert,
+        6 => StencilOperation::IncrementWrap,
+        7 => StencilOperation::DecrementWrap,
+        _ => StencilOperation::Keep,
+    }
+}
 
 fn blend_factor(f: u8) -> BlendFactor {
     match f {
@@ -1656,7 +1864,7 @@ fn prepare(
             }
             let vbuf = dev.create_buffer_with_data(&BufferInitDescriptor { label: Some("unity post vb"), contents: &verts, usage: BufferUsages::VERTEX });
             // PostProcessV2's pass: Cull Off, ZWrite Off, ZTest Always, Blend One Zero
-            let state = DrawState { cull: 0, zwrite: false, ztest: 8, src: 1, dst: 0, src_a: 1, dst_a: 0, op: 0, mask: 15, rt1: [1, 0, 0, 0] };
+            let state = DrawState { cull: 0, zwrite: false, ztest: 8, src: 1, dst: 0, src_a: 1, dst_a: 0, op: 0, mask: 15, rt1: [1, 0, 0, 0], stencil: STENCIL_OFF };
             let mut desc = pipeline_descriptor(var, &layouts, state, false);
             desc.depth_stencil = None;
             // every sampled texture but the scene: the definition's, else white
@@ -1708,6 +1916,8 @@ fn prepare(
             let sampler = dev.create_sampler(&SamplerDescriptor { label: Some("unity outline"), mag_filter: FilterMode::Linear, min_filter: FilterMode::Linear, ..default() });
             OutlineGpu { pipeline: cache.queue_render_pipeline(desc), layouts, ubufs, sampler }
         });
+        gpu.tex_views = tex_views;
+        gpu.fallback = Some((white, black_cube, black_3d, zero_storage));
     }
     // composite pipeline
     if gpu.composite.is_none() {
@@ -1996,6 +2206,7 @@ fn prepare(
     }
     gpu.staging = staging;
     gpu.in_view = in_view;
+    prepare_ui(gpu, &scene, &frame, &dev, &cache, &ctx, hud_ctx.as_ref(), screen);
     if let Some(pd) = scene.post.as_ref() {
         let g = PostGlobals {
             time: frame.time,
@@ -2028,6 +2239,306 @@ fn prepare(
     if std::env::var_os("UNITY_FRAME_STATS").is_some() && gpu.frames.load(std::sync::atomic::Ordering::Relaxed) == 240 {
         let hud = scene.draws.iter().enumerate().filter(|(i, d)| d.hud && gpu.in_view[*i]).count();
         info!("unity prepare: {:.2} ms; draws in view {}/{} (hud camera {hud}/{})", t_prepare.elapsed().as_secs_f64() * 1e3, gpu.in_view.iter().filter(|v| **v).count(), gpu.in_view.len(), scene.draws.iter().filter(|d| d.hud).count());
+    }
+}
+
+/// uGUI: one vertex/index buffer, constant buffers and bind groups per draw, rebuilt every frame
+/// (the canvases re-mesh every frame here; performance is not critical).
+#[allow(clippy::too_many_arguments)]
+fn prepare_ui(gpu: &mut UnityGpu, scene: &SceneData, frame: &UnityFrame, dev: &RenderDevice, cache: &PipelineCache, ctx: &FrameCtx, hud_ctx: Option<&FrameCtx>, screen: UVec2) {
+    gpu.ui_draws.clear();
+    let (Some(u), Some((uf, mats))) = (scene.ui.as_ref(), frame.ui.as_ref()) else { return };
+    if gpu.fallback.is_none() {
+        return;
+    }
+    if gpu.ui_depth.as_ref().is_none_or(|d| d.0 != screen) {
+        let t = dev.create_texture(&TextureDescriptor {
+            label: Some("unity ui depth"),
+            size: Extent3d { width: screen.x, height: screen.y, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: DEPTH_FORMAT,
+            usage: TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        gpu.ui_depth = Some((screen, t.create_view(&TextureViewDescriptor::default())));
+    }
+    let (white, black_cube, black_3d, zero_storage) = gpu.fallback.as_ref().unwrap();
+    // Screen Space - Overlay: pixels (bottom-left origin) -> clip space
+    let (w, h) = (screen.x as f32, screen.y as f32);
+    let overlay = FrameCtx {
+        vp: Mat4::from_cols(Vec4::new(2.0 / w, 0.0, 0.0, 0.0), Vec4::new(0.0, 2.0 / h, 0.0, 0.0), Vec4::ZERO, Vec4::new(-1.0, -1.0, 0.5, 1.0)),
+        v: Mat4::IDENTITY,
+        cam_pos: Vec3::ZERO,
+        size: screen,
+        ..*ctx
+    };
+    let mut draws = Vec::new();
+    let mut new_pipelines = Vec::new();
+    // skipped draws: [no indices, no material, no variant]
+    let mut skipped = [0usize; 3];
+    let mut skipped_mats = std::collections::BTreeSet::new();
+    for (bi, b) in uf.batches.iter().enumerate() {
+        let world = b.mode == uk_game::ugui::RenderMode::World;
+        let (pass, c) = match (world, b.layer) {
+            (false, _) => (UiPass::Overlay, &overlay),
+            (true, 13) => match hud_ctx {
+                Some(h) => (UiPass::Hud, h),
+                None => continue,
+            },
+            (true, _) => (UiPass::Main, ctx),
+        };
+        let o2w = mats.get(bi).copied().unwrap_or(Mat4::IDENTITY);
+        for d in &b.draws {
+            if d.idx.is_empty() {
+                skipped[0] += 1;
+                continue;
+            }
+            let mi = d.material.or(u.assets.default_material);
+            let Some(m) = mi.and_then(|m| u.mats.get(m as usize)).and_then(Option::as_ref) else {
+                skipped[1] += 1;
+                skipped_mats.insert(mi);
+                continue;
+            };
+            let bits = d.clip.is_some() as usize | (d.stencil.alpha_clip as usize) << 1;
+            let Some(v) = m.variants[bits].or_else(|| m.variants.iter().flatten().next().copied()) else {
+                skipped[2] += 1;
+                skipped_mats.insert(mi);
+                continue;
+            };
+            let var = &scene.variants[v as usize];
+            let mut state = m.state[(pass != UiPass::Overlay) as usize];
+            let mut stencil_ref = m.stencil_ref as u32;
+            if d.stencil != uk_game::ugui::Stencil::default() {
+                // StencilMaterial.Add: the Mask's stencil state and color mask replace the material's
+                let s = d.stencil;
+                state.stencil = [s.read, s.write, s.op, 0, 0, s.comp];
+                state.mask = s.color_mask;
+                stencil_ref = s.id as u32;
+            }
+            // vertex streams in the variant's input order
+            let mut vb: Vec<u8> = Vec::with_capacity(d.verts.len() * var.stride as usize);
+            for vx in &d.verts {
+                for &(_, ch, n) in &var.inputs {
+                    let vals: [f32; 4] = match ch {
+                        0 => [vx.pos.x, vx.pos.y, vx.pos.z, 1.0],
+                        1 => [0.0, 0.0, -1.0, 0.0],
+                        2 => [1.0, 0.0, 0.0, -1.0],
+                        3 => vx.color.map(|c| c as f32 / 255.0),
+                        4 => vx.uv0.to_array(),
+                        5 => vx.uv1.to_array(),
+                        _ => [0.0; 4],
+                    };
+                    for f in &vals[..n as usize] {
+                        vb.extend_from_slice(&f.to_le_bytes());
+                    }
+                }
+            }
+            // _MainTex: the Graphic's texture (CanvasRenderer.SetTexture), else Texture2D.whiteTexture
+            let main = d.texture.and_then(|t| u.tex.get(t as usize).copied().flatten());
+            let tex_of = |name: &str| if name == "_MainTex" { main } else { m.textures.get(name).copied() };
+            let layouts = &gpu.layouts[v as usize];
+            let textures: Vec<(u32, &str)> = var.groups[0]
+                .iter()
+                .filter_map(|t| match t {
+                    Slot::Texture { binding, name, .. } => Some((*binding, name.as_str())),
+                    _ => None,
+                })
+                .collect();
+            let mut samplers = Vec::new();
+            for s in &var.groups[0] {
+                if let Slot::Sampler { binding, .. } = s {
+                    // split samplers sit SAMPLER_BINDING_OFFSET above their texture; else the first texture's
+                    let tex = textures.iter().find(|(tb, _)| tb + uk_assets::spirv::SAMPLER_BINDING_OFFSET == *binding).or(textures.first()).and_then(|(_, n)| tex_of(n));
+                    samplers.push((*binding, sampler_for(dev, tex.and_then(|t| scene.textures.get(t as usize)))));
+                }
+            }
+            let mut e0 = Vec::new();
+            for s in &var.groups[0] {
+                match s {
+                    Slot::Texture { binding, dim, name } => {
+                        let view = match dim {
+                            TexDim::Cube => black_cube,
+                            TexDim::D3 => black_3d,
+                            TexDim::D2 => tex_of(name).map_or(white, |t| &gpu.tex_views[t as usize]),
+                        };
+                        e0.push(BindGroupEntry { binding: *binding, resource: BindingResource::TextureView(view) });
+                    }
+                    Slot::Sampler { binding, .. } => {
+                        let smp = &samplers.iter().find(|(b, _)| b == binding).unwrap().1;
+                        e0.push(BindGroupEntry { binding: *binding, resource: BindingResource::Sampler(smp) });
+                    }
+                    Slot::Storage { binding } => e0.push(BindGroupEntry { binding: *binding, resource: zero_storage.as_entire_binding() }),
+                    Slot::Uniform { .. } => {}
+                }
+            }
+            let mut ubufs = Vec::new();
+            for s in &var.groups[1] {
+                if let Slot::Uniform { binding, cb } = s {
+                    let size = var.params.constant_buffers.get(*cb).map_or(16, |c| c.size.next_multiple_of(16).max(16)) as usize;
+                    let mut bytes = vec![0u8; size];
+                    if let Some(cbd) = var.params.constant_buffers.get(*cb) {
+                        fill_ui_cb(&mut bytes, cbd, scene, &m.props, o2w, d.clip.as_ref(), main, c);
+                    }
+                    ubufs.push((*binding, dev.create_buffer_with_data(&BufferInitDescriptor { label: Some("unity ui cb"), contents: &bytes, usage: BufferUsages::UNIFORM })));
+                }
+            }
+            let mut e1: Vec<BindGroupEntry> = ubufs.iter().map(|(b, buf)| BindGroupEntry { binding: *b, resource: buf.as_entire_binding() }).collect();
+            for s in &var.groups[1] {
+                if let Slot::Storage { binding } = s {
+                    e1.push(BindGroupEntry { binding: *binding, resource: zero_storage.as_entire_binding() });
+                }
+            }
+            let bg0 = dev.create_bind_group("unity ui g0", &cache.get_bind_group_layout(&layouts[0]), &e0);
+            let bg1 = dev.create_bind_group("unity ui g1", &cache.get_bind_group_layout(&layouts[1]), &e1);
+            let mrt = pass == UiPass::Main;
+            let key = (v, state, mrt);
+            let pipeline = match gpu.pipelines.get(&key).or_else(|| new_pipelines.iter().find(|(k, _)| *k == key).map(|(_, p)| p)) {
+                Some(p) => *p,
+                None => {
+                    let p = cache.queue_render_pipeline(pipeline_descriptor(var, layouts, state, mrt));
+                    new_pipelines.push((key, p));
+                    p
+                }
+            };
+            draws.push(UiGpuDraw {
+                vbuf: dev.create_buffer_with_data(&BufferInitDescriptor { label: Some("unity ui vb"), contents: &vb, usage: BufferUsages::VERTEX }),
+                ibuf: dev.create_buffer_with_data(&BufferInitDescriptor { label: Some("unity ui ib"), contents: bytemuck::cast_slice(&d.idx), usage: BufferUsages::INDEX }),
+                count: d.idx.len() as u32,
+                bg0,
+                bg1,
+                pipeline,
+                stencil_ref,
+                pass,
+            });
+        }
+    }
+    gpu.pipelines.extend(new_pipelines);
+    let fno = gpu.frames.load(std::sync::atomic::Ordering::Relaxed);
+    if std::env::var_os("UNITY_FRAME_STATS").is_some() && fno == 240 {
+        // per batch: draws, vertices, and how many vertices land inside the view
+        for (bi, b) in uf.batches.iter().enumerate() {
+            let world = b.mode == uk_game::ugui::RenderMode::World;
+            let c = if !world { &overlay } else if b.layer == 13 { hud_ctx.unwrap_or(ctx) } else { ctx };
+            let o2w = mats.get(bi).copied().unwrap_or(Mat4::IDENTITY);
+            let (mut inside, mut total) = (0usize, 0usize);
+            let (mut lo, mut hi) = (Vec2::splat(9.0), Vec2::splat(-9.0));
+            for v in b.draws.iter().flat_map(|d| &d.verts) {
+                let p = c.vp * (o2w * v.pos.extend(1.0));
+                total += 1;
+                if p.w > 0.0 && p.x.abs() <= p.w * 1.0001 && p.y.abs() <= p.w * 1.0001 && p.z >= 0.0 && p.z <= p.w {
+                    inside += 1;
+                    lo = lo.min(Vec2::new(p.x, p.y) / p.w);
+                    hi = hi.max(Vec2::new(p.x, p.y) / p.w);
+                }
+            }
+            info!(
+                "unity ui batch {bi} canvas node {} {:?} order {} layer {} scale {:.3}: draws {} vertices in view {inside}/{total} ndc {lo:.3?}..{hi:.3?}",
+                b.root_node,
+                b.mode,
+                b.sorting_order,
+                b.layer,
+                b.scale_factor,
+                b.draws.len()
+            );
+        }
+        let by = |p: UiPass| draws.iter().filter(|d| d.pass == p).count();
+        info!("unity ui gpu draws: overlay {} main {} hud {}; screen {}x{}", by(UiPass::Overlay), by(UiPass::Main), by(UiPass::Hud), screen.x, screen.y);
+        let names: Vec<String> = skipped_mats.iter().map(|m| m.and_then(|m| u.assets.materials.get(m as usize)).map_or("-".into(), |m| format!("{} ({:?})", m.name, m.shader))).collect();
+        info!("unity ui skipped draws: no indices {} no material {} no variant {}; materials {names:?}", skipped[0], skipped[1], skipped[2]);
+    }
+    gpu.ui_draws = draws;
+}
+
+/// uGUI's constant buffers: the canvas's matrix, the camera (or the overlay's pixel projection),
+/// RectMask2D's clip rect and softness, and the material's properties.
+#[allow(clippy::too_many_arguments)]
+fn fill_ui_cb(out: &mut [u8], cb: &uk_assets::shader::ConstantBuffer, scene: &SceneData, mat: &MaterialProps, o2w: Mat4, clip: Option<&uk_game::ugui::Clip>, main: Option<u32>, ctx: &FrameCtx) {
+    out.fill(0);
+    for p in &cb.params {
+        let at = p.offset as usize;
+        let mut put = |vals: &[f32]| {
+            for (k, f) in vals.iter().enumerate() {
+                let o = at + k * 4;
+                if o + 4 <= out.len() {
+                    out[o..o + 4].copy_from_slice(&f.to_le_bytes());
+                }
+            }
+        };
+        let n = p.name.as_str();
+        if p.is_matrix {
+            let m = match n {
+                "unity_MatrixVP" => ctx.vp,
+                "unity_MatrixV" => ctx.v,
+                "unity_MatrixInvV" => ctx.v.inverse(),
+                "unity_ObjectToWorld" => o2w,
+                "unity_WorldToObject" => o2w.inverse(),
+                "glstate_matrix_projection" | "unity_CameraProjection" => ctx.vp * ctx.v.inverse(),
+                _ => Mat4::IDENTITY,
+            };
+            put(&m.to_cols_array());
+            continue;
+        }
+        if p.array_size > 0 {
+            continue;
+        }
+        let t = ctx.time;
+        let soft = clip.map_or([0.0; 2], |c| c.softness);
+        let v: [f32; 4] = match n {
+            "_Time" => [t / 20.0, t, t * 2.0, t * 3.0],
+            "_SinTime" => [(t / 8.0).sin(), (t / 4.0).sin(), (t / 2.0).sin(), t.sin()],
+            "_CosTime" => [(t / 8.0).cos(), (t / 4.0).cos(), (t / 2.0).cos(), t.cos()],
+            "_WorldSpaceCameraPos" => [ctx.cam_pos.x, ctx.cam_pos.y, ctx.cam_pos.z, 0.0],
+            "_ProjectionParams" => [1.0, ctx.near, FAR, 1.0 / FAR],
+            "_ScreenParams" => {
+                let (w, h) = (ctx.size.x as f32, ctx.size.y as f32);
+                [w, h, 1.0 + 1.0 / w, 1.0 + 1.0 / h]
+            }
+            // CanvasRenderer: RectMask2D's rect, else unclipped
+            "_ClipRect" => clip.map_or([-32767.0, -32767.0, 32767.0, 32767.0], |c| c.rect),
+            "_UIMaskSoftnessX" | "_MaskSoftnessX" => [soft[0], 0.0, 0.0, 0.0],
+            "_UIMaskSoftnessY" | "_MaskSoftnessY" => [soft[1], 0.0, 0.0, 0.0],
+            // (1,1,1,0) only for Alpha8 textures (legacy font atlases)
+            "_TextureSampleAdd" => [0.0; 4],
+            "_VertexWarping" => [scene.prefs.vertex_warping, 0.0, 0.0, 0.0],
+            "_TextureWarping" => [scene.prefs.texture_warping, 0.0, 0.0, 0.0],
+            "_ResY" => [scene.prefs.res_y, 0.0, 0.0, 0.0],
+            _ => {
+                if let Some(base) = n.strip_suffix("_TexelSize") {
+                    let t = if base == "_MainTex" { main } else { None };
+                    match t.and_then(|t| scene.textures.get(t as usize)) {
+                        Some(tx) => [1.0 / tx.width as f32, 1.0 / tx.height as f32, tx.width as f32, tx.height as f32],
+                        None => [1.0, 1.0, 1.0, 1.0],
+                    }
+                } else {
+                    mat.vector(n).unwrap_or(if n.ends_with("_ST") { [1.0, 1.0, 0.0, 0.0] } else { [0.0; 4] })
+                }
+            }
+        };
+        if p.ty == 1 {
+            for k in 0..p.cols.max(1) as usize {
+                let o = at + k * 4;
+                if o + 4 <= out.len() {
+                    out[o..o + 4].copy_from_slice(&(v[k] as i32).to_le_bytes());
+                }
+            }
+        } else {
+            put(&v[..p.cols.clamp(1, 4) as usize]);
+        }
+    }
+}
+
+fn draw_ui<'a>(pass: &mut bevy::render::render_phase::TrackedRenderPass<'a>, gpu: &'a UnityGpu, cache: &'a PipelineCache, which: UiPass) {
+    for d in gpu.ui_draws.iter().filter(|d| d.pass == which) {
+        let Some(p) = cache.get_render_pipeline(d.pipeline) else { continue };
+        pass.set_render_pipeline(p);
+        pass.set_stencil_reference(d.stencil_ref);
+        pass.set_bind_group(0, &d.bg0, &[]);
+        pass.set_bind_group(1, &d.bg1, &[]);
+        pass.set_vertex_buffer(0, d.vbuf.slice(..));
+        pass.set_index_buffer(d.ibuf.slice(..), IndexFormat::Uint32);
+        pass.draw_indexed(0..d.count, 0, 0..1);
     }
 }
 
@@ -2098,7 +2609,13 @@ fn pipeline_descriptor(var: &Variant, layouts: &[BindGroupLayoutDescriptor; 2], 
             format: DEPTH_FORMAT,
             depth_write_enabled: Some(s.zwrite),
             depth_compare: Some(depth_compare(s.ztest)),
-            stencil: default(),
+            stencil: if s.stencil == STENCIL_OFF {
+                default()
+            } else {
+                let [read, write, pass, fail, zfail, comp] = s.stencil;
+                let face = StencilFaceState { compare: stencil_compare(comp), fail_op: stencil_op(fail), depth_fail_op: stencil_op(zfail), pass_op: stencil_op(pass) };
+                StencilState { front: face, back: face, read_mask: read as u32, write_mask: write as u32 }
+            },
             bias: default(),
         }),
         fragment: Some(FragmentState {
@@ -2148,7 +2665,9 @@ fn draw(
     // Main Camera, then the HUD Camera (depth-only clear) over it
     for hud in [false, true] {
         let order = sorted(hud);
-        if hud && order.is_empty() {
+        let ui_pass = if hud { UiPass::Hud } else { UiPass::Main };
+        let has_ui = gpu.ui_draws.iter().any(|d| d.pass == ui_pass);
+        if hud && order.is_empty() && !has_ui {
             continue;
         }
         if hud {
@@ -2170,7 +2689,8 @@ fn draw(
             depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
                 view: depth,
                 depth_ops: Some(Operations { load: LoadOp::Clear(0.0), store: StoreOp::Store }),
-                stencil_ops: None,
+                // Unity clears depth and stencil together
+                stencil_ops: Some(Operations { load: LoadOp::Clear(0), store: StoreOp::Store }),
             }),
             timestamp_writes: None,
             occlusion_query_set: None,
@@ -2186,8 +2706,10 @@ fn draw(
             pass.set_index_buffer(d.ibuf.slice(..), IndexFormat::Uint32);
             pass.draw_indexed(0..d.count, 0, 0..1);
         }
+        // world-space canvases: the canvas renders after its camera's geometry (UI queue, 3000)
+        draw_ui(&mut pass, gpu, cache, ui_pass);
     }
-    if sorted(true).is_empty() {
+    if sorted(true).is_empty() && !gpu.ui_draws.iter().any(|d| d.pass == UiPass::Hud) {
         outline_pass(world, gpu, scene, cache, color, &mut ctx);
     }
     // ULTRAKILL's final composite (PostProcessV2) into the post target
@@ -2291,6 +2813,41 @@ fn draw(
                 Extent3d { width: ps.x, height: ps.y, depth_or_array_layers: 1 },
             );
             *gpu.post_readback.lock().unwrap() = Some((pbuf, prow, ps));
+        }
+    }
+    // Screen Space - Overlay canvases: drawn over the final image at screen resolution
+    if gpu.ui_draws.iter().any(|d| d.pass == UiPass::Overlay) {
+        let on_post = !std::ptr::eq(shown, color);
+        let ds = if on_post { gpu.ui_depth.as_ref().map(|d| &d.1) } else { Some(depth) };
+        if let Some(ds) = ds {
+            let mut pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
+                label: Some("unity ui overlay"),
+                color_attachments: &[Some(RenderPassColorAttachment { view: shown, depth_slice: None, resolve_target: None, ops: Operations { load: LoadOp::Load, store: StoreOp::Store } })],
+                depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                    view: ds,
+                    depth_ops: Some(Operations { load: LoadOp::Clear(0.0), store: StoreOp::Store }),
+                    stencil_ops: Some(Operations { load: LoadOp::Clear(0), store: StoreOp::Store }),
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            draw_ui(&mut pass, gpu, cache, UiPass::Overlay);
+        }
+        // numeric check: the post output after the overlay, diffed against the pre-UI copy
+        if n == 240 && on_post && std::env::var_os("UNITY_FRAME_STATS").is_some() {
+            if let Some((ptex, _)) = gpu.post_target.as_ref() {
+                let dev = world.resource::<RenderDevice>();
+                let ps = UVec2::new(ptex.width(), ptex.height());
+                let prow = (ps.x * 4).next_multiple_of(256);
+                let ubuf = dev.create_buffer(&BufferDescriptor { label: Some("unity ui readback"), size: (prow * ps.y) as u64, usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ, mapped_at_creation: false });
+                ctx.command_encoder().copy_texture_to_buffer(
+                    ptex.as_image_copy(),
+                    TexelCopyBufferInfo { buffer: &ubuf, layout: TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(prow), rows_per_image: Some(ps.y) } },
+                    Extent3d { width: ps.x, height: ps.y, depth_or_array_layers: 1 },
+                );
+                *gpu.ui_readback.lock().unwrap() = Some(ubuf);
+            }
         }
     }
     // composite onto the camera's view (gamma -> linear): PostProcessV2's output, else the raw scene
@@ -2427,6 +2984,33 @@ fn frame_stats(gpu: Res<UnityGpu>, dev: Res<RenderDevice>, scene: Res<UnityScene
         info!("unity post size: {}x{} from scene {}x{}, pixels equal to left neighbour {:.3}, red levels {}", psz.x, psz.y, size.x, size.y, runs as f64 / n, levels.len());
         // the hurt flash lerps toward _HurtScreenColor by its alpha: a signed per-channel shift
         info!("unity post shift: mean rgb post - scene ({:.1}, {:.1}, {:.1})", shift[0] as f64 / n, shift[1] as f64 / n, shift[2] as f64 / n);
+        // the overlay canvases: pixels they changed, mean change, and the changed pixels' bounds
+        if let Some(ubuf) = gpu.ui_readback.lock().unwrap().take() {
+            let us = ubuf.slice(..);
+            us.map_async(MapMode::Read, |_| {});
+            let _ = dev.poll(wgpu_types::PollType::wait_indefinitely());
+            let ui = us.get_mapped_range();
+            let (mut changed, mut diff) = (0u64, 0u64);
+            let (mut lo, mut hi) = (UVec2::MAX, UVec2::ZERO);
+            for py in 0..psz.y {
+                for px in 0..psz.x {
+                    let pi = (py * prow + px * 4) as usize;
+                    let d: u32 = (0..3).map(|k| (ui[pi + k] as i32 - post[pi + k] as i32).unsigned_abs()).sum();
+                    if d > 0 {
+                        changed += 1;
+                        diff += d as u64;
+                        lo = lo.min(UVec2::new(px, py));
+                        hi = hi.max(UVec2::new(px, py));
+                    }
+                }
+            }
+            info!(
+                "unity ui pixels changed: {changed} of {} ({:.2}%), mean abs diff where changed {:.1}, bounds {lo}..{hi} (rows from the top)",
+                psz.x * psz.y,
+                100.0 * changed as f64 / (psz.x * psz.y) as f64,
+                diff as f64 / (3.0 * changed.max(1) as f64)
+            );
+        }
     }
     // the outline buffer: coverage, marked pixels (pass 3's test: R > 0.999 or R + G > 1), the
     // outline pixels that marking predicts, and how many of those the scene target shows black

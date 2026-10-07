@@ -96,6 +96,8 @@ pub struct State {
     pub screen_noise: Option<f32>,
     /// UnderwaterController.touchingWaters (indices into `Game::waters`), in entry order
     pub uwc_waters: Vec<u32>,
+    /// Per-node RectTransform / Graphic state the HUD scripts drive (see ugui.rs)
+    pub ui: crate::ugui::UiState,
     pub has_revolver: bool,
     pub enemies: Vec<Enemy>,
     pub projectiles: Vec<Projectile>,
@@ -223,6 +225,8 @@ pub struct Game {
     pub anim: crate::anim::Anim,
     /// Viewmodel roots GunSetter / FistControl instantiated (layer 13): the revolver shows once owned.
     pub vm_revolver: Option<u32>,
+    /// StatsManager.fr: the FinalRank results panel, hidden in Start and shown by SendInfo
+    pub final_rank: Option<u32>,
     /// Rigs of the viewmodel Animators: (Revolver, Arm Blue / Punch)
     pub vm_rigs: (Option<usize>, Option<usize>),
     /// ScreenDistortionField scripts: (script, its first collider, distance, strength)
@@ -235,6 +239,9 @@ pub struct Game {
     uwc: Option<(Vec3, f32)>,
     /// UnderwaterController.defaultColor: its overlay Image's color with a = 0.3 (the app resolves the Image)
     pub underwater_default: [f32; 4],
+    /// uGUI scene: canvases / graphics resolved against the loaded UI assets (`set_ui`)
+    pub ui: Option<Arc<crate::ugui::UiDef>>,
+    pub ui_assets: Option<Arc<uk_assets::ui::UiAssets>>,
 }
 
 struct WaterDef {
@@ -398,6 +405,7 @@ impl Game {
             has_power_up: false,
             dual_wields: 0,
             screen_noise: None,
+            ui: Default::default(),
             has_revolver: false,
             enemies,
             projectiles: Vec::new(),
@@ -436,12 +444,15 @@ impl Game {
             unknown_calls: Default::default(),
             anim,
             vm_revolver: def.scripts.iter().find(|s| s.class == "Revolver" && s.file.is_some()).map(|s| s.node),
+            final_rank: def.scripts.iter().find(|s| s.class == "FinalRank").map(|s| s.node),
             vm_rigs: (None, None),
             distortion_fields: Vec::new(),
             waters: Vec::new(),
             uwc: None,
             underwater_default: [0.0, 0.0, 0.0, 0.3],
             death_ui: DeathUi::from_def(&def),
+            ui: None,
+            ui_assets: None,
         };
         g.distortion_fields = (0..def.scripts.len() as u32)
             .filter(|&i| def.scripts[i as usize].class == "ScreenDistortionField")
@@ -488,6 +499,10 @@ impl Game {
         }
         if let Some(r) = g.vm_revolver {
             g.s.active_self[r as usize] = g.s.has_revolver;
+        }
+        // StatsManager.Start: fr.gameObject.SetActive(false)
+        if let Some(f) = g.final_rank {
+            g.s.active_self[f as usize] = false;
         }
         // Scene load: activate roots (Awake/OnEnable for everything initially active).
         let roots: Vec<u32> = (0..n as u32).filter(|&i| def.nodes[i as usize].parent.is_none()).collect();
@@ -1066,6 +1081,10 @@ impl Game {
                     }
                     self.s.reached_second_pit |= second;
                     self.s.results_shown = true;
+                    // StatsManager.SendInfo: fr.gameObject.SetActive(true)
+                    if let Some(f) = self.final_rank {
+                        self.set_active(f, true);
+                    }
                 } else if second {
                     self.s.next_level = Some(target);
                     self.s.rankless_continue = true;
@@ -2049,6 +2068,17 @@ impl Game {
         self.full_refresh = true;
         self.events.push(GameEvent::Respawned);
         self.sync_world();
+    }
+
+    /// Resolve the scene's uGUI against its loaded assets; the start snapshot gets the initial UiState too.
+    pub fn set_ui(&mut self, assets: uk_assets::ui::UiAssets) {
+        let def = crate::ugui::UiDef::build(&self.def, &assets);
+        self.s.ui = crate::ugui::UiState::new(&def);
+        if let Some(st) = &mut self.start {
+            st.ui = self.s.ui.clone();
+        }
+        self.ui = Some(Arc::new(def));
+        self.ui_assets = Some(Arc::new(assets));
     }
 
     /// Re-takes the level-start snapshot (after the caller customised the initial state).

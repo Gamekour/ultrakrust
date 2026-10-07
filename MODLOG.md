@@ -413,5 +413,14 @@ CPU-skinned enemies, 3,393 colliders/569 triggers, 11,758 MonoBehaviours with ty
 - Not yet:
   - Text and TMP meshes.
   - Slider/layout groups (Slider fills are zero-width until Slider sets their anchors).
-  - The renderer path.
   - HUD scripts (StatsManager hiding FinalRank, StyleHUD, HudOpenEffect...); the probe shows the scene's initial state.
+- uGUI renderer path (`unity_render.rs` `prepare_ui`/`draw_ui`):
+  - Every draw is rebuilt per frame: vertex streams packed in the UI shader variant's input order, `_MainTex` = the Graphic's texture (else white), the material's other textures, uniform buffers with `_ClipRect`/softness, the canvas matrix and the camera.
+  - Overlay canvases use a pixel-space projection and are drawn onto the post output with their own depth/stencil. World canvases are drawn in their camera's pass (layer 13 → HUD Camera).
+  - Mask stencil state per draw (`set_stencil_reference`), with pipelines keyed by (variant, state, mrt).
+  - Probe (0-1, 1600×900):
+    - Player/Canvas: 28 draws, 256/256 vertices in view.
+    - StyleCanvas (HUD Camera): 13 draws, 292/292 vertices in view, ndc x −0.09..0.13.
+    - The overlay changes 9.74% of the post output's pixels (bounds [12,12]..[368,405]).
+    - The 24 skipped draws are all empty meshes (text not meshed yet). Every material and variant resolves.
+  - A zero-sized Texture2D now fails to decode instead of panicking.

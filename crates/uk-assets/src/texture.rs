@@ -36,6 +36,9 @@ pub fn decode_texture(db: &mut AssetDb, v: &Value) -> Result<TextureData> {
     let w = v.get("m_Width").i64() as usize;
     let h = v.get("m_Height").i64() as usize;
     let fmt = v.get("m_TextureFormat").i64();
+    if w == 0 || h == 0 {
+        return Err(Error(format!("empty texture {}", v.get("m_Name").str())));
+    }
     let sd = v.get("m_StreamData");
     let inline = v.get("image data").bytes();
     let owned;

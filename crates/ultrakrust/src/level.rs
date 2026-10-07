@@ -74,6 +74,7 @@ pub fn load(
         game.underwater_default = c;
     }
     info!("underwater default color {:?}", game.underwater_default);
+    game.set_ui(uk_assets::ui::load_ui_assets(&mut db, &def));
 
     let mut mat_cache: HashMap<MaterialKey, Handle<StandardMaterial>> = HashMap::new();
     let mut tex_cache: HashMap<(String, i64), Option<(Handle<Image>, bool)>> = HashMap::new();
@@ -94,7 +95,7 @@ pub fn load(
         let gfx = crate::unity_render::GraphicsPrefs::from_prefs(&prefs);
         info!("graphics prefs: {gfx:?}");
         let t = std::time::Instant::now();
-        let (scene, summary) = crate::unity_render::build(&mut db, &def, |n| def.nodes[n as usize].layer != scenedef::VIEWMODEL_LAYER && player.is_some_and(|p| def.is_descendant(n, p)), shaders, generation, gfx);
+        let (scene, summary) = crate::unity_render::build(&mut db, &def, game.ui.clone().zip(game.ui_assets.clone()), |n| def.nodes[n as usize].layer != scenedef::VIEWMODEL_LAYER && player.is_some_and(|p| def.is_descendant(n, p)), shaders, generation, gfx);
         info!("{summary} ({:.2}s)", t.elapsed().as_secs_f32());
         scene
     });

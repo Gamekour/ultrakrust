@@ -53,6 +53,8 @@ pub struct RenderState {
     /// Render targets 1 and 2 (`rtSeparateBlend`): src, dst, op, mask. Without separate blending
     /// they share target 0's state.
     pub rt: [[StateValue; 4]; 2],
+    /// Stencil (both faces): ref, read mask, write mask, pass op, fail op, zfail op, comparison
+    pub stencil: [StateValue; 7],
 }
 
 /// One compiled variant of a stage.
@@ -261,6 +263,10 @@ impl ShaderAsset {
                         blend_op: StateValue::from(b.get("blendOp")),
                         color_mask: StateValue::from(b.get("colMask")),
                         rt: [rt(1), rt(2)],
+                        stencil: {
+                            let so = st.get("stencilOp");
+                            [st.get("stencilRef"), st.get("stencilReadMask"), st.get("stencilWriteMask"), so.get("pass"), so.get("fail"), so.get("zFail"), so.get("comp")].map(StateValue::from)
+                        },
                     },
                     vertex: subs(p, "progVertex"),
                     fragment: subs(p, "progFragment"),
