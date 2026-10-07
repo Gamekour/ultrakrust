@@ -446,13 +446,16 @@ fn checkpoint(def: &Arc<SceneDef>, r: &mut Report) {
     idle(&mut g, 250, &mut t, false);
     g.hurt_player(999, false);
     let died = g.s.dead;
-    idle(&mut g, 250, &mut t, false);
+    // DeathSequence: no respawn on its own; the BlackScreen comes up at 2 s and waits for R
+    idle(&mut g, 300, &mut t, false);
+    let waiting = g.s.dead && g.s.death_screen;
+    g.death_restart();
     let ev: Vec<_> = g.events.drain(..).collect();
-    let ok = died && !g.s.dead && g.s.hp == 100 && g.s.has_revolver && g.s.kills == kills && ev.contains(&GameEvent::Respawned);
+    let ok = died && waiting && !g.s.dead && !g.s.death_screen && g.s.hp == 100 && g.s.has_revolver && g.s.kills == kills && ev.contains(&GameEvent::Respawned);
     r.pass(
         "0-1.checkpoint_respawn",
         ok,
-        format!("died={died} dead_after={} hp={} revolver={} kills {}->{}", g.s.dead, g.s.hp, g.s.has_revolver, kills, g.s.kills),
+        format!("died={died} black_screen_waiting={waiting} dead_after={} hp={} revolver={} kills {}->{}", g.s.dead, g.s.hp, g.s.has_revolver, kills, g.s.kills),
     );
 }
 

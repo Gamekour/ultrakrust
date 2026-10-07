@@ -77,7 +77,10 @@ pub struct State {
     pub player: Player,
     pub hp: i32,
     pub dead: bool,
+    /// DeathSequence.timeSinceDeath (`_Deathness` = `_Sharpness` = t/2 for the first 2 s)
     pub dead_timer: f32,
+    /// DeathSequence.EndSequence: Canvas/BlackScreen is up, waiting for StatsManager's restart input
+    pub death_screen: bool,
     /// NewMovement.currentColor.a: the hurt flash fed to PostProcessV2's `_HurtScreenColor`
     pub hurt_alpha: f32,
     /// UnderwaterController: `_UnderwaterOverlay` while the UNDERWATER keyword is on
@@ -127,6 +130,74 @@ pub struct Mover {
     pub world0: Mat4,
 }
 
+/// What the player Canvas shows on death, read from the scene: DeathSequence's "Text (TMP)"
+/// (TextAppearByLines) during the 2 s ramp, then DeathSequence.deathScreen (the BlackScreen Image
+/// with its YouDiedText).
+#[derive(Clone, Debug, Default)]
+pub struct DeathUi {
+    /// TMP text lines; `true` for lines wrapped in `<color=orange>`
+    pub lines: Vec<(String, bool)>,
+    /// TextAppearByLines.delay: one more line every `delay` seconds
+    pub line_delay: f32,
+    /// BlackScreen Image m_Color
+    pub black: [f32; 4],
+    /// YouDiedText: TextOverride.m_KeyboardText (else Text.m_Text)
+    pub you_died: String,
+    pub you_died_color: [f32; 4],
+    /// DeathSequence is a later sibling than the BlackScreen, so its text draws over it
+    pub text_over_black: bool,
+}
+
+impl DeathUi {
+    fn from_def(def: &SceneDef) -> Self {
+        let mut ui = DeathUi::default();
+        let color = |v: &uk_assets::serialized::Value| {
+            let c = v.get("m_Color");
+            [c.get("r").f32(), c.get("g").f32(), c.get("b").f32(), c.get("a").f32()]
+        };
+        let Some(ds) = def.scripts.iter().find(|s| s.class == "DeathSequence") else { return ui };
+        if let Some(tabl) = def.scripts.iter().find(|s| s.class == "TextAppearByLines" && def.is_descendant(s.node, ds.node)) {
+            ui.line_delay = tabl.data.get("delay").f32();
+            if let Some((_, tmp)) = def.scripts_on(tabl.node).find(|(_, c)| c.class == "TextMeshProUGUI") {
+                ui.lines = tmp.data.get("m_text").str().split('\n').map(|l| match l.strip_prefix("<color=orange>") {
+                    Some(o) => (o.trim_end_matches("</color>").to_string(), true),
+                    None => (l.to_string(), false),
+                }).collect();
+            }
+        }
+        if let Some(black) = def.node_ref(ds.data.get("deathScreen")) {
+            if let Some((_, img)) = def.scripts_on(black).find(|(_, c)| c.class == "Image") {
+                ui.black = color(&img.data);
+            }
+            let in_black = |class: &str| def.scripts.iter().find(|s| s.class == class && def.is_descendant(s.node, black) && def.nodes[s.node as usize].name == "YouDiedText");
+            if let Some(t) = in_black("Text") {
+                ui.you_died = t.data.get("m_Text").str().to_string();
+                ui.you_died_color = color(&t.data);
+            }
+            if let Some(o) = in_black("TextOverride") {
+                let k = o.data.get("m_KeyboardText").str();
+                if !k.is_empty() {
+                    ui.you_died = k.to_string();
+                }
+            }
+            let parent = def.nodes[black as usize].parent;
+            if parent.is_some() && parent == def.nodes[ds.node as usize].parent {
+                let sib = &def.nodes[parent.unwrap() as usize].children;
+                ui.text_over_black = sib.iter().position(|&c| c == ds.node) > sib.iter().position(|&c| c == black);
+            }
+        }
+        ui
+    }
+
+    /// TextAppearByLines.AppearText: lines shown `t` seconds after OnEnable
+    pub fn lines_shown(&self, t: f32) -> usize {
+        if self.line_delay <= 0.0 {
+            return self.lines.len();
+        }
+        ((t / self.line_delay).floor() as usize + 1).min(self.lines.len())
+    }
+}
+
 pub struct Game {
     pub def: Arc<SceneDef>,
     pub s: State,
@@ -158,6 +229,8 @@ pub struct Game {
     distortion_fields: Vec<(u32, Option<u32>, f32, f32)>,
     /// Water scripts: their colliders (GetComponentsInChildren) and clr
     waters: Vec<WaterDef>,
+    /// The player Canvas' DeathSequence / BlackScreen contents
+    pub death_ui: DeathUi,
     /// UnderwaterController's sphere trigger: (offset from the player in the rig's local space, radius)
     uwc: Option<(Vec3, f32)>,
     /// UnderwaterController.defaultColor: its overlay Image's color with a = 0.3 (the app resolves the Image)
@@ -315,6 +388,7 @@ impl Game {
             hp: 100,
             dead: false,
             dead_timer: 0.0,
+            death_screen: false,
             hurt_alpha: 0.0,
             underwater_overlay: None,
             uwc_waters: Vec::new(),
@@ -367,6 +441,7 @@ impl Game {
             waters: Vec::new(),
             uwc: None,
             underwater_default: [0.0, 0.0, 0.0, 0.3],
+            death_ui: DeathUi::from_def(&def),
         };
         g.distortion_fields = (0..def.scripts.len() as u32)
             .filter(|&i| def.scripts[i as usize].class == "ScreenDistortionField")
@@ -1920,7 +1995,9 @@ impl Game {
         self.events.push(GameEvent::Hurt(damage));
         if self.s.hp == 0 {
             self.s.dead = true;
+            // DeathSequence.OnEnable
             self.s.dead_timer = 0.0;
+            self.s.death_screen = false;
             // NewMovement.GetHurt death: PowerUpMeter.juice = 0
             self.s.power_juice = 0.0;
             self.events.push(GameEvent::Died);
@@ -1966,6 +2043,9 @@ impl Game {
         }
         self.s.hp = 100;
         self.s.dead = false;
+        // DeathSequence.OnDisable
+        self.s.dead_timer = 0.0;
+        self.s.death_screen = false;
         self.full_refresh = true;
         self.events.push(GameEvent::Respawned);
         self.sync_world();
@@ -1980,6 +2060,19 @@ impl Game {
     pub fn restart_level(&mut self) {
         self.checkpoint = None;
         self.respawn();
+    }
+
+    /// StatsManager.Update: R or Fire1 while `hp <= 0` calls Restart, at any point of the death
+    /// sequence. Restart reloads the scene without a checkpoint, else CheckPoint.OnRespawn.
+    pub fn death_restart(&mut self) {
+        if self.s.hp > 0 {
+            return;
+        }
+        if self.checkpoint.is_none() {
+            self.restart_level();
+        } else {
+            self.respawn();
+        }
     }
 
     // ---------------------------------------------------------------- frame stepping
@@ -2055,9 +2148,10 @@ impl Game {
         self.screen_distortion();
         self.power_up_meter(dt);
         if self.s.dead {
+            // DeathSequence.Update: the 2 s ramp, then EndSequence puts up the BlackScreen
             self.s.dead_timer += dt;
-            if self.s.dead_timer > 1.5 {
-                self.respawn();
+            if self.s.dead_timer >= 2.0 {
+                self.s.death_screen = true;
             }
             return;
         }

@@ -46,6 +46,8 @@ pub struct BotFrame {
     pub pitch_deg: f32,
     pub fire: bool,
     pub punch: bool,
+    /// StatsManager's restart input (R) once dead
+    pub restart: bool,
 }
 
 impl Bot {
@@ -82,6 +84,8 @@ impl Bot {
         let p = &g.s.player;
         let mut out = BotFrame { yaw_deg: p.yaw_deg, ..Default::default() };
         if !p.activated || g.s.dead {
+            // the bot presses R 1.5 s into the death sequence
+            out.restart = g.s.dead && g.s.dead_timer > 1.5;
             return out;
         }
         // enemies first: aim at the nearest visible active enemy
@@ -340,6 +344,9 @@ pub fn drive(g: &mut Game, bot: &mut Bot, t: &mut f64) -> BotFrame {
     g.fixed_update(&fixed);
     *t += dt as f64;
     g.update(&f.input, dt, *t);
+    if f.restart {
+        g.death_restart();
+    }
     let eye = g.s.player.pos + Vec3::Y * 1.4;
     let (y, p) = (f.yaw_deg.to_radians(), f.pitch_deg.to_radians());
     let aim = Vec3::new(y.sin() * p.cos(), p.sin(), -y.cos() * p.cos());

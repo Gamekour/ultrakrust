@@ -8,7 +8,7 @@
 //!
 //! Controls (ULTRAKILL defaults): WASD move, Space jump, Left Shift dash,
 //! Left Ctrl slide / slam, LMB fire, hold RMB to charge a piercing shot, F punch (parries).
-//! R restart from checkpoint, N noclip, [ ] sensitivity, T camera tilt, Esc release mouse.
+//! R restart from checkpoint (R/LMB on the death screen), N noclip, [ ] sensitivity, T camera tilt, Esc release mouse.
 
 mod unity_render;
 mod present_probe;
@@ -91,6 +91,17 @@ struct HpBar;
 struct HpText;
 #[derive(Component)]
 struct PierceBar;
+/// NewMovement.screenHud: hidden while dead
+#[derive(Component)]
+struct HudRoot;
+/// DeathSequence.deathScreen (the BlackScreen Image)
+#[derive(Component)]
+struct DeathBlack;
+#[derive(Component)]
+struct DeathYouDied;
+/// DeathSequence's "Text (TMP)", one TextSpan per revealed line
+#[derive(Component)]
+struct DeathLog;
 #[derive(Component)]
 struct Beam {
     life: f32,
@@ -124,7 +135,7 @@ fn main() {
         .add_systems(Last, exit_after)
         .add_systems(Update, present_probe::run.after(update_hud).run_if(present_probe::enabled))
         .add_systems(FixedUpdate, fixed_sim)
-        .add_systems(Update, (cursor_grab, exit_probe, frame_sim, change_level, sync_level, unity_frame, apply_view, update_beams, update_hud, tour::run_tour).chain())
+        .add_systems(Update, (cursor_grab, exit_probe, frame_sim, change_level, sync_level, unity_frame, apply_view, update_beams, update_hud, update_death_ui, tour::run_tour).chain())
         .run();
 }
 
@@ -303,7 +314,13 @@ fn setup(
         Node { position_type: PositionType::Absolute, top: percent(30), width: percent(100), justify_content: JustifyContent::Center, ..default() },
     ));
     commands
-        .spawn(Node { position_type: PositionType::Absolute, bottom: px(24), left: px(24), flex_direction: FlexDirection::Column, row_gap: px(6), ..default() })
+        .spawn((DeathBlack, GlobalZIndex(10), Node { position_type: PositionType::Absolute, width: percent(100), height: percent(100), display: Display::None, justify_content: JustifyContent::Center, align_items: AlignItems::Center, ..default() }))
+        .with_children(|b| {
+            b.spawn((DeathYouDied, Text::new(""), TextLayout::justify(Justify::Center)));
+        });
+    commands.spawn((DeathLog, Text::new(""), GlobalZIndex(11), Node { position_type: PositionType::Absolute, top: px(0), left: px(0), display: Display::None, ..default() }));
+    commands
+        .spawn((HudRoot, Node { position_type: PositionType::Absolute, bottom: px(24), left: px(24), flex_direction: FlexDirection::Column, row_gap: px(6), ..default() }))
         .with_children(|ui| {
             ui.spawn((HpText, Text::new("100"), TextFont { font_size: FontSize::Px(26.0), ..default() }, TextColor(Color::srgb(1.0, 0.3, 0.2))));
             ui.spawn((Node { width: px(282), height: px(16), ..default() }, BackgroundColor(Color::srgb(0.15, 0.15, 0.15)))).with_children(|b| {
@@ -431,8 +448,14 @@ fn frame_sim(
     sim.clock += dt as f64;
     let captured = cursor.grab_mode != CursorGrabMode::None;
 
-    // NewMovement.levelOver: no restarting from the exit elevator
-    if keys.just_pressed(KeyCode::KeyR) && !sim.game.s.level_complete {
+    // StatsManager.Update: R or Fire1 while dead restarts (scene, or the checkpoint)
+    let restart_input = keys.just_pressed(KeyCode::KeyR) || (captured && mouse.just_pressed(MouseButton::Left)) || bot.as_ref().is_some_and(|b| b.restart);
+    if sim.game.s.dead && restart_input {
+        sim.game.death_restart();
+        sim.cam.rotation_y = sim.game.s.player.yaw_deg;
+    } else if keys.just_pressed(KeyCode::KeyR) && !sim.game.s.level_complete {
+        // developer shortcut while alive (ULTRAKILL restarts from the pause menu); NewMovement.levelOver:
+        // no restarting from the exit elevator
         sim.game.respawn();
         sim.cam.rotation_y = sim.game.s.player.yaw_deg;
     }
@@ -580,7 +603,6 @@ fn frame_sim(
             GameEvent::EnemyKilled { .. } => sim.log.push(("KILL".into(), 1.0)),
             GameEvent::Checkpoint => sim.banner = Some(("CHECKPOINT".into(), 1.5)),
             GameEvent::WeaponGot(w) => sim.banner = Some((format!("{w} ACQUIRED"), 2.5)),
-            GameEvent::Died => sim.banner = Some(("YOU DIED".into(), 1.6)),
             GameEvent::Respawned => {
                 sim.cam.rotation_y = sim.game.s.player.yaw_deg;
                 sim.revolver = Revolver::default();
@@ -756,6 +778,15 @@ fn apply_view(
         if FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == at {
             info!("hurt probe: {dmg} damage at frame {at}");
             sim.game.hurt_player(dmg, true);
+        }
+    }
+    // UNITY_PROBE_DEATH=frame: StatsManager's restart input at that frame (with UNITY_PROBE_HURT killing first)
+    if let Some(at) = std::env::var("UNITY_PROBE_DEATH").ok().and_then(|v| v.parse::<u32>().ok()) {
+        static FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == at {
+            let was = sim.game.s.dead;
+            sim.game.death_restart();
+            info!("death probe: restart at frame {at} (dead {was}) -> dead {} hp {} pos {:.1?}", sim.game.s.dead, sim.game.s.hp, sim.game.s.player.pos);
         }
     }
     // UNITY_PROBE_POST=underwater,vignette,wicked: force those PostProcessV2 keywords on with the
@@ -1033,6 +1064,62 @@ fn update_hud(
     }
     let r = &sim.revolver;
     pierce.width = percent(if !g.s.has_revolver { 0.0 } else if r.pierce_ready { r.pierce_shot_charge } else { r.pierce_charge });
+}
+
+/// The player Canvas on death: DeathSequence's log appearing by lines, then the BlackScreen
+/// (EndSequence at 2 s) with YouDiedText. CanvasScaler: ScaleWithScreenSize 1280x720, match 0.5.
+fn update_death_ui(
+    mut commands: Commands,
+    sim: Res<Sim>,
+    window: Single<&Window>,
+    mut cache: Local<(usize, usize, u32)>,
+    mut hud: Single<&mut Node, (With<HudRoot>, Without<DeathBlack>, Without<DeathLog>)>,
+    mut black: Single<(&mut Node, &mut BackgroundColor), (With<DeathBlack>, Without<HudRoot>, Without<DeathLog>)>,
+    mut you_died: Single<(&mut Text, &mut TextFont, &mut TextColor), With<DeathYouDied>>,
+    mut log: Single<(Entity, &mut Node, &mut GlobalZIndex), (With<DeathLog>, Without<HudRoot>, Without<DeathBlack>)>,
+    spans: Query<(&TextSpan, &TextColor, &TextFont), Without<DeathYouDied>>,
+    children: Query<&Children>,
+    mut frame: Local<u32>,
+) {
+    let g = &sim.game;
+    let u = &g.death_ui;
+    let scale = ((window.width() / 1280.0) * (window.height() / 720.0)).sqrt();
+    hud.display = if g.s.dead { Display::None } else { Display::Flex };
+    black.0.display = if g.s.death_screen { Display::Flex } else { Display::None };
+    let c = |c: [f32; 4]| Color::srgba(c[0], c[1], c[2], c[3]);
+    black.1.0 = c(u.black);
+    you_died.0.0.clone_from(&u.you_died);
+    you_died.1.font_size = FontSize::Px(14.0 * scale);
+    you_died.2.0 = c(u.you_died_color);
+    log.1.display = if g.s.dead { Display::Flex } else { Display::None };
+    log.1.left = px(16.0 * scale);
+    log.1.top = px(16.0 * scale);
+    *log.2 = GlobalZIndex(if u.text_over_black { 11 } else { 9 });
+    // UNITY_PROBE_DEATH: the death canvas as built last frame (spans spawn through Commands)
+    if std::env::var_os("UNITY_PROBE_DEATH").is_some() {
+        *frame += 1;
+        if g.s.dead || *frame % 60 == 0 {
+            let kids: Vec<_> = children.get(log.0).map(|c| c.iter().filter_map(|e| spans.get(e).ok()).collect()).unwrap_or_default();
+            let orange = kids.iter().filter(|(_, c, _)| c.0 != Color::WHITE).count();
+            let last = kids.last().map(|(t, _, f)| (t.0.trim_end().to_string(), f.font_size));
+            info!("death probe: frame {} dead {} t {:.3} screen {} hud {:?} black {:?} {:?} log {:?} z {:?} spans {} orange {} last {:?} you_died {:?} {:?} scale {scale:.3}",
+                *frame, g.s.dead, g.s.dead_timer, g.s.death_screen, hud.display, black.0.display, black.1.0, log.1.display, log.2.0, kids.len(), orange, last, you_died.0.0, you_died.1.font_size);
+        }
+    }
+    let shown = if g.s.dead { u.lines_shown(g.s.dead_timer) } else { 0 };
+    let key = (shown, std::sync::Arc::as_ptr(&g.def) as usize, (16.0 * scale) as u32);
+    if *cache != key {
+        *cache = key;
+        commands.entity(log.0).despawn_related::<Children>().with_children(|t| {
+            for (i, (line, orange)) in u.lines.iter().take(shown).enumerate() {
+                // TMP's named color "orange" is (255, 128, 0)
+                let color = if *orange { Color::srgb_u8(255, 128, 0) } else { Color::WHITE };
+                let text = if i + 1 < shown { format!("{line}
+") } else { line.clone() };
+                t.spawn((TextSpan::new(text), TextFont { font_size: FontSize::Px(16.0 * scale), ..default() }, TextColor(color)));
+            }
+        });
+    }
 }
 
 /// FinalRank: time, kills, style (with ranks), then the total; the continue prompt once complete

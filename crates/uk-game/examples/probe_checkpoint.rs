@@ -31,7 +31,13 @@ fn main() {
     for _ in 0..250 { g.fixed_update(&Input::default()); t += FIXED_DT as f64; g.update(&Input::default(), FIXED_DT, t); }
     g.hurt_player(999, false);
     println!("died: dead={} hp={}", g.s.dead, g.s.hp);
-    for _ in 0..250 { g.fixed_update(&Input::default()); t += FIXED_DT as f64; g.update(&Input::default(), FIXED_DT, t); }
+    let u = &g.death_ui;
+    println!("death ui: {} lines (delay {}), first {:?}, last {:?}, black {:?}, you_died {:?} {:?}, text_over_black {}", u.lines.len(), u.line_delay, u.lines.first(), u.lines.last(), u.black, u.you_died, u.you_died_color, u.text_over_black);
+    for t in [0.0, 0.049, 0.05, 1.0, 1.85, 2.0] { print!("lines@{t}={} ", u.lines_shown(t)); }
+    println!();
+    for _ in 0..260 { g.fixed_update(&Input::default()); t += FIXED_DT as f64; g.update(&Input::default(), FIXED_DT, t); }
+    println!("death screen: dead={} black_screen={} t={:.2}", g.s.dead, g.s.death_screen, g.s.dead_timer);
+    g.death_restart();
     println!("after respawn: dead={} hp={} pos {:?} kills {} (at checkpoint {}) has_revolver {}", g.s.dead, g.s.hp, g.s.player.pos, g.s.kills, kills_at_cp, g.s.has_revolver);
     let ev: Vec<_> = g.events.drain(..).collect();
     println!("events: {:?}", ev.iter().filter(|e| matches!(e, GameEvent::Respawned | GameEvent::Died)).collect::<Vec<_>>());

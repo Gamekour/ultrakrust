@@ -30,6 +30,8 @@ pub const PORTED: &[(&str, Port)] = &[
     ("PowerUpMeter", Port::Partial("juice meter drives VIGNETTE; no meter UI, endEffect")),
     ("DualWieldPickup", Port::Partial("grants DualWield juice; no duplicated weapon, pickup effect, camera shake")),
     ("DisablePowerUp", Port::Full),
+    ("DeathSequence", Port::Partial("deathness + log + EndSequence BlackScreen; no LaughingSkull/Flash/ISeeYou sprites, audio, pitch")),
+    ("TextAppearByLines", Port::Full),
     ("FinalDoor", Port::Partial("no animation/sound")),
     ("FinalDoorOpener", Port::Full),
     ("FinalPit", Port::Full),

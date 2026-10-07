@@ -237,8 +237,8 @@ CPU-skinned enemies, 3,393 colliders/569 triggers, 11,758 MonoBehaviours with ty
   RGB is NewMovement.hurtScreen's Image `m_Color` (1, 0.186, 0), read from the scene. Sim: `State::hurt_alpha`.
 - DeathSequence enables the DEAD keyword and drives `_Sharpness` = `_Deathness` = t * 0.5 for 2 s; `_ChromaticAberration`
   is never set (0). The DEAD variant gets its own pipeline and constant buffers (`_Time`, `_ScreenParams` filled) and
-  replaces the default pass while `State::dead`. Gap: ULTRAKILL ends the sequence into the death screen; we auto-respawn
-  at 1.5 s, so deathness peaks at 0.75.
+  replaces the default pass while `State::dead`. (The 1.5 s auto-respawn gap here was closed by the
+  death screen entry below; deathness now reaches 1.)
 - Heat-wave: `HeatWaves()` has no caller. ColorSchemeSetter is in no campaign scene.
 - Probe: `UNITY_PROBE_HURT=frame:damage`; logs `unity post globals` and `unity post shift` (mean post - scene).
   `examples/post_vsrm.rs` dumps the shader's keyword variants and constant buffers, `examples/hurt_screen.rs` the color.
@@ -361,3 +361,34 @@ CPU-skinned enemies, 3,393 colliders/569 triggers, 11,758 MonoBehaviours with ty
   - The duplicated weapon (DualWield's copy firing with `delay` = 0.05 + n/20, offset ±1.5).
   - The meter UI and endEffect.
   - The pickup effect and camera shake.
+
+## Death screen: DeathSequence + BlackScreen + StatsManager restart (2026-10-07)
+
+- There is no auto-respawn anymore. Death leaves the player dead until StatsManager.Update's restart input:
+  R, or Fire1 (LMB while the cursor is captured), while `hp <= 0`, at any point of the sequence.
+  - `Game::death_restart` reloads the level without a checkpoint (`restart_level`), else runs CheckPoint.OnRespawn.
+  - The bot presses restart 1.5 s after dying (`BotFrame::restart`).
+  - R while alive stays as a developer shortcut for the pause menu's Restart Checkpoint.
+- `DeathUi::from_def` reads the scene's player canvas:
+  - DeathSequence's TextAppearByLines `delay` (0.05) and its TMP text (39 lines; `<color=orange>` lines flagged).
+  - `deathScreen`: the BlackScreen Image color (0.05, 0.05, 0.05, 1).
+  - YouDiedText: m_Text, overridden by TextOverride's m_KeyboardText "[YOU ARE DEAD] … Press [R] TO RESTART", white.
+  - Sibling order: DeathSequence is after BlackScreen, so the log draws over it.
+- DeathSequence.timeSinceDeath is `dead_timer`. The log shows min(floor(t/delay)+1, 39) lines.
+  At t ≥ 2, EndSequence sets `death_screen`: the BlackScreen and YouDiedText.
+  Respawn (OnDisable) clears both.
+- Bevy UI layout: CanvasScaler ScaleWithScreenSize 1280×720, match 0.5, so scale = sqrt(w/1280 · h/720).
+  - The log is TMP fontSize 16 (top-left); YouDiedText is size 14 (centered); TMP "orange" is (255, 128, 0).
+  - NewMovement's screenHud is hidden while dead. The "YOU DIED" banner is gone.
+- Probe `UNITY_PROBE_HURT=60:200 UNITY_PROBE_DEATH=600` on 0-1 (1600×900, scale 1.25):
+  - t 0.616: 12 spans (6 orange). t 1.282: 26. t 1.949: 39, last "I DON'T WANT TO DIE.", 20 px.
+  - The BlackScreen shows from t 2.016, with the log at z 11 over it and YouDiedText at 17.5 px. The HUD is hidden throughout.
+  - Restart at frame 600: alive, hp 100, at the level start (no checkpoint yet). The canvas is cleared and the HUD is back.
+- Harness: 0-1.checkpoint_respawn now idles 300 ticks dead. It asserts the BlackScreen is waiting (no auto-respawn),
+  then restarts from the checkpoint. It passes.
+- `examples/find_class.rs`: FIND_SUBTREE, class `*` with FIND_TEXT, FIND_FULL.
+- Gaps:
+  - The LaughingSkull and ISeeYou sprites and the red Flash (HudOpenEffect): there is no uGUI sprite path yet.
+  - Death audio and the pitch drop.
+  - The rb torque roll.
+  - The scene reload is our `restart_level` (it respawns at the level start; it does not reload the scene).
