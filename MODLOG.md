@@ -336,3 +336,28 @@ CPU-skinned enemies, 3,393 colliders/569 triggers, 11,758 MonoBehaviours with ty
   - Wetness and notWet.
   - Splash and audio.
   - Forces on non-player rigidbodies (layers 9/10 get −0.45).
+
+## PowerUpMeter + DualWieldPickup + DisablePowerUp (2026-10-07)
+
+- `State` carries the PowerUpMeter singleton: `power_juice`, `power_max` (latestMaxJuice), `has_power_up`,
+  and the live DualWield count.
+- DualWieldPickup (trigger enter) runs PickedUp and DualWield.Start at once:
+  - It deactivates itself unless `infiniteUses`.
+  - juiceAmount 0 becomes 30. If juice < amount, juice = latestMaxJuice = amount.
+- PowerUpMeter.UpdateMeter runs every frame, dead or alive:
+  - While juice > 0, juice falls by dt and `_VignetteColor` = (1, 0.6, 0, juice/max), which turns VIGNETTE on.
+  - Otherwise EndPowerUp: the vignette goes off, and every DualWield sees juice ≤ 0 and is destroyed.
+- Juice is zeroed by NewMovement death, by respawn (the meter itself is carried over the checkpoint
+  snapshot) and by entering a FinalPit. DisablePowerUp.Start ends a running power-up (5-3).
+- `examples/find_class.rs` lists every instance of the given classes across all scene bundles (path, enabled,
+  fields). It was used to find the 11 pickups in 8 scenes.
+- Probe `UNITY_PROBE_POWERUP=<path>` (4-2 "6A Stuff/DualWieldPowerup", juiceAmount 30):
+  - Juice + t stays constant at about 31.3 (picked up at t ≈ 1.3); alpha 0.984 → 0.779 over t 1.78 → 7.93.
+  - With `UNITY_PROBE_HURT=600:200`: juice is 0 on the death frame, and the next update turns VIGNETTE off
+    (0 DualWields). It stays off after the respawn.
+  - Full run with HP held at 100: alpha 0.902 (t 4.19) → 0.0089 (t 30.99). At t 31.50 it reads juice 0, max 0,
+    VIGNETTE off, 0 DualWields, and it stays off.
+- Gaps:
+  - The duplicated weapon (DualWield's copy firing with `delay` = 0.05 + n/20, offset ±1.5).
+  - The meter UI and endEffect.
+  - The pickup effect and camera shake.

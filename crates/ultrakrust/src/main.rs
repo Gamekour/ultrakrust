@@ -832,6 +832,43 @@ fn apply_view(
             info!("water drop: frame {f} y {:.2} vy {:.2} touching {} overlay {:?} below {under:?}", p.pos.y, p.vel.y, p.touching_waters, sim.game.s.underwater_overlay);
         }
     }
+    // UNITY_PROBE_POWERUP=<path substring>: frames 30..40 hold the player on that DualWieldPickup
+    // (activating it and its ancestors), then log PowerUpMeter juice / vignette every 60 frames
+    if let Ok(want) = std::env::var("UNITY_PROBE_POWERUP") {
+        static FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let f = FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let def = sim.game.def.clone();
+        let pick = def.scripts.iter().find(|s| s.class == "DualWieldPickup" && def.path(s.node).contains(&want));
+        if let Some(s) = pick {
+            if (30..40).contains(&f) {
+                let at = def.nodes[s.node as usize].world0.w_axis.truncate();
+                if f == 30 {
+                    info!("powerup probe: player to {at:.1?} on {} fields {:?}", def.path(s.node), s.data);
+                    let mut chain = vec![];
+                    let mut n = Some(s.node);
+                    while let Some(i) = n {
+                        chain.push(i);
+                        n = def.nodes[i as usize].parent;
+                    }
+                    for i in chain.into_iter().rev() {
+                        sim.game.set_active(i, true);
+                    }
+                }
+                sim.game.s.player.pos = at - Vec3::Y;
+                sim.game.s.player.vel = Vec3::ZERO;
+            }
+            // without UNITY_PROBE_HURT the arena's enemies must not end the run before the juice does
+            if std::env::var_os("UNITY_PROBE_HURT").is_none() && !sim.game.s.dead {
+                sim.game.s.hp = 100;
+            }
+            if f >= 30 && f % 60 == 0 {
+                let g = &sim.game.s;
+                info!("powerup probe: frame {f} t {:.2} juice {:.2} max {:.1} has {} dual {} vignette {:?} pickup active {} dead {}", g.time, g.power_juice, g.power_max, g.has_power_up, g.dual_wields, g.vignette, g.active[s.node as usize], g.dead);
+            }
+        } else if f == 30 {
+            info!("powerup probe: no DualWieldPickup matching {want}");
+        }
+    }
     // UNITY_PROBE_DISTORT=meters: hold the player that far along +X from the first
     // ScreenDistortionField's GameObject, for the WICKED noise strength
     if let Some(m) = std::env::var("UNITY_PROBE_DISTORT").ok().and_then(|v| v.parse::<f32>().ok()) {

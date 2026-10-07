@@ -274,6 +274,10 @@ pub enum Script {
     OobTargetSetter { death_zones: Vec<u32> },
     /// OnLevelStart: `onStart` fires once when the level timer starts (the player is activated).
     OnLevelStart { on_start: UEvent, activated: bool },
+    /// DualWieldPickup: entering the trigger grants a DualWield power-up (PowerUpMeter juice).
+    DualWieldPickup { infinite: bool, juice: f32 },
+    /// DisablePowerUp: Start ends a running power-up.
+    DisablePowerUp,
     Other,
 }
 
@@ -442,6 +446,8 @@ pub fn parse(def: &SceneDef, idx: usize) -> Script {
         "WeaponPickUp" => Script::WeaponPickUp,
         "OutOfBoundsTargetSetter" => Script::OobTargetSetter { death_zones: scripts(def, v.get("deathZones")) },
         "OnLevelStart" => Script::OnLevelStart { on_start: parse_uevent(def, v.get("onStart")), activated: false },
+        "DualWieldPickup" => Script::DualWieldPickup { infinite: b("infiniteUses"), juice: f("juiceAmount") },
+        "DisablePowerUp" => Script::DisablePowerUp,
         _ => Script::Other,
     }
 }

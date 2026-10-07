@@ -84,6 +84,11 @@ pub struct State {
     pub underwater_overlay: Option<[f32; 4]>,
     /// PowerUpMeter: `_VignetteColor` while the VIGNETTE keyword is on
     pub vignette: Option<[f32; 4]>,
+    /// PowerUpMeter singleton: juice / latestMaxJuice / hasPowerUp, and live DualWield count
+    pub power_juice: f32,
+    pub power_max: f32,
+    pub has_power_up: bool,
+    pub dual_wields: u32,
     /// ScreenDistortionController: `_RandomNoiseStrength` while WICKED is on (any field active)
     pub screen_noise: Option<f32>,
     /// UnderwaterController.touchingWaters (indices into `Game::waters`), in entry order
@@ -314,6 +319,10 @@ impl Game {
             underwater_overlay: None,
             uwc_waters: Vec::new(),
             vignette: None,
+            power_juice: 0.0,
+            power_max: 0.0,
+            has_power_up: false,
+            dual_wields: 0,
             screen_noise: None,
             has_revolver: false,
             enemies,
@@ -735,6 +744,12 @@ impl Game {
                         self.final_door_open(sc);
                     }
                 }
+                // DisablePowerUp.Start
+                Script::DisablePowerUp => {
+                    if self.s.power_juice > 0.0 {
+                        self.end_power_up();
+                    }
+                }
                 _ => {}
             }
         }
@@ -907,6 +922,8 @@ impl Game {
         if !p.fake_end {
             p.send_timer = 5.0;
         }
+        // FinalPit.OnTriggerEnter: PowerUpMeter.juice = 0
+        self.s.power_juice = 0.0;
         let pl = &mut self.s.player;
         pl.activated = false;
         if pl.sliding {
@@ -1813,6 +1830,7 @@ impl Game {
                 Script::FinalPit(_) if enter => self.final_pit_enter(sc),
                 Script::OobTargetSetter { .. } if enter => self.oob_target_setter(sc),
                 Script::HudMessage(_) => self.hud_message(sc, enter),
+                Script::DualWieldPickup { .. } if enter => self.dual_wield_pickup(sc),
                 _ => {}
             }
         }
@@ -1851,6 +1869,41 @@ impl Game {
 
     // ---------------------------------------------------------------- player
 
+    /// DualWieldPickup.PickedUp + DualWield.Start (the duplicated weapon itself is not ported).
+    fn dual_wield_pickup(&mut self, sc: u32) {
+        let Script::DualWieldPickup { infinite, juice } = self.s.scripts[sc as usize] else { return };
+        if !infinite {
+            self.set_active(self.def.scripts[sc as usize].node, false);
+        }
+        self.s.dual_wields += 1;
+        let amt = if juice == 0.0 { 30.0 } else { juice };
+        if self.s.power_juice < amt {
+            self.s.power_max = amt;
+            self.s.power_juice = amt;
+        }
+    }
+
+    /// PowerUpMeter.UpdateMeter (Update, runs while dead too).
+    fn power_up_meter(&mut self, dt: f32) {
+        if self.s.power_juice > 0.0 {
+            self.s.has_power_up = true;
+            self.s.power_juice -= dt;
+            let a = self.s.power_juice / self.s.power_max;
+            self.s.vignette = Some([1.0, 0.6, 0.0, a]);
+        } else if self.s.has_power_up {
+            self.end_power_up();
+        }
+    }
+
+    /// PowerUpMeter.EndPowerUp; every DualWield sees juice <= 0 and destroys itself.
+    fn end_power_up(&mut self) {
+        self.s.has_power_up = false;
+        self.s.power_juice = 0.0;
+        self.s.power_max = 0.0;
+        self.s.vignette = None;
+        self.s.dual_wields = 0;
+    }
+
     pub fn hurt_player(&mut self, damage: i32, invincible: bool) {
         if self.s.dead || self.s.level_complete || damage <= 0 {
             return;
@@ -1868,6 +1921,8 @@ impl Game {
         if self.s.hp == 0 {
             self.s.dead = true;
             self.s.dead_timer = 0.0;
+            // NewMovement.GetHurt death: PowerUpMeter.juice = 0
+            self.s.power_juice = 0.0;
             self.events.push(GameEvent::Died);
         }
     }
@@ -1896,9 +1951,14 @@ impl Game {
         let snap = self.checkpoint.clone().or_else(|| self.start.clone()).expect("start snapshot");
         // StatsManager lives outside the checkpoint: kills carry over, a checkpoint restart counts
         let (kills, restarts) = (self.s.kills, self.s.restarts + self.checkpoint.is_some() as u32);
+        // PowerUpMeter and the GunControl-parented DualWields live outside the checkpoint too
+        let power = (self.s.power_max, self.s.has_power_up, self.s.dual_wields, self.s.vignette);
         self.s = *snap;
         self.s.kills = kills;
         self.s.restarts = restarts;
+        (self.s.power_max, self.s.has_power_up, self.s.dual_wields, self.s.vignette) = power;
+        // NewMovement.Respawn: PowerUpMeter.juice = 0 (the next meter update ends the power-up)
+        self.s.power_juice = 0.0;
         if let Some(p) = self.s.checkpoint_pos {
             self.s.player = Player::new(p);
             self.s.player.activated = true;
@@ -1993,6 +2053,7 @@ impl Game {
             self.s.hurt_alpha -= dt;
         }
         self.screen_distortion();
+        self.power_up_meter(dt);
         if self.s.dead {
             self.s.dead_timer += dt;
             if self.s.dead_timer > 1.5 {
