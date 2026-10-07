@@ -6,10 +6,12 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
+ab_glyph = "0.2.32"
 bevy_math.workspace = true
 lz4_flex = "0.11"
 lzma-rs = "0.3"
 serde_json = "1"
+texture2ddecoder = "0.1.2"
 
 [dev-dependencies]
 naga = { version = "29.0.4", features = ["spv-in", "wgsl-out"] }

@@ -31,6 +31,8 @@ const CLASS_LIGHT: i32 = 108;
 const CLASS_RENDER_SETTINGS: i32 = 104;
 const CLASS_CAMERA: i32 = 20;
 const CLASS_ANIMATOR: i32 = 95;
+const CLASS_CANVAS: i32 = 223;
+const CLASS_CANVAS_GROUP: i32 = 225;
 const CLASS_ANIMATOR_CONTROLLER: i32 = 91;
 const CLASS_ANIMATOR_OVERRIDE_CONTROLLER: i32 = 221;
 
@@ -68,6 +70,28 @@ pub struct NodeDef {
     pub local_scale: Vec3,
     /// World matrix at load time (Bevy space).
     pub world0: Mat4,
+    /// RectTransform layout fields (Unity space), when the Transform is a RectTransform.
+    pub rect: Option<RectDef>,
+}
+
+/// RectTransform: the rect inside the parent rect is
+/// `lerp(parent, anchor_min..anchor_max) + anchored_pos`, grown by `size_delta` around `pivot`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RectDef {
+    pub anchor_min: [f32; 2],
+    pub anchor_max: [f32; 2],
+    pub anchored_pos: [f32; 2],
+    pub size_delta: [f32; 2],
+    pub pivot: [f32; 2],
+}
+
+/// A native (non-MonoBehaviour) UI component: Canvas (223) or CanvasGroup (225), raw serialized data.
+#[derive(Debug)]
+pub struct UiNativeDef {
+    pub node: u32,
+    pub class_id: i32,
+    pub path_id: i64,
+    pub data: Value,
 }
 
 #[derive(Debug)]
@@ -203,6 +227,8 @@ pub struct SceneDef {
     pub animators: Vec<AnimatorDef>,
     pub controllers: Vec<ControllerDef>,
     pub clips: Vec<Arc<Clip>>,
+    /// Canvas / CanvasGroup components, in node order (kept apart from `scripts` so script order is unchanged).
+    pub ui_natives: Vec<UiNativeDef>,
 }
 
 impl SceneDef {
@@ -457,10 +483,30 @@ struct RawTr {
     go: i64,
     father: i64,
     trs: (Vec3, Quat, Vec3),
+    /// m_Children: the sibling order (GetChild / uGUI draw order).
+    children: Vec<i64>,
+    rect: Option<RectDef>,
 }
 
 fn raw_tr(v: &Value) -> RawTr {
-    RawTr { go: v.get("m_GameObject").pptr().1, father: v.get("m_Father").pptr().1, trs: unity_trs(v) }
+    let v2 = |k: &str| {
+        let x = v.get(k);
+        [x.get("x").f32(), x.get("y").f32()]
+    };
+    let rect = v.has("m_AnchorMin").then(|| RectDef {
+        anchor_min: v2("m_AnchorMin"),
+        anchor_max: v2("m_AnchorMax"),
+        anchored_pos: v2("m_AnchoredPosition"),
+        size_delta: v2("m_SizeDelta"),
+        pivot: v2("m_Pivot"),
+    });
+    RawTr {
+        go: v.get("m_GameObject").pptr().1,
+        father: v.get("m_Father").pptr().1,
+        trs: unity_trs(v),
+        children: v.get("m_Children").array().iter().map(|c| c.pptr().1).collect(),
+        rect,
+    }
 }
 
 /// Appends the GameObjects / Transforms of `ld.scene` (`raw_go`, `raw_tr`) as nodes with their
@@ -498,6 +544,7 @@ fn add_objects(ld: &mut Loader, def: &mut SceneDef, raw_go: &HashMap<i64, Value>
             local_rot: to_bevy_quat(q),
             local_scale: s,
             world0: Mat4::IDENTITY,
+            rect: rt.rect,
         });
     }
     let mut roots = Vec::new();
@@ -510,6 +557,15 @@ fn add_objects(ld: &mut Loader, def: &mut SceneDef, raw_go: &HashMap<i64, Value>
         if let Some(pf) = pf.or(parent) {
             def.nodes[n as usize].parent = Some(pf);
             def.nodes[pf as usize].children.push(n);
+        }
+    }
+    // sibling order is m_Children's, not path-id order
+    for &t in &tr_ids {
+        let Some(&n) = tr_to_node.get(&t) else { continue };
+        let order: Vec<u32> = raw_tr[&t].children.iter().filter_map(|c| tr_to_node.get(c).copied()).collect();
+        let ch = &mut def.nodes[n as usize].children;
+        if order.len() == ch.len() {
+            *ch = order;
         }
     }
     // world matrices in Unity space, computed top-down (existing nodes keep theirs)
@@ -646,6 +702,11 @@ fn add_objects(ld: &mut Loader, def: &mut SceneDef, raw_go: &HashMap<i64, Value>
                         keep_state_on_disable: v.get("m_KeepAnimatorStateOnDisable").bool(),
                         path_id: id,
                     });
+                }
+                CLASS_CANVAS | CLASS_CANVAS_GROUP => {
+                    def.obj_to_node.insert(id, node);
+                    let Ok(v) = file.read(o) else { continue };
+                    def.ui_natives.push(UiNativeDef { node, class_id: o.class_id, path_id: id, data: v });
                 }
                 CLASS_RIGIDBODY => {
                     def.obj_to_node.insert(id, node);

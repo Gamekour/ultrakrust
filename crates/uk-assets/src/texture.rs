@@ -107,6 +107,15 @@ fn decode_image(v: &Value, fmt: i64, data: &[u8], w: usize, h: usize, rgba: &mut
         }
         10 => decode_bc(data, w, h, rgba, false),
         12 => decode_bc(data, w, h, rgba, true),
+        // BC7
+        25 => {
+            let mut px = vec![0u32; n];
+            texture2ddecoder::decode_bc7(data, w, h, &mut px).map_err(|e| Error(format!("{}: bc7 {e}", v.get("m_Name").str())))?;
+            for (o, p) in rgba.chunks_exact_mut(4).zip(px) {
+                let [b, g, r, a] = p.to_le_bytes();
+                o.copy_from_slice(&[r, g, b, a]);
+            }
+        }
         f => return Err(Error(format!("{}: texture format {f} not supported", v.get("m_Name").str()))),
     }
     Ok(())
