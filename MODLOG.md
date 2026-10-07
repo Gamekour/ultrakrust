@@ -244,3 +244,37 @@ CPU-skinned enemies, 3,393 colliders/569 triggers, 11,758 MonoBehaviours with ty
   `examples/post_vsrm.rs` dumps the shader's keyword variants and constant buffers, `examples/hurt_screen.rs` the color.
 - 0-1: baseline shift (-3.9, -3.8, -4.3). 30 damage at frame 232: alpha 0.433 at frame 240, shift (93.8, 11.1, -6.4) vs
   predicted (94.0, 11.2, -7.1). 200 damage at frame 200: alpha 0.470, deathness 0.165 (0.33 s), DEAD pass on.
+
+## PostProcessV2 keyword variants: UNDERWATER, VIGNETTE, WICKED (2026-10-07)
+- All 16 combinations of PostProcessV2's runtime keywords (DEAD, UNDERWATER, VIGNETTE, WICKED) are built as separate
+  pipelines. The frame picks the variant by mask and falls back to mask 0 if one is missing. This replaces the DEAD-only
+  pipeline.
+- Textures are bound by slot name instead of putting the dither texture in every non-scene slot:
+  - from the material's TexEnvs: `_NoiseTex` 256x256 (DualNoise)
+  - from the handler's ditherTexture: `_Dither` 16x16
+  - from the handler's vignetteTexture: `_VignetteTex` 512x512
+  - names with no definition get white
+- With a real `_NoiseTex`, the 0-1 baseline shift is now (-2.3, -2.6, -4.0); it was (-3.9, -3.8, -4.3) with the
+  dither texture in that slot.
+- New constant-buffer inputs: `_UnderwaterOverlay`, `_VignetteColor` and `_RandomNoiseStrength`. Sim state:
+  `underwater_overlay`, `vignette` and `screen_noise`.
+- WICKED is a port of ScreenDistortionField and ScreenDistortionController:
+  - For each enabled field, d = distance from the player to the closest point on its first collider (shape in load pose,
+    following the owning mover); with no collider, its position.
+  - strength = ((distance - d) / distance)^2 * strength when d < distance.
+  - The keyword is on while any field is enabled; the noise value is the maximum strength.
+  - Fields: 0-S Wicked's RadiationField (70 m, 0.33), and the two 1-2 Cancerous Rodent Radiation fields (30 m, 0.33).
+- Gaps: nothing in the sim sets UNDERWATER (Water + UnderwaterController, 36 scenes) or VIGNETTE
+  (PowerUpMeter/DualWield juice) yet.
+- Probes:
+  - `UNITY_PROBE_POST=underwater,vignette,wicked` forces the inputs.
+  - `UNITY_PROBE_DISTORT=m` holds the player m metres along +X from the first field and activates its ancestors.
+- 0-1 results at frame 240 (exact variant every time), shift = mean rgb post - scene:
+  - UNDERWATER (0, .5, 1, .3): shift (-11.6, 35.9, 74.5), predicted about (-11, 32, 71).
+  - VIGNETTE (1, .6, 0, 1): shift (2.2, 0.2, -4.1), edge-only.
+  - WICKED 1.0: mean abs diff 16.9, 1544 distinct colors (baseline 55).
+  - All three: 3836 distinct colors.
+- Distortion results (frame 240, WICKED on, exact variant), as predicted ((distance - d) / distance)^2 * 0.33:
+  - 1-2 rodent, player 10 m from the field (sphere radius 7.5, so d = 2.5): noise 0.27729, predicted 0.27729.
+  - 1-2 rodent, 40 m: noise 0.0. WICKED stays on because the field is enabled.
+  - 0-S Wicked, 20 m (radius 3.75, so d = 16.25): noise 0.19457, predicted 0.19457.

@@ -161,15 +161,20 @@ pub struct OutlineDef {
     pub state: DrawState,
 }
 
+/// The keywords scripts toggle on PostProcessV2 at runtime, as bits of a variant index:
+/// DeathSequence (DEAD), UnderwaterController (UNDERWATER, global), PowerUpMeter (VIGNETTE),
+/// ScreenDistortionController (WICKED).
+pub const POST_KEYWORDS: [&str; 4] = ["DEAD", "UNDERWATER", "VIGNETTE", "WICKED"];
+
 pub struct PostDef {
-    pub variant: u32,
-    /// the same pass with DeathSequence's DEAD keyword (PostProcessV2_Handler.DeathEffect)
-    pub dead_variant: Option<u32>,
+    /// the pass's variant for each combination of POST_KEYWORDS bits
+    pub variants: [Option<u32>; 16],
     /// NewMovement.hurtScreen's Image color: the RGB of `_HurtScreenColor`
     pub hurt_rgb: [f32; 3],
     pub material: Arc<MaterialProps>,
-    /// PostProcessV2_Handler.ditherTexture (scene texture index).
-    pub dither: Option<u32>,
+    /// sampled textures by shader name (scene texture index): the material's, with the handler's
+    /// ditherTexture / vignetteTexture set in Start
+    pub textures: Vec<(String, u32)>,
 }
 
 #[derive(Resource, Clone, Default, ExtractResource)]
@@ -190,6 +195,19 @@ pub struct UnityFrame {
     pub hurt: f32,
     /// DeathSequence's `_Deathness`/`_Sharpness` while the player is dead (DEAD keyword on)
     pub dead: Option<f32>,
+    /// `_UnderwaterOverlay` while UNDERWATER is on
+    pub underwater: Option<[f32; 4]>,
+    /// `_VignetteColor` while VIGNETTE is on
+    pub vignette: Option<[f32; 4]>,
+    /// `_RandomNoiseStrength` while WICKED is on
+    pub noise: Option<f32>,
+}
+
+impl UnityFrame {
+    /// the POST_KEYWORDS bits enabled this frame
+    pub fn post_mask(&self) -> usize {
+        self.dead.is_some() as usize | (self.underwater.is_some() as usize) << 1 | (self.vignette.is_some() as usize) << 2 | (self.noise.is_some() as usize) << 3
+    }
 }
 
 pub struct UnityRenderPlugin;
@@ -674,17 +692,21 @@ pub fn build(
         let (sf, sid) = db.resolve(&mf, props.shader).ok().flatten()?;
         let sh = ShaderAsset::from_value(&sf.read_id(sid).ok()?).ok()?;
         let kw: Vec<&str> = props.keywords.iter().map(|s| s.as_str()).collect();
-        let vsub = sh.select(&sh.passes.first()?.vertex, &kw)?.clone();
-        let var = make_variant(&sh, &vsub, shaders, variants.len()).map_err(|e| warn!("post-process variant: {e}")).ok()?;
-        variants.push(var);
-        let variant = variants.len() as u32 - 1;
-        let mut dkw = kw.clone();
-        dkw.push("DEAD");
-        let dead_variant = sh.select(&sh.passes[0].vertex, &dkw).cloned().and_then(|dsub| {
-            let var = make_variant(&sh, &dsub, shaders, variants.len()).map_err(|e| warn!("post-process DEAD variant: {e}")).ok()?;
-            variants.push(var);
-            Some(variants.len() as u32 - 1)
-        });
+        let pass = sh.passes.first()?;
+        let mut post_variants = [None; 16];
+        for (mask, slot) in post_variants.iter_mut().enumerate() {
+            let mut kw = kw.clone();
+            kw.extend(POST_KEYWORDS.iter().enumerate().filter(|(i, _)| mask >> i & 1 == 1).map(|(_, k)| *k));
+            let Some(vsub) = sh.select(&pass.vertex, &kw).cloned() else { continue };
+            match make_variant(&sh, &vsub, shaders, variants.len()) {
+                Ok(var) => {
+                    variants.push(var);
+                    *slot = Some(variants.len() as u32 - 1);
+                }
+                Err(e) => warn!("post-process variant {kw:?}: {e}"),
+            }
+        }
+        post_variants[0]?;
         // the hurt flash color: NewMovement.hurtScreen (a disabled Image the shader stands in for)
         let hurt_rgb = def
             .scripts
@@ -700,12 +722,29 @@ pub fn build(
                 warn!("NewMovement.hurtScreen unresolved; hurt flash disabled");
                 [0.0; 3]
             });
-        let dither = db.resolve(&f, h.data.get("ditherTexture").pptr()).ok().flatten().and_then(|(tf, tid)| {
-            let t = uk_assets::texture::decode_texture(db, &tf.read_id(tid).ok()?).ok()?;
+        // the material's textures, then PostProcessV2_Handler.Start's SetTexture calls on top
+        let mut refs = Vec::new();
+        for (name, t) in &props.textures {
+            if let Some(r) = db.resolve(&mf, t.texture).ok().flatten() {
+                refs.push((name.clone(), r));
+            }
+        }
+        for (name, field) in [("_Dither", "ditherTexture"), ("_VignetteTex", "vignetteTexture")] {
+            if let Some(r) = db.resolve(&f, h.data.get(field).pptr()).ok().flatten() {
+                refs.retain(|(n, _)| n != name);
+                refs.push((name.to_string(), r));
+            }
+        }
+        let mut post_tex = Vec::new();
+        for (name, (tf, tid)) in refs {
+            let Some(t) = tf.read_id(tid).ok().and_then(|v| uk_assets::texture::decode_texture(db, &v).ok()) else {
+                warn!("post-process texture {name} undecodable");
+                continue;
+            };
             textures.push(TexCpu { width: t.width, height: t.height, rgba: t.rgba, filter: t.filter, wrap: t.wrap, layers: t.layers });
-            Some(textures.len() as u32 - 1)
-        });
-        Some(PostDef { variant, dead_variant, hurt_rgb, material: Arc::new(props), dither })
+            post_tex.push((name, textures.len() as u32 - 1));
+        }
+        Some(PostDef { variants: post_variants, hurt_rgb, material: Arc::new(props), textures: post_tex })
     })();
     // the outline composite: at default prefs (simplifyEnemies off) the handler blits the outline
     // buffer onto the scene with OutlinePx pass 3 at CameraEvent.AfterEverything
@@ -745,7 +784,11 @@ pub fn build(
     let enemy_draws: Vec<&Draw> = draws.iter().filter(|d| simplifiers.contains_key(&d.node)).collect();
     let summary = format!(
         "unity shaders: post-process {}, outline {}, sky {} (camera {:?}), enemy simplifiers {} on {} draws ({} write SV_Target1: {:?}), {} variants, {}/{} renderers drawn, {} textures, {} lights; skipped: {:?}",
-        post.as_ref().map_or("missing".to_string(), |p| format!("{} dither {:?}", variants[p.variant as usize].label, p.dither.map(|t| (textures[t as usize].width, textures[t as usize].height)))),
+        post.as_ref().map_or("missing".to_string(), |p| {
+            let n = p.variants.iter().flatten().count();
+            let tex: Vec<String> = p.textures.iter().map(|(n, t)| format!("{n} {}x{}", textures[*t as usize].width, textures[*t as usize].height)).collect();
+            format!("{} ({n}/16 keyword variants) textures {tex:?}", p.variants[0].map_or("?", |v| &variants[v as usize].label))
+        }),
         outline.as_ref().map_or("missing".to_string(), |o| format!("{} state {:?}", variants[o.variant as usize].label, o.state)),
         draws.iter().find(|d| d.sky).map_or("none".to_string(), |d| format!("{} {:?} textures {:?}", variants[d.variant as usize].label, d.material.name, d.textures.values().map(|&t| (textures[t as usize].width, textures[t as usize].layers)).collect::<Vec<_>>())),
         def.render_settings.camera_clear,
@@ -887,6 +930,9 @@ pub fn frame(game: &uk_game::Game, scene: &SceneData, time: f32) -> UnityFrame {
         hurt: s.hurt_alpha,
         // DeathSequence.Update: timeSinceDeath * 0.5 for its first 2 s, then held
         dead: s.dead.then(|| s.dead_timer.min(2.0) * 0.5),
+        underwater: s.underwater_overlay,
+        vignette: s.vignette,
+        noise: s.screen_noise,
     }
 }
 
@@ -916,8 +962,7 @@ struct UnityGpu {
     /// PostProcessV2's reusableBufferA: the main camera's second target (outline RG), cleared black each frame.
     outline_target: Option<(Texture, TextureView)>,
     outline: Option<OutlineGpu>,
-    /// the post pass with DEAD on, used while the player is dead
-    post_dead: Option<PostGpu>,
+
     outline_readback: std::sync::Mutex<Option<Buffer>>,
     /// `UNITY_FRAME_STATS`: one frame of the scene target copied back for numeric checks.
     readback: std::sync::Mutex<Option<(Buffer, u32, UVec2, bool)>>,
@@ -932,10 +977,25 @@ struct UnityGpu {
     ubo: Option<Buffer>,
     staging: Vec<u8>,
     composite: Option<(CachedRenderPipelineId, BindGroupLayoutDescriptor, Sampler)>,
-    post: Option<PostGpu>,
+    /// PostProcessV2 per POST_KEYWORDS mask (None where the variant is missing)
+    post: Vec<Option<PostGpu>>,
     /// PostProcessV2 output (what the Virtual Camera puts on screen), same size as the scene target.
     post_target: Option<(Texture, TextureView)>,
     post_readback: std::sync::Mutex<Option<Buffer>>,
+}
+
+impl UnityGpu {
+    /// the post pass for a keyword mask; a missing combination falls back to the material's
+    fn post_for(&self, mask: usize) -> Option<&PostGpu> {
+        self.post.get(mask).and_then(Option::as_ref).or_else(|| self.post.first()?.as_ref())
+    }
+}
+
+impl PostGpu {
+    /// a sampled texture by shader name (every non-scene slot of the variant is bound at build)
+    fn texture(&self, name: &str) -> &(TextureView, Sampler) {
+        &self.textures.iter().find(|(n, _)| n == name).expect("post texture slot bound at build").1
+    }
 }
 
 struct OutlineGpu {
@@ -951,7 +1011,8 @@ struct PostGpu {
     layouts: [BindGroupLayoutDescriptor; 2],
     ubufs: Vec<(u32, Buffer, usize)>,
     vbuf: Buffer,
-    dither: (TextureView, Sampler),
+    /// non-scene textures by shader name
+    textures: Vec<(String, (TextureView, Sampler))>,
     main_sampler: Sampler,
 }
 
@@ -965,6 +1026,9 @@ struct PostGlobals {
     time: f32,
     hurt: [f32; 4],
     deathness: f32,
+    underwater: [f32; 4],
+    vignette: [f32; 4],
+    noise: f32,
 }
 
 fn fill_post_cb(out: &mut [u8], cb: &uk_assets::shader::ConstantBuffer, mat: &MaterialProps, size: UVec2, g: PostGlobals) {
@@ -981,6 +1045,9 @@ fn fill_post_cb(out: &mut [u8], cb: &uk_assets::shader::ConstantBuffer, mat: &Ma
                 "_Gamma" => [1.0, 0.0, 0.0, 0.0],
                 "_HurtScreenColor" => g.hurt,
                 "_Sharpness" | "_Deathness" => [g.deathness, 0.0, 0.0, 0.0],
+                "_UnderwaterOverlay" => g.underwater,
+                "_VignetteColor" => g.vignette,
+                "_RandomNoiseStrength" => [g.noise, 0.0, 0.0, 0.0],
                 "_Time" => [g.time / 20.0, g.time, g.time * 2.0, g.time * 3.0],
                 "_ScreenParams" => [size.x as f32, size.y as f32, 1.0 + 1.0 / size.x as f32, 1.0 + 1.0 / size.y as f32],
                 // OutlinePx: SetupOutlines at full resolution, forced to one pixel
@@ -1527,15 +1594,26 @@ fn prepare(
             let state = DrawState { cull: 0, zwrite: false, ztest: 8, src: 1, dst: 0, src_a: 1, dst_a: 0, op: 0, mask: 15, rt1: [1, 0, 0, 0] };
             let mut desc = pipeline_descriptor(var, &layouts, state, false);
             desc.depth_stencil = None;
-            let dither = match p.dither {
-                Some(t) => (tex_views[t as usize].clone(), sampler_for(&dev, scene.textures.get(t as usize))),
-                None => (white.clone(), sampler_for(&dev, None)),
-            };
+            // every sampled texture but the scene: the definition's, else white
+            let textures = var.groups[0]
+                .iter()
+                .filter_map(|s| match s {
+                    Slot::Texture { name, .. } if name != "_MainTex" => Some(name.clone()),
+                    _ => None,
+                })
+                .map(|name| {
+                    let t = p.textures.iter().find(|(n, _)| *n == name).map(|&(_, t)| t);
+                    let bound = match t {
+                        Some(t) => (tex_views[t as usize].clone(), sampler_for(&dev, scene.textures.get(t as usize))),
+                        None => (white.clone(), sampler_for(&dev, None)),
+                    };
+                    (name, bound)
+                })
+                .collect();
             let main_sampler = dev.create_sampler(&SamplerDescriptor { label: Some("unity post main"), ..default() });
-            PostGpu { variant: v, pipeline: cache.queue_render_pipeline(desc), layouts, ubufs, vbuf, dither, main_sampler }
+            PostGpu { variant: v, pipeline: cache.queue_render_pipeline(desc), layouts, ubufs, vbuf, textures, main_sampler }
         };
-        gpu.post = scene.post.as_ref().map(|p| build_post(p, p.variant));
-        gpu.post_dead = scene.post.as_ref().and_then(|p| Some(build_post(p, p.dead_variant?)));
+        gpu.post = scene.post.as_ref().map_or_else(Vec::new, |p| p.variants.iter().map(|v| v.map(|v| build_post(p, v))).collect());
         gpu.outline = scene.outline.as_ref().map(|o| {
             let var = &scene.variants[o.variant as usize];
             let layouts = [
@@ -1857,8 +1935,11 @@ fn prepare(
             // NewMovement.Update: _HurtScreenColor = hurtColor with currentColor.a
             hurt: [pd.hurt_rgb[0], pd.hurt_rgb[1], pd.hurt_rgb[2], frame.hurt],
             deathness: frame.dead.unwrap_or(0.0),
+            underwater: frame.underwater.unwrap_or_default(),
+            vignette: frame.vignette.unwrap_or_default(),
+            noise: frame.noise.unwrap_or(0.0),
         };
-        for post in [&gpu.post, &gpu.post_dead].into_iter().flatten() {
+        if let Some(post) = gpu.post_for(frame.post_mask()) {
             let var = &scene.variants[post.variant as usize];
             for (_, buf, cb) in &post.ubufs {
                 let Some(cbd) = var.params.constant_buffers.get(*cb) else { continue };
@@ -2044,8 +2125,7 @@ fn draw(
     }
     // ULTRAKILL's final composite (PostProcessV2) into the post target
     let mut shown = color;
-    let dead = world.resource::<UnityFrame>().dead.is_some();
-    let post = if dead && gpu.post_dead.is_some() { &gpu.post_dead } else { &gpu.post };
+    let post = gpu.post_for(world.resource::<UnityFrame>().post_mask());
     if let (Some(post), Some((_, pv))) = (post, gpu.post_target.as_ref()) {
         if let Some(p) = cache.get_render_pipeline(post.pipeline) {
             let dev = world.resource::<RenderDevice>();
@@ -2054,7 +2134,7 @@ fn draw(
             for s in &var.groups[0] {
                 match s {
                     Slot::Texture { binding, name, .. } => {
-                        let view = if name == "_MainTex" { color } else { &post.dither.0 };
+                        let view = if name == "_MainTex" { color } else { &post.texture(name).0 };
                         e0.push(BindGroupEntry { binding: *binding, resource: BindingResource::TextureView(view) });
                     }
                     Slot::Sampler { binding, .. } => {
@@ -2063,7 +2143,10 @@ fn draw(
                             Slot::Texture { binding: tb, name, .. } if *tb + uk_assets::spirv::SAMPLER_BINDING_OFFSET == *binding => Some(name.as_str()),
                             _ => None,
                         });
-                        let smp = if tex == Some("_MainTex") { &post.main_sampler } else { &post.dither.1 };
+                        let smp = match tex {
+                            Some("_MainTex") | None => &post.main_sampler,
+                            Some(n) => &post.texture(n).1,
+                        };
                         e0.push(BindGroupEntry { binding: *binding, resource: BindingResource::Sampler(smp) });
                     }
                     _ => {}
@@ -2099,7 +2182,18 @@ fn draw(
     }
     if n == 240 && std::env::var_os("UNITY_FRAME_STATS").is_some() {
         let f = world.resource::<UnityFrame>();
-        info!("unity post globals: hurt alpha {:.3} deathness {:?} DEAD pass {}", f.hurt, f.dead, f.dead.is_some() && gpu.post_dead.is_some());
+        let mask = f.post_mask();
+        let on: Vec<&str> = POST_KEYWORDS.iter().enumerate().filter(|(i, _)| mask >> i & 1 == 1).map(|(_, k)| *k).collect();
+        let built = gpu.post.get(mask).is_some_and(|p| p.is_some());
+        info!(
+            "unity post globals: hurt alpha {:.3} deathness {:?} underwater {:?} vignette {:?} noise {:?} keywords {on:?} pass {}",
+            f.hurt,
+            f.dead,
+            f.underwater,
+            f.vignette,
+            f.noise,
+            if built { "exact" } else { "fallback" }
+        );
         let (size, tex, _, _) = gpu.target.as_ref().unwrap();
         let row = (size.x * 4).next_multiple_of(256);
         let dev = world.resource::<RenderDevice>();

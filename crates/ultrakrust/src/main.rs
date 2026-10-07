@@ -750,6 +750,43 @@ fn apply_view(
             sim.game.hurt_player(dmg, true);
         }
     }
+    // UNITY_PROBE_POST=underwater,vignette,wicked: force those PostProcessV2 keywords on with the
+    // values their scripts set (Water.clr default at a 0.3, DualWield's powerUpColor at full juice)
+    if let Ok(v) = std::env::var("UNITY_PROBE_POST") {
+        for k in v.split(',') {
+            match k {
+                "underwater" => sim.game.s.underwater_overlay = Some([0.0, 0.5, 1.0, 0.3]),
+                "vignette" => sim.game.s.vignette = Some([1.0, 0.6, 0.0, 1.0]),
+                "wicked" => sim.game.s.screen_noise = Some(1.0),
+                _ => {}
+            }
+        }
+    }
+    // UNITY_PROBE_DISTORT=meters: hold the player that far along +X from the first
+    // ScreenDistortionField's GameObject, for the WICKED noise strength
+    if let Some(m) = std::env::var("UNITY_PROBE_DISTORT").ok().and_then(|v| v.parse::<f32>().ok()) {
+        let def = sim.game.def.clone();
+        if let Some(s) = def.scripts.iter().find(|s| s.class == "ScreenDistortionField") {
+            let at = def.nodes[s.node as usize].world0.w_axis.truncate() + Vec3::X * m;
+            sim.game.s.player.pos = at;
+            sim.game.s.player.vel = Vec3::ZERO;
+            static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let shape = def.colliders.iter().find(|c| c.node == s.node).map(|c| format!("{:?}", c.shape));
+                info!("distort probe: player held {m} m from {} at {at:.1?}, collider {shape:?}, fields {:?}", def.path(s.node), s.data);
+                // the room's trigger never fires from a teleport: activate the field and its ancestors
+                let mut chain = vec![];
+                let mut n = Some(s.node);
+                while let Some(i) = n {
+                    chain.push(i);
+                    n = def.nodes[i as usize].parent;
+                }
+                for i in chain.into_iter().rev() {
+                    sim.game.set_active(i, true);
+                }
+            }
+        }
+    }
     // UNITY_PROBE_ENEMY: frame the enemy nearest the player from 4 m, for the outline buffer stats
     if std::env::var_os("UNITY_PROBE_ENEMY").is_some() {
         // once: stand on the nearest enemy so its room's triggers activate it

@@ -80,6 +80,12 @@ pub struct State {
     pub dead_timer: f32,
     /// NewMovement.currentColor.a: the hurt flash fed to PostProcessV2's `_HurtScreenColor`
     pub hurt_alpha: f32,
+    /// UnderwaterController: `_UnderwaterOverlay` while the UNDERWATER keyword is on
+    pub underwater_overlay: Option<[f32; 4]>,
+    /// PowerUpMeter: `_VignetteColor` while the VIGNETTE keyword is on
+    pub vignette: Option<[f32; 4]>,
+    /// ScreenDistortionController: `_RandomNoiseStrength` while WICKED is on (any field active)
+    pub screen_noise: Option<f32>,
     pub has_revolver: bool,
     pub enemies: Vec<Enemy>,
     pub projectiles: Vec<Projectile>,
@@ -141,6 +147,8 @@ pub struct Game {
     pub vm_revolver: Option<u32>,
     /// Rigs of the viewmodel Animators: (Revolver, Arm Blue / Punch)
     pub vm_rigs: (Option<usize>, Option<usize>),
+    /// ScreenDistortionField scripts: (script, its first collider, distance, strength)
+    distortion_fields: Vec<(u32, Option<u32>, f32, f32)>,
 }
 
 fn layer_solid(l: u8) -> bool {
@@ -288,6 +296,9 @@ impl Game {
             dead: false,
             dead_timer: 0.0,
             hurt_alpha: 0.0,
+            underwater_overlay: None,
+            vignette: None,
+            screen_noise: None,
             has_revolver: false,
             enemies,
             projectiles: Vec::new(),
@@ -327,7 +338,15 @@ impl Game {
             anim,
             vm_revolver: def.scripts.iter().find(|s| s.class == "Revolver" && s.file.is_some()).map(|s| s.node),
             vm_rigs: (None, None),
+            distortion_fields: Vec::new(),
         };
+        g.distortion_fields = (0..def.scripts.len() as u32)
+            .filter(|&i| def.scripts[i as usize].class == "ScreenDistortionField")
+            .map(|i| {
+                let s = &def.scripts[i as usize];
+                (i, g.node_colliders(s.node).first().copied(), s.data.get("distance").f32(), s.data.get("strength").f32())
+            })
+            .collect();
         // viewmodel animators by the parameters their scripts drive (Revolver.Shoot, Punch.PunchStart)
         let vm_rig = |param: &str| {
             (0..def.animators.len() as u32).find_map(|a| {
@@ -439,6 +458,36 @@ impl Game {
             }
             self.flush_events();
         }
+    }
+
+    /// ScreenDistortionField.Update + ScreenDistortionController.Update: enabled fields are in the
+    /// controller's list (WICKED on while it is non-empty); `_RandomNoiseStrength` is the strongest
+    /// field's ((distance - d) / distance)^2 * strength, d the player's distance to its collider.
+    fn screen_distortion(&mut self) {
+        let p = self.s.player.pos;
+        let mut on = false;
+        let mut noise = 0f32;
+        for &(sc, col, distance, strength) in &self.distortion_fields {
+            if !self.script_live(sc) {
+                continue;
+            }
+            on = true;
+            let node = self.def.scripts[sc as usize].node;
+            // shapes are in load pose; a field on an enemy (the Wicked's RadiationField) moves with it
+            let lp = match self.node_mover[node as usize] {
+                Some(m) => self.mover_delta(m).inverse().transform_point3(p),
+                None => p,
+            };
+            let b = match col {
+                Some(c) => shape_closest_point(&self.def.colliders[c as usize].shape, lp),
+                None => self.def.nodes[node as usize].world0.w_axis.truncate(),
+            };
+            let d = lp.distance(b);
+            if d < distance {
+                noise = noise.max(((distance - d) / distance).powi(2) * strength);
+            }
+        }
+        self.s.screen_noise = on.then_some(noise);
     }
 
     fn script_live(&self, sc: u32) -> bool {
@@ -1857,6 +1906,7 @@ impl Game {
         if self.s.hurt_alpha > 0.0 {
             self.s.hurt_alpha -= dt;
         }
+        self.screen_distortion();
         if self.s.dead {
             self.s.dead_timer += dt;
             if self.s.dead_timer > 1.5 {
@@ -1979,4 +2029,24 @@ fn seg_seg_dist(a: Vec3, b: Vec3, c: Vec3, d: Vec3) -> f32 {
 /// CameraController's view rotation for (rotationY, rotationX) in degrees (Bevy space, -Z forward).
 fn view_quat(yaw: f32, pitch: f32) -> Quat {
     Quat::from_rotation_y(-yaw.to_radians()) * Quat::from_rotation_x(pitch.to_radians())
+}
+
+/// Collider.ClosestPoint for a collider definition (load pose): the point itself when inside.
+fn shape_closest_point(shape: &ShapeDef, p: Vec3) -> Vec3 {
+    match shape {
+        ShapeDef::Box { center, half, rot } => BoxCollider { center: *center, half: *half, rot: *rot, slippery: false }.closest_point(p),
+        ShapeDef::Sphere { center, radius } => *center + (p - *center).clamp_length_max(*radius),
+        ShapeDef::Capsule { a, b, radius } => {
+            let ab = *b - *a;
+            let t = ((p - *a).dot(ab) / ab.length_squared().max(1e-12)).clamp(0.0, 1.0);
+            let c = *a + ab * t;
+            c + (p - c).clamp_length_max(*radius)
+        }
+        // Unity only answers for convex meshes; the nearest triangle stands in
+        ShapeDef::Mesh(tris) => tris
+            .iter()
+            .map(|t| Shape::Tri(Triangle::new(t[0], t[1], t[2])).closest_point(p))
+            .min_by(|x, y| x.distance_squared(p).total_cmp(&y.distance_squared(p)))
+            .unwrap_or(p),
+    }
 }
