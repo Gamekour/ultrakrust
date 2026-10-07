@@ -14,9 +14,24 @@ pub fn enabled() -> bool {
 }
 
 /// Runs after `update_hud`: forces the hint on/off and requests captures.
-pub fn run(mut commands: Commands, mut hint: Single<&mut Text, With<super::HintText>>, mut n: Local<u32>) {
+pub fn run(
+    mut commands: Commands,
+    mut hint: Single<&mut Text, With<super::HintText>>,
+    sim: Res<super::Sim>,
+    mut n: Local<u32>,
+    mut since_load: Local<(u64, u32)>,
+) {
     *n += 1;
     let f = *n;
+    // after a level change: is the new level on screen?
+    if since_load.0 != sim.generation {
+        *since_load = (sim.generation, 0);
+    }
+    since_load.1 += 1;
+    if sim.generation > 1 && matches!(since_load.1, 30 | 120 | 240 | 600) {
+        let label = format!("generation{} +{} ({})", sim.generation, since_load.1, sim.title);
+        commands.spawn(Screenshot::primary_window()).observe(move |cap: On<ScreenshotCaptured>| report(&label, &cap.image));
+    }
     if (PROBE_ON..PROBE_OFF).contains(&f) {
         hint.0 = PROBE_TEXT.into();
     }

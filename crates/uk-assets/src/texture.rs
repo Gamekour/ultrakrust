@@ -17,6 +17,8 @@ pub struct TextureData {
     pub filter: i64,
     /// TextureWrapMode: 0 repeat, 1 clamp.
     pub wrap: i64,
+    /// Images stacked in `rgba`: 1, or 6 cube faces (+X -X +Y -Y +Z -Z) for a Cubemap.
+    pub layers: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -49,8 +51,28 @@ pub fn decode_texture(db: &mut AssetDb, v: &Value) -> Result<TextureData> {
     } else {
         inline
     };
+    // a Cubemap stores its faces one after another, each with its full mip chain
+    let layers = v.get("m_ImageCount").i64().max(1) as usize;
+    let stride = data.len() / layers;
     let n = w * h;
-    let mut rgba = vec![255u8; n * 4];
+    let mut rgba = vec![255u8; n * 4 * layers];
+    for (l, out) in rgba.chunks_exact_mut(n * 4).enumerate() {
+        decode_image(v, fmt, &data[l * stride..(l + 1) * stride], w, h, out)?;
+    }
+    let ts = v.get("m_TextureSettings");
+    Ok(TextureData {
+        name: v.get("m_Name").str().to_string(),
+        width: w as u32,
+        height: h as u32,
+        rgba,
+        filter: ts.get("m_FilterMode").i64(),
+        wrap: ts.get("m_WrapU").i64(),
+        layers: layers as u32,
+    })
+}
+
+fn decode_image(v: &Value, fmt: i64, data: &[u8], w: usize, h: usize, rgba: &mut [u8]) -> Result<()> {
+    let n = w * h;
     match fmt {
         // Alpha8
         1 => {
@@ -83,19 +105,11 @@ pub fn decode_texture(db: &mut AssetDb, v: &Value) -> Result<TextureData> {
                 rgba[i * 4..i * 4 + 4].copy_from_slice(&[p[2], p[1], p[0], p[3]]);
             }
         }
-        10 => decode_bc(data, w, h, &mut rgba, false),
-        12 => decode_bc(data, w, h, &mut rgba, true),
+        10 => decode_bc(data, w, h, rgba, false),
+        12 => decode_bc(data, w, h, rgba, true),
         f => return Err(Error(format!("{}: texture format {f} not supported", v.get("m_Name").str()))),
     }
-    let ts = v.get("m_TextureSettings");
-    Ok(TextureData {
-        name: v.get("m_Name").str().to_string(),
-        width: w as u32,
-        height: h as u32,
-        rgba,
-        filter: ts.get("m_FilterMode").i64(),
-        wrap: ts.get("m_WrapU").i64(),
-    })
+    Ok(())
 }
 
 fn rgb565(c: u16) -> [u8; 3] {

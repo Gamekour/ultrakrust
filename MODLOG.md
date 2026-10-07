@@ -193,3 +193,26 @@ CPU-skinned enemies, 3,393 colliders/569 triggers, 11,758 MonoBehaviours with ty
   debug corner) while forcing the hint on for frames 160-199. 0-1: hint ink 0 -> 2445 -> 0, corner ink stable, lit
   fraction 0.72 by frame 120 with no resize (frames 3-90 dark/flickering while pipelines compile).
   Harness: `pass.render.<level>.hint_clears`, `render.<level>.present_lit_frac`.
+
+## Skybox, --all-weapons, exit elevator -> next level, R in the elevator (2026-10-06)
+- **Skybox:** `RenderSettings.m_SkyboxMaterial` is drawn on a sphere around the camera, first, depth test off, when the
+  player's Main Camera (culling mask 0x8fd2dfd7) clears to skybox (flags 1); otherwise the clear color is that camera's
+  `m_BackGroundColor`. Cubemaps decode all 6 faces (`m_ImageCount`); `_*_HDR` defaults to (1,1,0,0); Procedural skies take
+  `_WorldSpaceLightPos0`/`_LightColor0` from the brightest active directional light. 4-2 was black: its sky is a cubemap.
+  Probe: `UNITY_SKY_ONLY=1` draws the sky alone; `examples/skybox.rs` dumps every level's sky material.
+- **`--all-weapons`:** unlocks every ported weapon (Revolver only so far), rebased into the level-start snapshot so restarts keep it,
+  carried through level changes.
+- **Exit:** `FinalPit` (levelOver, centering, view turn, SendInfo -> results) and `TeleportFinalPit` (+20 forward +20 up into the
+  second pit's shaft, which closed 0-1's endless fall) are Full. The FinalRank tally runs a line per 0.5 s (Fire1 skips);
+  Fire1 once complete in the second pit loads `targetLevelName` (SceneHelper.LoadScene), with a LOADING card and the Unity
+  renderer rebuilt per generation. Style rank is 0 (no style meter yet).
+- **R in the elevator:** `respawn` is a no-op once `level_complete` (NewMovement.levelOver), in the sim and the frontend.
+- Harness: `0-1.exit_ignores_restart`, `0-1.exit_to_next_level` (results 0.248 s, second pit 1.448 s, axis dist 0, view err 0).
+  Frontend probe: `UK_PROBE_EXIT=1` drops into the live first pit, `UK_PROBE_CONTINUE=1` holds Fire1; `UK_PROBE_PRESENT`
+  samples `generationN +30/+120/+240/+600` after a level change. 0-1 -> 0-2 lands at mean_lum 0.214 / lit 0.98 by +600
+  (direct 0-2 load: 0.227 / 1.0).
+- Sky sweep (`UNITY_SKY_ONLY=1 UK_PROBE_PRESENT=1`, all 43 campaign scenes): every level with a skybox material draws it;
+  levels whose Main Camera clears to solid color (0-1, 3-2, 4-4, 5-1, 5-4, p-1) or have no sky material stay their clear color.
+  Dark results trace to the data: 0-5 "BlackNoFog", 7-3 night texture (mean 1.6/255), 7-2 tint 0.113, and 1-3/1-4 where
+  no level sets `m_Sun` and the brightest active directional light (Unity's fallback) is below the horizon
+  (`examples/suns.rs`). 4-2 GreedSky2: mean_lum 0.60, lit 1.0 (was black).

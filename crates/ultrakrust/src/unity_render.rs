@@ -30,8 +30,9 @@ use uk_assets::shader::{MaterialProps, Params, ShaderAsset};
 #[derive(Component, Clone, Copy, Default, bevy::render::extract_component::ExtractComponent)]
 pub struct UnityCamera;
 
-/// The player's Main Camera (FirstRoom/Player/Main Camera in every level): clip planes and clear.
-/// Clear flags 2 = solid color, background black; skies are level geometry.
+/// The player's Main Camera (FirstRoom/Player/Main Camera in every level): clip planes, and the
+/// clear color when a scene has no camera to read (clear flags 1 = skybox: RenderSettings' skybox
+/// material, else the camera's background color).
 pub const NEAR: f32 = 0.1;
 pub const FAR: f32 = 4000.0;
 pub const CLEAR: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
@@ -44,6 +45,8 @@ pub struct TexCpu {
     pub filter: i64,
     /// Unity TextureWrapMode: 0 repeat, 1 clamp, 2 mirror, 3 mirror once.
     pub wrap: i64,
+    /// 1, or 6 for a cubemap (faces +X -X +Y -Y +Z -Z).
+    pub layers: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,6 +109,8 @@ pub struct Draw {
     pub skin: Option<Arc<SkinDraw>>,
     /// Viewmodel layer (13): drawn by the HUD Camera after a depth clear.
     pub hud: bool,
+    /// RenderSettings' skybox: a sphere around the camera, drawn first behind everything.
+    pub sky: bool,
 }
 
 pub struct SkinDraw {
@@ -409,8 +414,17 @@ pub fn build(
     let mut draws = Vec::new();
     let mut skipped: HashMap<String, usize> = HashMap::new();
     let mut chosen: HashMap<(String, i64), Option<uk_assets::shader::SubProgram>> = HashMap::new();
-    for r in &def.renderers {
-        if r.batch.indices.is_empty() || skip_node(r.node) {
+    // Unity draws the skybox material on its own sphere around the camera
+    let sky_def = def.render_settings.skybox.clone().filter(|_| def.render_settings.camera_clear.is_none_or(|c| c.0 == 1)).map(|m| uk_assets::scenedef::RenderDef {
+        node: 0,
+        material: Some(m),
+        batch: sky_sphere(),
+        enabled: true,
+        skin: None,
+    });
+    for (ri, r) in def.renderers.iter().chain(sky_def.iter()).enumerate() {
+        let sky = ri == def.renderers.len();
+        if r.batch.indices.is_empty() || (!sky && skip_node(r.node)) {
             continue;
         }
         let Some(key) = &r.material else { continue };
@@ -504,23 +518,28 @@ pub fn build(
         // textures the variant samples
         let mut tex = HashMap::new();
         for s in var.groups[0].iter() {
-            let Slot::Texture { name, dim: TexDim::D2, .. } = s else { continue };
+            let Slot::Texture { name, dim, .. } = s else { continue };
+            let layers = match dim {
+                TexDim::D2 => 1,
+                TexDim::Cube => 6,
+                TexDim::D3 => continue,
+            };
             let Some(env) = mat.textures.get(name) else { continue };
             let f = db.file(&key.file).ok();
             let tid = f.and_then(|f| db.resolve(&f, env.texture).ok().flatten()).and_then(|(tf, tid)| {
                 *texture_ids.entry((tf.name.clone(), tid)).or_insert_with(|| {
                     let v = tf.read_id(tid).ok()?;
                     let t = uk_assets::texture::decode_texture(db, &v).ok()?;
-                    textures.push(TexCpu { width: t.width, height: t.height, rgba: t.rgba, filter: t.filter, wrap: t.wrap });
+                    textures.push(TexCpu { width: t.width, height: t.height, rgba: t.rgba, filter: t.filter, wrap: t.wrap, layers: t.layers });
                     Some(textures.len() as u32 - 1)
                 })
             });
-            if let Some(t) = tid {
+            if let Some(t) = tid.filter(|&t| textures[t as usize].layers == layers) {
                 tex.insert(name.clone(), t);
             }
         }
         let st = &pass.state;
-        let state = DrawState {
+        let mut state = DrawState {
             cull: state_u8(&st.cull, &mat),
             zwrite: st.zwrite.resolve(&mat.floats) >= 0.5,
             ztest: state_u8(&st.ztest, &mat),
@@ -531,6 +550,12 @@ pub fn build(
             op: state_u8(&st.blend_op, &mat),
             mask: state_u8(&st.color_mask, &mat),
         };
+        if sky {
+            // behind everything: drawn first, never tested or written (Unity's skybox sits at the far plane)
+            state.ztest = 8;
+            state.zwrite = false;
+            state.cull = 0;
+        }
         let skin = r.skin.as_ref().map(|def| {
             let (mut off, mut pos, mut nrm) = (0usize, None, None);
             for &(_, ch, n) in &var.inputs {
@@ -549,7 +574,9 @@ pub fn build(
             lo = lo.min(p);
             hi = hi.max(p);
         }
-        let queue = if mat.render_queue >= 0 {
+        let queue = if sky {
+            0
+        } else if mat.render_queue >= 0 {
             mat.render_queue
         } else if state.src != 1 || state.dst != 0 {
             3000
@@ -570,7 +597,8 @@ pub fn build(
             // animated limbs leave the bind-pose bounds
             radius: (hi - lo).length() * if skin.is_some() { 1.0 } else { 0.5 } + if skin.is_some() { 1.0 } else { 0.0 },
             skin,
-            hud: def.nodes[r.node as usize].layer == uk_assets::scenedef::VIEWMODEL_LAYER,
+            hud: !sky && def.nodes[r.node as usize].layer == uk_assets::scenedef::VIEWMODEL_LAYER,
+            sky,
         });
     }
     // the final composite: GameController's PostProcessV2_Handler names the material and dither texture
@@ -587,7 +615,7 @@ pub fn build(
         variants.push(var);
         let dither = db.resolve(&f, h.data.get("ditherTexture").pptr()).ok().flatten().and_then(|(tf, tid)| {
             let t = uk_assets::texture::decode_texture(db, &tf.read_id(tid).ok()?).ok()?;
-            textures.push(TexCpu { width: t.width, height: t.height, rgba: t.rgba, filter: t.filter, wrap: t.wrap });
+            textures.push(TexCpu { width: t.width, height: t.height, rgba: t.rgba, filter: t.filter, wrap: t.wrap, layers: t.layers });
             Some(textures.len() as u32 - 1)
         });
         Some(PostDef { variant: variants.len() as u32 - 1, material: Arc::new(props), dither })
@@ -602,8 +630,10 @@ pub fn build(
     let mut sk: Vec<_> = skipped.into_iter().collect();
     sk.sort_by(|a, b| b.1.cmp(&a.1));
     let summary = format!(
-        "unity shaders: post-process {}, {} variants, {}/{} renderers drawn, {} textures, {} lights; skipped: {:?}",
+        "unity shaders: post-process {}, sky {} (camera {:?}), {} variants, {}/{} renderers drawn, {} textures, {} lights; skipped: {:?}",
         post.as_ref().map_or("missing".to_string(), |p| format!("{} dither {:?}", variants[p.variant as usize].label, p.dither.map(|t| (textures[t as usize].width, textures[t as usize].height)))),
+        draws.iter().find(|d| d.sky).map_or("none".to_string(), |d| format!("{} {:?} textures {:?}", variants[d.variant as usize].label, d.material.name, d.textures.values().map(|&t| (textures[t as usize].width, textures[t as usize].layers)).collect::<Vec<_>>())),
+        def.render_settings.camera_clear,
         variants.len(),
         draws.len(),
         total,
@@ -619,13 +649,40 @@ pub fn build(
         lights,
         fog: (rs.fog, rs.fog_color, rs.fog_start, rs.fog_end),
         ambient: rs.ambient_sky,
-        clear: CLEAR,
+        clear: def.render_settings.camera_clear.map_or(CLEAR, |(_, c)| [c[0], c[1], c[2], 1.0]),
         composite_shader: shaders.add(Shader::from_wgsl(COMPOSITE_WGSL, "unity/composite.wgsl")),
         post,
         // the HUD Camera component: fov 90, culling mask layer 13, depth-only clear
         hud_cam: def.find("HUD Camera").map(|h| (def.nodes[h as usize].world0, 90.0)),
     };
     (scene, summary)
+}
+
+/// The skybox mesh: a UV sphere (sky shaders take the view ray from the vertex position; the
+/// procedural sky is evaluated per vertex, so it needs Unity's fine tessellation).
+fn sky_sphere() -> uk_assets::scene::Batch {
+    let (seg, rings) = (64u32, 32u32);
+    let mut b = uk_assets::scene::Batch::default();
+    for j in 0..=rings {
+        let th = std::f32::consts::PI * j as f32 / rings as f32;
+        for i in 0..=seg {
+            let ph = std::f32::consts::TAU * i as f32 / seg as f32;
+            let d = [th.sin() * ph.cos(), th.cos(), th.sin() * ph.sin()];
+            b.positions.push(d.map(|c| c * 10.0));
+            b.normals.push(d.map(|c| -c));
+            b.uvs.push([i as f32 / seg as f32, 1.0 - j as f32 / rings as f32]);
+            b.colors.push([1.0; 4]);
+            b.src.push(b.src.len() as u32);
+        }
+    }
+    for j in 0..rings {
+        for i in 0..seg {
+            let a = j * (seg + 1) + i;
+            let c = a + seg + 1;
+            b.indices.extend_from_slice(&[a, c, a + 1, a + 1, c, c + 1]);
+        }
+    }
+    b
 }
 
 /// Re-skins every skinned draw at the scene's rest pose and returns (draws checked, largest
@@ -653,7 +710,7 @@ pub fn skin_rest_error(game: &uk_game::Game, scene: &SceneData) -> (usize, f32) 
 /// Per-frame state from the game: what is visible, where movers have moved things, lights.
 pub fn frame(game: &uk_game::Game, scene: &SceneData, time: f32) -> UnityFrame {
     let m = Mat4::from_scale(Vec3::new(1.0, 1.0, -1.0));
-    let visible: Vec<bool> = scene.draws.iter().map(|d| d.enabled && game.active(d.node)).collect();
+    let visible: Vec<bool> = scene.draws.iter().map(|d| d.sky || (d.enabled && game.active(d.node))).collect();
     let object_to_world = scene
         .draws
         .iter()
@@ -879,7 +936,7 @@ fn sampler_for(dev: &RenderDevice, t: Option<&TexCpu>) -> Sampler {
 fn upload_texture(dev: &RenderDevice, queue: &RenderQueue, t: &TexCpu) -> TextureView {
     let tex = dev.create_texture(&TextureDescriptor {
         label: Some("unity texture"),
-        size: Extent3d { width: t.width.max(1), height: t.height.max(1), depth_or_array_layers: 1 },
+        size: Extent3d { width: t.width.max(1), height: t.height.max(1), depth_or_array_layers: t.layers },
         mip_level_count: 1,
         sample_count: 1,
         dimension: TextureDimension::D2,
@@ -891,9 +948,9 @@ fn upload_texture(dev: &RenderDevice, queue: &RenderQueue, t: &TexCpu) -> Textur
         tex.as_image_copy(),
         &t.rgba,
         TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(t.width * 4), rows_per_image: Some(t.height) },
-        Extent3d { width: t.width, height: t.height, depth_or_array_layers: 1 },
+        Extent3d { width: t.width, height: t.height, depth_or_array_layers: t.layers },
     );
-    tex.create_view(&TextureViewDescriptor::default())
+    tex.create_view(&TextureViewDescriptor { dimension: Some(if t.layers == 6 { TextureViewDimension::Cube } else { TextureViewDimension::D2 }), ..default() })
 }
 
 fn solid_view(dev: &RenderDevice, queue: &RenderQueue, rgba: [u8; 4], dim: TexDim) -> TextureView {
@@ -1021,11 +1078,25 @@ fn light_block(scene: &SceneData, frame: &UnityFrame, picked: &[usize], v: Mat4)
     out
 }
 
+/// RenderSettings' sun when unset: the brightest directional light that is on, as (direction
+/// towards the light, color x intensity), Unity space.
+fn sun(scene: &SceneData, frame: &UnityFrame) -> Option<(Vec3, [f32; 4])> {
+    let lum = |l: &LightCpu| (l.color[0] * 0.3 + l.color[1] * 0.59 + l.color[2] * 0.11) * l.intensity;
+    let (i, l) = scene
+        .lights
+        .iter()
+        .enumerate()
+        .filter(|(i, l)| l.kind == 1 && frame.lights.get(*i).is_some_and(|f| f.2))
+        .max_by(|a, b| lum(a.1).total_cmp(&lum(b.1)))?;
+    let c = l.color.map(|c| c * l.intensity);
+    Some((-frame.lights[i].1, [c[0], c[1], c[2], 1.0]))
+}
+
 /// Fills one constant buffer from built-ins and material properties.
 fn fill_cb(out: &mut [u8], cb: &uk_assets::shader::ConstantBuffer, scene: &SceneData, frame: &UnityFrame, di: usize, ctx: &FrameCtx, picked: &[usize]) {
     let d = &scene.draws[di];
     out.fill(0);
-    let o2w = frame.object_to_world.get(di).copied().unwrap_or(Mat4::IDENTITY);
+    let o2w = if d.sky { Mat4::from_translation(ctx.cam_pos) } else { frame.object_to_world.get(di).copied().unwrap_or(Mat4::IDENTITY) };
     let mut lights: Option<[[[f32; 4]; 8]; 4]> = None;
     for p in &cb.params {
         let at = p.offset as usize;
@@ -1083,6 +1154,12 @@ fn fill_cb(out: &mut [u8], cb: &uk_assets::shader::ConstantBuffer, scene: &Scene
             "unity_FogStart" => [ctx.fog.2, 0.0, 0.0, 0.0],
             "unity_FogEnd" => [ctx.fog.3, 0.0, 0.0, 0.0],
             "glstate_lightmodel_ambient" => ctx.ambient,
+            // the skybox's sun (Procedural): the brightest directional light that is on
+            "_WorldSpaceLightPos0" | "_LightColor0" if d.sky => match sun(scene, frame) {
+                Some((_, col)) if n == "_LightColor0" => col,
+                Some((dir, _)) => [dir.x, dir.y, dir.z, 0.0],
+                None => [0.0; 4],
+            },
             "_PortalClipPlane" | "_WorldSpaceLightPos0" | "_LightColor0" => [0.0; 4],
             // global options at their defaults (PrefsManager: vertexWarping 0, textureWarping 0)
             "_VertexWarping" | "_TextureWarping" | "_HeightFog" => [0.0; 4],
@@ -1097,6 +1174,9 @@ fn fill_cb(out: &mut [u8], cb: &uk_assets::shader::ConstantBuffer, scene: &Scene
                         Some(tx) => [1.0 / tx.width as f32, 1.0 / tx.height as f32, tx.width as f32, tx.height as f32],
                         None => [1.0, 1.0, 1.0, 1.0],
                     }
+                } else if n.ends_with("_HDR") && d.material.vector(n).is_none() {
+                    // the texture's HDR decode values; LDR textures decode as rgb * 1
+                    [1.0, 1.0, 0.0, 0.0]
                 } else {
                     d.material.vector(n).unwrap_or(if n.ends_with("_ST") { [1.0, 1.0, 0.0, 0.0] } else { [0.0; 4] })
                 }
@@ -1131,6 +1211,9 @@ fn prepare(
     if gpu.generation != scene.generation {
         gpu.generation = scene.generation;
         gpu.pipelines.clear();
+        // per-draw caches belong to the previous scene
+        gpu.light_pick.clear();
+        gpu.in_view.clear();
         gpu.layouts = scene
             .variants
             .iter()
@@ -1202,7 +1285,7 @@ fn prepare(
                 match s {
                     Slot::Texture { binding, dim, name } => {
                         let view = match dim {
-                            TexDim::Cube => &black_cube,
+                            TexDim::Cube => d.textures.get(name).map(|&t| &tex_views[t as usize]).unwrap_or(&black_cube),
                             TexDim::D3 => &black_3d,
                             TexDim::D2 => d.textures.get(name).map(|&t| &tex_views[t as usize]).unwrap_or(&white),
                         };
@@ -1499,6 +1582,7 @@ fn prepare(
         .iter()
         .map(|p| *p / p.truncate().length().max(1e-6))
         .collect();
+    let sky_only = std::env::var_os("UNITY_SKY_ONLY").is_some();
     let mut in_view = std::mem::take(&mut gpu.in_view);
     in_view.clear();
     in_view.extend(scene.draws.iter().enumerate().map(|(di, d)| {
@@ -1507,6 +1591,13 @@ fn prepare(
         }
         if d.hud {
             return hud_ctx.is_some();
+        }
+        if d.sky {
+            return true;
+        }
+        // `UNITY_SKY_ONLY`: the skybox alone, so frame stats measure what the sky draws
+        if sky_only {
+            return false;
         }
         let c = frame.object_to_world.get(di).map_or(d.center, |o| o.transform_point3(d.center));
         planes.iter().all(|p| p.truncate().dot(c) + p.w >= -d.radius)

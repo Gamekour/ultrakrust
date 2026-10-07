@@ -82,8 +82,23 @@ pub struct State {
     pub enemies: Vec<Enemy>,
     pub projectiles: Vec<Projectile>,
     pub messages: Vec<Message>,
+    /// NewMovement.levelOver: a FinalPit was entered. No damage, death or respawn from here on.
     pub level_complete: bool,
+    /// StatsManager.SendInfo: the results (FinalRank) are up.
+    pub results_shown: bool,
+    /// FinalRank.reachedSecondPit: the results may continue to `next_level`.
+    pub reached_second_pit: bool,
+    /// FinalRank.targetLevelName (scene name, e.g. "Level 0-2").
+    pub next_level: Option<String>,
+    /// FinalRank.RanklessNextLevel: a rankless second pit loads `next_level` with no results.
+    pub rankless_continue: bool,
+    /// A FinalPit is turning the view (CameraController rotationY / rotationX, degrees).
+    pub forced_view: Option<(f32, f32)>,
+    /// The camera's pitch (rotationX), kept in step by the frontend like `player.yaw_deg`.
+    pub view_pitch: f32,
     pub kills: u32,
+    /// StatsManager.restarts: checkpoint restarts (they cost rank).
+    pub restarts: u32,
     pub checkpoint_pos: Option<Vec3>,
     pub checkpoint_yaw: f32,
     pub anim: Vec<crate::anim::AnimatorState>,
@@ -275,7 +290,14 @@ impl Game {
             projectiles: Vec::new(),
             messages: Vec::new(),
             level_complete: false,
+            results_shown: false,
+            reached_second_pit: false,
+            next_level: None,
+            rankless_continue: false,
+            forced_view: None,
+            view_pitch: 0.0,
             kills: 0,
+            restarts: 0,
             checkpoint_pos: None,
             checkpoint_yaw: 0.0,
             anim: anim_states,
@@ -682,23 +704,144 @@ impl Game {
                     (Script::Door(_), "Unlock") => self.door_unlock(s),
                     (Script::FinalDoor(_), "Open") => self.final_door_open(s),
                     (Script::FinalDoor(_), "OpenDoors") => self.final_door_open_doors(s),
-                    (_, "AbruptChangeLevel") => self.complete_level(),
+                    (_, "AbruptChangeLevel") => self.abrupt_change_level(&c.string_arg),
                     _ => {
                         self.unknown_calls.insert(format!("{}.{}", self.def.scripts[s as usize].class, m));
                     }
                 }
             }
-            (_, "AbruptChangeLevel") => self.complete_level(),
+            (_, "AbruptChangeLevel") => self.abrupt_change_level(&c.string_arg),
             (t, m) => {
                 self.unknown_calls.insert(format!("{t:?}.{m}"));
             }
         }
     }
 
-    fn complete_level(&mut self) {
+    /// StatsManager.SendInfo's ranks for `seconds`: (time rank, kills rank, style rank, total) as
+    /// D/C/B/A/S letters (total also P), from the level's StatsManager thresholds. Style points are
+    /// not ported (0), so style is always D.
+    pub fn final_ranks(&self, seconds: f32) -> (char, char, char, char) {
+        let sm = self.def.scripts.iter().find(|s| s.class == "StatsManager");
+        let ranks = |f: &str| -> Vec<i64> { sm.map(|s| s.data.get(f).array().iter().map(|v| v.i64()).collect()).unwrap_or_default() };
+        let mut score = 0i32;
+        let mut get = |r: &[i64], v: f32, reverse: bool| {
+            let n = r.iter().take_while(|&&t| if reverse { v <= t as f32 } else { v >= t as f32 }).count();
+            score += if n >= r.len() { 4 } else { n as i32 };
+            if n >= r.len() { 'S' } else { ['D', 'C', 'B', 'A'][n] }
+        };
+        let time = get(&ranks("timeRanks"), seconds, true);
+        let kills = get(&ranks("killRanks"), self.s.kills as f32, false);
+        let style = get(&ranks("styleRanks"), 0.0, false);
+        let score = (score - self.s.restarts as i32).max(0);
+        let total = if score == 12 {
+            'P'
+        } else {
+            match (score as f32 / 3.0).round() as i32 {
+                1 => 'C',
+                2 => 'B',
+                3 => 'A',
+                4..=6 => 'S',
+                _ => 'D',
+            }
+        };
+        (time, kills, style, total)
+    }
+
+    /// AbruptLevelChanger.AbruptChangeLevel: SceneHelper.LoadScene(levelname), no results.
+    fn abrupt_change_level(&mut self, level: &str) {
+        self.s.next_level = Some(level.to_string());
+        self.s.rankless_continue = true;
         if !self.s.level_complete {
             self.s.level_complete = true;
             self.events.push(GameEvent::LevelComplete);
+        }
+    }
+
+    /// FinalPit.OnTriggerEnter: the level is over (NewMovement.activated = false, levelOver),
+    /// horizontal speed dropped, death zones off, SendInfo in 5 s.
+    fn final_pit_enter(&mut self, sc: u32) {
+        if self.s.dead || self.s.hp <= 0 {
+            return;
+        }
+        let view = view_quat(self.s.player.yaw_deg, self.s.view_pitch);
+        let Script::FinalPit(p) = &mut self.s.scripts[sc as usize] else { return };
+        p.entered = true;
+        p.view = view;
+        if !p.fake_end {
+            p.send_timer = 5.0;
+        }
+        let pl = &mut self.s.player;
+        pl.activated = false;
+        if pl.sliding {
+            pl.stop_slide();
+        }
+        pl.vel = Vec3::new(0.0, pl.vel.y, 0.0);
+        for s in self.s.scripts.iter_mut() {
+            if let Script::DeathZone(dz) = s {
+                dz.disabled = true;
+            }
+        }
+        if !self.s.level_complete {
+            self.s.level_complete = true;
+            self.events.push(GameEvent::LevelComplete);
+        }
+    }
+
+    /// FinalPit.OnTriggerStay (per physics step) and its SendInfo invoke: pulls the player to the
+    /// pit's axis, turns the view to the pit's rotation, then sends the results.
+    fn final_pits_fixed(&mut self) {
+        let dt = uk_core::consts::FIXED_DT;
+        for sc in 0..self.s.scripts.len() {
+            let Script::FinalPit(p) = &mut self.s.scripts[sc] else { continue };
+            if !p.entered {
+                continue;
+            }
+            let mut send = false;
+            if !p.info_sent && !p.fake_end {
+                p.send_timer -= dt;
+                send = p.send_timer <= 0.0;
+            }
+            let node = self.def.scripts[sc].node;
+            let inside = self.s.inside.iter().any(|&ci| self.def.colliders[ci as usize].node == node);
+            if inside && self.s.hp > 0 {
+                let (_, rot, pos) = self.def.nodes[node as usize].world0.to_scale_rotation_translation();
+                let pl = &mut self.s.player;
+                let axis = Vec3::new(pos.x, pl.pos.y, pos.z);
+                if pl.pos.x != axis.x || pl.pos.z != axis.z {
+                    let d = pl.pos.distance(axis);
+                    let step = 1.0 + d * dt;
+                    pl.pos = if d <= step { axis } else { pl.pos + (axis - pl.pos) / d * step };
+                    pl.vel = Vec3::new(0.0, pl.vel.y, 0.0);
+                }
+                if !p.rotation_ready {
+                    let f = rot * Vec3::NEG_Z;
+                    let target = view_quat(f.x.atan2(-f.z).to_degrees(), f.y.clamp(-1.0, 1.0).asin().to_degrees());
+                    let angle = p.view.angle_between(target).to_degrees();
+                    let max = dt * 10.0 * (angle + 1.0);
+                    p.view = p.view.rotate_towards(target, max.to_radians());
+                    if angle < 0.01 {
+                        p.view = target;
+                        p.rotation_ready = true;
+                    }
+                    let f = p.view * Vec3::NEG_Z;
+                    self.s.forced_view = Some((f.x.atan2(-f.z).to_degrees(), f.y.clamp(-1.0, 1.0).asin().to_degrees()));
+                }
+                send |= p.rotation_ready && !p.info_sent && !p.fake_end;
+            }
+            if send && !p.info_sent {
+                p.info_sent = true;
+                let (rankless, second, target) = (p.rankless, p.second_pit, p.target_level.clone());
+                if !rankless {
+                    if !self.s.results_shown {
+                        self.s.next_level = Some(target);
+                    }
+                    self.s.reached_second_pit |= second;
+                    self.s.results_shown = true;
+                } else if second {
+                    self.s.next_level = Some(target);
+                    self.s.rankless_continue = true;
+                }
+            }
         }
     }
 
@@ -1340,6 +1483,15 @@ impl Game {
         self.run_uevent(&t.on_teleport, false);
     }
 
+    /// TeleportFinalPit.OnTriggerEnter: position += transform.forward * 20 + up * 20 (velocity kept),
+    /// which moves the fall from the first pit's shaft into the second pit's.
+    fn teleport_final_pit(&mut self, sc: u32) {
+        let node = self.def.scripts[sc as usize].node as usize;
+        let fwd = self.def.nodes[node].world0.transform_vector3(Vec3::NEG_Z).normalize_or_zero();
+        self.s.player.pos += fwd * 20.0 + Vec3::Y * 20.0;
+        self.s.player.prev_pos = self.s.player.pos;
+    }
+
     fn hud_message(&mut self, sc: u32, enter: bool) {
         let Script::HudMessage(h) = &mut self.s.scripts[sc as usize] else { return };
         if enter {
@@ -1519,8 +1671,9 @@ impl Game {
                 Script::CheckPoint(_) if enter => self.checkpoint_activate(sc),
                 Script::DeathZone(_) if enter => self.death_zone(sc),
                 Script::Teleport(_) if enter => self.teleport(sc),
+                Script::TeleportFinalPit if enter => self.teleport_final_pit(sc),
                 Script::PlayerActivator { .. } if enter => self.player_activator(sc),
-                Script::FinalPit if enter => self.complete_level(),
+                Script::FinalPit(_) if enter => self.final_pit_enter(sc),
                 Script::OobTargetSetter { .. } if enter => self.oob_target_setter(sc),
                 Script::HudMessage(_) => self.hud_message(sc, enter),
                 _ => {}
@@ -1598,8 +1751,16 @@ impl Game {
     }
 
     pub fn respawn(&mut self) {
+        // NewMovement.levelOver: nothing brings the player back once the level is finished
+        if self.s.level_complete {
+            return;
+        }
         let snap = self.checkpoint.clone().or_else(|| self.start.clone()).expect("start snapshot");
+        // StatsManager lives outside the checkpoint: kills carry over, a checkpoint restart counts
+        let (kills, restarts) = (self.s.kills, self.s.restarts + self.checkpoint.is_some() as u32);
         self.s = *snap;
+        self.s.kills = kills;
+        self.s.restarts = restarts;
         if let Some(p) = self.s.checkpoint_pos {
             self.s.player = Player::new(p);
             self.s.player.activated = true;
@@ -1666,7 +1827,7 @@ impl Game {
 
     /// Unity FixedUpdate + physics at 125 Hz.
     pub fn fixed_update(&mut self, input: &Input) {
-        if self.s.dead || self.s.level_complete {
+        if self.s.dead {
             return;
         }
         self.sync_world();
@@ -1676,6 +1837,7 @@ impl Game {
         self.world = world;
         self.update_triggers();
         self.update_contacts();
+        self.final_pits_fixed();
         for sc in 0..self.s.scripts.len() as u32 {
             if matches!(self.s.scripts[sc as usize], Script::Wave(_)) && self.script_live(sc) {
                 self.wave_fixed(sc);
@@ -1804,4 +1966,9 @@ fn seg_point_dist(a: Vec3, b: Vec3, p: Vec3) -> f32 {
 fn seg_seg_dist(a: Vec3, b: Vec3, c: Vec3, d: Vec3) -> f32 {
     // sample-based is plenty for triggers
     (0..=16).map(|i| seg_point_dist(c, d, a.lerp(b, i as f32 / 16.0))).fold(f32::MAX, f32::min)
+}
+
+/// CameraController's view rotation for (rotationY, rotationX) in degrees (Bevy space, -Z forward).
+fn view_quat(yaw: f32, pitch: f32) -> Quat {
+    Quat::from_rotation_y(-yaw.to_radians()) * Quat::from_rotation_x(pitch.to_radians())
 }

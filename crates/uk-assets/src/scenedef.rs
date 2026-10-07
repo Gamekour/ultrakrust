@@ -29,6 +29,7 @@ const CLASS_CAPSULE_COLLIDER: i32 = 136;
 const CLASS_RECT_TRANSFORM: i32 = 224;
 const CLASS_LIGHT: i32 = 108;
 const CLASS_RENDER_SETTINGS: i32 = 104;
+const CLASS_CAMERA: i32 = 20;
 const CLASS_ANIMATOR: i32 = 95;
 const CLASS_ANIMATOR_CONTROLLER: i32 = 91;
 const CLASS_ANIMATOR_OVERRIDE_CONTROLLER: i32 = 221;
@@ -148,6 +149,11 @@ pub struct RenderSettingsDef {
     pub ambient_equator: [f32; 4],
     pub ambient_ground: [f32; 4],
     pub ambient_intensity: f32,
+    /// `m_SkyboxMaterial` (None: the camera clears to its background color).
+    pub skybox: Option<MaterialKey>,
+    /// The player's Main Camera (culling mask 0x8fd2dfd7): clear flags (1 skybox, 2 solid color)
+    /// and background color.
+    pub camera_clear: Option<(i64, [f32; 4])>,
 }
 
 #[derive(Clone, Debug)]
@@ -427,7 +433,16 @@ pub fn load_scene(db: &mut AssetDb, bundle: &std::path::Path) -> Result<SceneDef
                     ambient_equator: col("m_AmbientEquatorColor"),
                     ambient_ground: col("m_AmbientGroundColor"),
                     ambient_intensity: v.get("m_AmbientIntensity").f32(),
+                    skybox: ld.material_key(v.get("m_SkyboxMaterial").pptr()),
+                    camera_clear: def.render_settings.camera_clear,
                 };
+            }
+            CLASS_CAMERA => {
+                let v = scene.read(o)?;
+                if v.get("m_Enabled").bool() && v.get("m_CullingMask").get("m_Bits").i64() as u32 == 0x8fd2dfd7 {
+                    let c = v.get("m_BackGroundColor");
+                    def.render_settings.camera_clear = Some((v.get("m_ClearFlags").i64(), [c.get("r").f32(), c.get("g").f32(), c.get("b").f32(), c.get("a").f32()]));
+                }
             }
             _ => {}
         }

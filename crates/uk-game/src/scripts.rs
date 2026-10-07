@@ -1,7 +1,7 @@
 //! Runtime state for the MonoBehaviours 0-1 needs, parsed from their serialized
 //! fields. Behaviour lives in `game.rs`; these are the data halves.
 
-use bevy_math::Vec3;
+use bevy_math::{Quat, Vec3};
 use uk_assets::scenedef::SceneDef;
 use uk_assets::serialized::Value;
 
@@ -27,6 +27,7 @@ pub struct Call {
     pub bool_arg: bool,
     pub float_arg: f32,
     pub int_arg: i64,
+    pub string_arg: String,
 }
 
 /// `UltrakillEvent`: object lists + UnityEvents.
@@ -64,6 +65,7 @@ pub fn parse_calls(def: &SceneDef, v: &Value) -> Vec<Call> {
                 bool_arg: a.get("m_BoolArgument").bool(),
                 float_arg: a.get("m_FloatArgument").f32(),
                 int_arg: a.get("m_IntArgument").i64(),
+                string_arg: a.get("m_StringArgument").str().to_string(),
             }
         })
         .collect()
@@ -259,9 +261,11 @@ pub enum Script {
     DeathZone(Box<DeathZone>),
     Teleport(Box<Teleport>),
     PlayerActivator { activated: bool, only_player: bool },
+    /// The first exit pit's shaft: drops the falling player into the second pit's shaft.
+    TeleportFinalPit,
     FinalDoor(FinalDoor),
     FinalDoorOpener { opened: bool, opening: bool, closed: bool },
-    FinalPit,
+    FinalPit(Box<FinalPit>),
     HudMessage(Box<HudMessage>),
     /// Index into `State::enemies`.
     Enemy(usize),
@@ -271,6 +275,25 @@ pub enum Script {
     /// OnLevelStart: `onStart` fires once when the level timer starts (the player is activated).
     OnLevelStart { on_start: UEvent, activated: bool },
     Other,
+}
+
+/// FinalPit: the exit pit. Entering ends the level (NewMovement.levelOver); the results go up
+/// once the view has turned to the pit's rotation (or after 5 s); the second, deeper pit lets
+/// FinalRank continue to `target_level`.
+#[derive(Clone, Debug, Default)]
+pub struct FinalPit {
+    pub rankless: bool,
+    pub second_pit: bool,
+    pub fake_end: bool,
+    /// Scene name, e.g. "Level 0-2".
+    pub target_level: String,
+    pub entered: bool,
+    pub rotation_ready: bool,
+    pub info_sent: bool,
+    /// Invoke("SendInfo", 5f) from OnTriggerEnter.
+    pub send_timer: f32,
+    /// currentWorldRotation: the view rotation being turned towards the pit's.
+    pub view: Quat,
 }
 
 pub fn parse(def: &SceneDef, idx: usize) -> Script {
@@ -388,6 +411,7 @@ pub fn parse(def: &SceneDef, idx: usize) -> Script {
             reset_speed: b("resetPlayerSpeed"),
             on_teleport: parse_uevent(def, v.get("onTeleportPlayer")),
         })),
+        "TeleportFinalPit" => Script::TeleportFinalPit,
         "PlayerActivator" => Script::PlayerActivator { activated: false, only_player: b("onlyActivatePlayer") },
         "FinalDoor" => Script::FinalDoor(FinalDoor {
             doors: scripts(def, v.get("doors")),
@@ -398,7 +422,13 @@ pub fn parse(def: &SceneDef, idx: usize) -> Script {
             about_to_open: false,
         }),
         "FinalDoorOpener" => Script::FinalDoorOpener { opened: false, opening: false, closed: false },
-        "FinalPit" => Script::FinalPit,
+        "FinalPit" => Script::FinalPit(Box::new(FinalPit {
+            rankless: b("rankless"),
+            second_pit: b("secondPit"),
+            fake_end: b("fakeEnd"),
+            target_level: v.get("targetLevelName").str().to_string(),
+            ..Default::default()
+        })),
         "HudMessage" => Script::HudMessage(Box::new(HudMessage {
             message: clean_rich_text(v.get("message").str()),
             deactivating: b("deactivating"),

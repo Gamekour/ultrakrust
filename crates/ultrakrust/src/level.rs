@@ -56,6 +56,7 @@ pub fn load(
     materials: &mut Assets<StandardMaterial>,
     images: &mut Assets<Image>,
     unity_shaders: Option<&mut Assets<bevy::shader::Shader>>,
+    generation: u64,
 ) -> Result<Loaded, String> {
     let t0 = std::time::Instant::now();
     let install = uk_assets::find_install().ok_or("ULTRAKILL install not found (set ULTRAKILL_DIR)")?;
@@ -73,7 +74,7 @@ pub fn load(
     let player = game.player_node;
     let unity = unity_shaders.map(|shaders| {
         let t = std::time::Instant::now();
-        let (scene, summary) = crate::unity_render::build(&mut db, &def, |n| def.nodes[n as usize].layer != scenedef::VIEWMODEL_LAYER && player.is_some_and(|p| def.is_descendant(n, p)), shaders, 1);
+        let (scene, summary) = crate::unity_render::build(&mut db, &def, |n| def.nodes[n as usize].layer != scenedef::VIEWMODEL_LAYER && player.is_some_and(|p| def.is_descendant(n, p)), shaders, generation);
         info!("{summary} ({:.2}s)", t.elapsed().as_secs_f32());
         scene
     });

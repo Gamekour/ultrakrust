@@ -10,6 +10,8 @@ the level data read from your install.
 **Milestone 2: real levels.** `ultrakrust` loads level 0-1 straight from your Steam install at
 runtime (geometry, textures, collision, spawn point) with a Rust reader for Unity's bundle format.
 `--level 1-1` picks another level, `--sandbox` opens the movement test map, `N` toggles noclip.
+`--all-weapons` starts with every ported weapon unlocked (currently the Revolver; kept across level changes).
+The exit elevator works as in ULTRAKILL: the results tally comes up, and **LMB** in the shaft below loads the next level.
 
 **Milestone 1: movement sandbox.** Walk, jump, dash, slide, slam, slam-jump, wall-jump (×3),
 wall cling, super slide jumps and the piercer revolver, on a test map built to exercise each of them.
@@ -54,7 +56,7 @@ cargo run --release -p uk-assets --example dump_level -- level0-1
 
 Controls (ULTRAKILL defaults): **WASD** move, **Space** jump, **Left Shift** dash,
 **Left Ctrl** slide (in the air: ground slam), **LMB** fire, **hold RMB** charge a piercing shot,
-**F** punch (also parries projectiles), **R** restart from checkpoint, **N** noclip, **F3** developer overlay, **T** camera tilt,
+**F** punch (also parries projectiles), **R** restart from checkpoint (ignored once the level is over), **N** noclip, **F3** developer overlay, **T** camera tilt,
 **[ ]** mouse sensitivity, **Esc** release the mouse. `--demo <dir>` plays a scripted run and saves screenshots.
 
 ## Faithfulness notes

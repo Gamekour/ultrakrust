@@ -357,17 +357,72 @@ fn boss_to_exit(def: &Arc<SceneDef>, r: &mut Report) {
     }
     r.info("play.0-1.boss_revolver_shots", shots as f64);
     idle(&mut g, 600, &mut t, true);
-    // 0-1 has an unused second pit ("Pit (2)") that stays inactive; use the live one.
-    let Some(pit) = def.scripts.iter().position(|s| s.class == "FinalPit" && g.active(s.node)) else {
-        r.pass("0-1.boss_to_exit", false, "no active FinalPit after the boss");
+    // the first pit (the one the hallway drops into); TeleportFinalPit moves the fall into "Pit (2)"
+    let first = |i: usize| matches!(&g.s.scripts[i], Script::FinalPit(p) if !p.second_pit);
+    let Some(pit) = (0..def.scripts.len()).find(|&i| def.scripts[i].class == "FinalPit" && g.active(def.scripts[i].node) && first(i)) else {
+        r.pass("0-1.boss_to_exit", false, "no active first FinalPit after the boss");
         return;
     };
-    if let Some(c) = shape_center(def, def.scripts[pit].node, false) {
-        teleport(&mut g, c);
-        idle(&mut g, 20, &mut t, true)
-    }
+    // enter off-axis, looking away, so the centering and the view turn have work to do
+    let Some(c) = shape_center(def, def.scripts[pit].node, false) else {
+        r.pass("0-1.boss_to_exit", false, "FinalPit has no collider");
+        return;
+    };
+    // just inside the top of the shaft, as if dropped from the room above
+    teleport(&mut g, c + Vec3::new(0.6, 55.0, -0.4));
+    g.s.player.yaw_deg += 120.0;
+    g.s.view_pitch = -30.0;
+    idle(&mut g, 20, &mut t, true);
     let dead = !g.s.enemies[mf].alive;
     r.pass("0-1.boss_to_exit", dead && g.s.level_complete, format!("boss_dead={dead} level_complete={}", g.s.level_complete));
+    final_pit(def, &mut g, &mut t, r);
+}
+
+/// FinalPit -> FinalRank: R does nothing in the elevator, the player is pulled to the pit's axis and
+/// turned to its rotation, the results go up, and the fall reaches the second pit, which arms the
+/// continue to the next level (`targetLevelName`).
+fn final_pit(def: &Arc<SceneDef>, g: &mut Game, t: &mut f64, r: &mut Report) {
+    let before = (g.s.player.pos, g.s.restarts, g.s.level_complete);
+    g.respawn();
+    let r_ignored = g.s.player.pos == before.0 && g.s.restarts == before.1 && g.s.level_complete;
+    r.pass("0-1.exit_ignores_restart", r_ignored, format!("pos {:?} -> {:?}, restarts {} -> {}", before.0, g.s.player.pos, before.1, g.s.restarts));
+    // distance to the axis of whichever shaft the player is in (the second sits 20 along the first's forward)
+    let axes: Vec<Vec3> = def.scripts.iter().filter(|s| s.class == "FinalPit").map(|s| def.nodes[s.node as usize].world0.to_scale_rotation_translation().2).collect();
+    let axis_dist = |g: &Game| axes.iter().map(|a| Vec3::new(g.s.player.pos.x - a.x, 0.0, g.s.player.pos.z - a.z).length()).fold(f32::MAX, f32::min);
+    r.info("play.0-1.pit_axis_dist_enter", axis_dist(g) as f64);
+    let (mut results_at, mut second_at, mut min_axis) = (None, None, f32::MAX);
+    let mut view_err = f32::NAN;
+    let target_view = {
+        let n = def.scripts.iter().position(|s| s.class == "FinalPit" && g.active(s.node)).map(|i| def.scripts[i].node).unwrap();
+        let (_, rot, _) = def.nodes[n as usize].world0.to_scale_rotation_translation();
+        let f = rot * Vec3::NEG_Z;
+        (f.x.atan2(-f.z).to_degrees(), f.y.clamp(-1.0, 1.0).asin().to_degrees())
+    };
+    for i in 0..(125 * 20) {
+        idle(g, 1, t, true);
+        min_axis = min_axis.min(axis_dist(g));
+        if let Some((y, p)) = g.s.forced_view {
+            let dy = ((y - target_view.0 + 540.0).rem_euclid(360.0) - 180.0).abs();
+            view_err = dy.max((p - target_view.1).abs());
+        }
+        if results_at.is_none() && g.s.results_shown {
+            results_at = Some(i as f32 * FIXED_DT);
+        }
+        if second_at.is_none() && g.s.reached_second_pit {
+            second_at = Some(i as f32 * FIXED_DT);
+            break;
+        }
+    }
+    r.info("play.0-1.pit_axis_dist_min", min_axis as f64);
+    r.info("play.0-1.pit_view_err_deg", view_err as f64);
+    r.info("play.0-1.results_at_s", results_at.unwrap_or(-1.0) as f64);
+    r.info("play.0-1.second_pit_at_s", second_at.unwrap_or(-1.0) as f64);
+    let next = g.s.next_level.clone().unwrap_or_default();
+    r.pass(
+        "0-1.exit_to_next_level",
+        results_at.is_some() && second_at.is_some() && next == "Level 0-2" && view_err < 0.5,
+        format!("results {results_at:?} second_pit {second_at:?} next {next:?} view_err {view_err:.3} axis_min {min_axis:.3}"),
+    );
 }
 
 /// Bot to the first checkpoint, die: respawn at the checkpoint with the revolver and kills preserved.

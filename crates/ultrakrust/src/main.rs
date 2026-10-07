@@ -2,7 +2,9 @@
 //!
 //! `ultrakrust` plays level 0-1 from your ULTRAKILL install (if found);
 //! `ultrakrust --level 1-1` picks another level; `ultrakrust --sandbox` opens the test map;
-//! `ultrakrust --tour <dir>` saves screenshots of every room and exits.
+//! `ultrakrust --tour <dir>` saves screenshots of every room and exits;
+//! `--all-weapons` starts with every ported weapon unlocked (kept across level changes).
+//! The exit elevator's results continue to the next level on Fire1, as in ULTRAKILL.
 //!
 //! Controls (ULTRAKILL defaults): WASD move, Space jump, Left Shift dash,
 //! Left Ctrl slide / slam, LMB fire, hold RMB to charge a piercing shot, F punch (parries).
@@ -50,6 +52,23 @@ struct Sim {
     title: String,
     sandbox_targets: Vec<map::Target>,
     level_time: f32,
+    /// FinalRank: seconds since the results came up, and whether Fire1 skipped the tally.
+    results_t: f32,
+    results_skipped: bool,
+    /// A scene to load (bundle name, e.g. "0-2") and how many frames the LOADING card has shown.
+    load_request: Option<(String, u32)>,
+    /// Bumped per level load so the Unity renderer rebuilds its GPU state.
+    generation: u64,
+    unity_shaders: bool,
+}
+
+/// FinalRank's tally: one line per step, then complete.
+const TALLY_STEP: f32 = 0.5;
+const TALLY_LINES: f32 = 4.0;
+
+/// SceneHelper.LoadScene names ("Level 0-2", "Level 4-S") -> campaign bundle names ("0-2", "4-s").
+fn scene_bundle(scene: &str) -> String {
+    scene.strip_prefix("Level ").unwrap_or(scene).to_lowercase()
 }
 
 #[derive(Component)]
@@ -105,7 +124,7 @@ fn main() {
         .add_systems(Last, exit_after)
         .add_systems(Update, present_probe::run.after(update_hud).run_if(present_probe::enabled))
         .add_systems(FixedUpdate, fixed_sim)
-        .add_systems(Update, (cursor_grab, frame_sim, sync_level, unity_frame, apply_view, update_beams, update_hud, tour::run_tour).chain())
+        .add_systems(Update, (cursor_grab, exit_probe, frame_sim, change_level, sync_level, unity_frame, apply_view, update_beams, update_hud, tour::run_tour).chain())
         .run();
 }
 
@@ -121,12 +140,13 @@ fn setup(
     let unity_shaders = !args.iter().any(|a| a == "--legacy-render");
     let level_arg = args.iter().position(|a| a == "--level").and_then(|i| args.get(i + 1)).cloned();
     let want_level = !args.iter().any(|a| a == "--sandbox");
+    let all_weapons = args.iter().any(|a| a == "--all-weapons");
     let tour_dir = args.iter().position(|a| a == "--tour").and_then(|i| args.get(i + 1)).map(std::path::PathBuf::from);
 
     let mut loaded: Option<level::Loaded> = None;
     if want_level {
         let name = level_arg.unwrap_or_else(|| "0-1".into());
-        match level::load(&name, &mut commands, &mut meshes, &mut materials, &mut images, unity_shaders.then_some(&mut *shaders)) {
+        match level::load(&name, &mut commands, &mut meshes, &mut materials, &mut images, unity_shaders.then_some(&mut *shaders), 1) {
             Ok(l) => {
                 info!("{}", l.summary);
                 loaded = Some(l);
@@ -135,7 +155,7 @@ fn setup(
         }
     }
     let is_level = loaded.is_some();
-    let (game, title, rooms, sandbox_targets) = match loaded {
+    let (mut game, title, rooms, sandbox_targets) = match loaded {
         Some(l) => {
             commands.insert_resource(l.view);
             if let Some(scene) = l.unity {
@@ -163,6 +183,10 @@ fn setup(
             (game, "movement sandbox".to_string(), Vec::new(), targets)
         }
     };
+    if all_weapons {
+        give_all_weapons(&mut game);
+        info!("--all-weapons: has_revolver={}", game.s.has_revolver);
+    }
     let spawn = game.s.player.pos;
     let spawn_yaw = game.spawn_yaw;
 
@@ -324,7 +348,19 @@ fn setup(
         title,
         sandbox_targets,
         level_time: 0.0,
+        results_t: 0.0,
+        results_skipped: false,
+        load_request: None,
+        generation: 1,
+        unity_shaders: unity_shaders && is_level,
     });
+}
+
+/// `--all-weapons`: every weapon the port has (the Revolver; the rest of the arsenal is not ported).
+fn give_all_weapons(game: &mut Game) {
+    game.s.has_revolver = true;
+    // the level-start snapshot keeps them through restarts
+    game.rebase_start();
 }
 
 fn cursor_grab(mut cursor: Single<&mut CursorOptions>, mouse: Res<ButtonInput<MouseButton>>, key: Res<ButtonInput<KeyCode>>) {
@@ -388,7 +424,8 @@ fn frame_sim(
     sim.clock += dt as f64;
     let captured = cursor.grab_mode != CursorGrabMode::None;
 
-    if keys.just_pressed(KeyCode::KeyR) {
+    // NewMovement.levelOver: no restarting from the exit elevator
+    if keys.just_pressed(KeyCode::KeyR) && !sim.game.s.level_complete {
         sim.game.respawn();
         sim.cam.rotation_y = sim.game.s.player.yaw_deg;
     }
@@ -428,7 +465,13 @@ fn frame_sim(
     } else if can_look {
         sim.cam.look(motion.delta);
     }
+    // FinalPit turns the view towards the elevator
+    if let Some((yaw, pitch)) = sim.game.s.forced_view {
+        sim.cam.rotation_y = yaw;
+        sim.cam.rotation_x = pitch;
+    }
     sim.game.s.player.yaw_deg = sim.cam.rotation_y;
+    sim.game.s.view_pitch = sim.cam.rotation_x;
     let clock = sim.clock;
     if sim.noclip {
         let rot = sim.cam.rotation();
@@ -535,8 +578,31 @@ fn frame_sim(
                 sim.cam.rotation_y = sim.game.s.player.yaw_deg;
                 sim.revolver = Revolver::default();
             }
-            GameEvent::LevelComplete => sim.banner = Some(("LEVEL COMPLETE".into(), f32::MAX)),
             _ => {}
+        }
+    }
+
+    // FinalRank: the tally runs line by line (Fire1 skips it); once complete, Fire1 in the second
+    // pit loads the next level. A rankless exit (AbruptLevelChanger) loads straight away.
+    if sim.game.s.results_shown && sim.load_request.is_none() {
+        let fire1 = bot.is_some_and(|b| b.fire) || (captured && mouse.just_pressed(MouseButton::Left)) || std::env::var_os("UK_PROBE_CONTINUE").is_some();
+        let complete = sim.results_skipped || sim.results_t >= TALLY_STEP * TALLY_LINES;
+        if sim.results_t == 0.0 {
+            info!("results up at {:.2}s: ranks {:?}", sim.level_time, sim.game.final_ranks(sim.level_time));
+        }
+        if fire1 && !complete {
+            sim.results_skipped = true;
+        } else if fire1 && complete && sim.game.s.reached_second_pit {
+            if let Some(next) = sim.game.s.next_level.clone() {
+                info!("results: continue -> {next:?} (bundle {})", scene_bundle(&next));
+                sim.load_request = Some((scene_bundle(&next), 0));
+            }
+        }
+        sim.results_t += dt;
+    }
+    if sim.game.s.rankless_continue && sim.load_request.is_none() {
+        if let Some(next) = sim.game.s.next_level.clone() {
+            sim.load_request = Some((scene_bundle(&next), 0));
         }
     }
     sim.log.retain_mut(|(_, t)| {
@@ -555,6 +621,88 @@ fn frame_sim(
             tf.scale = Vec3::splat(1.0 + t.flash * 2.0);
         }
     }
+}
+
+/// SceneHelper.LoadScene: after a couple of frames of the LOADING card, the current level's render
+/// entities go and the next level replaces the game, its view and the Unity scene (weapons carry over).
+#[allow(clippy::too_many_arguments)]
+fn change_level(
+    mut sim: ResMut<Sim>,
+    view: Option<ResMut<level::LevelView>>,
+    scene: Option<ResMut<unity_render::UnityScene>>,
+    frame: Option<ResMut<unity_render::UnityFrame>>,
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+    mut shaders: ResMut<Assets<bevy::shader::Shader>>,
+    beams: Query<Entity, With<Beam>>,
+) {
+    let sim = &mut *sim;
+    let Some((name, frames)) = &mut sim.load_request else { return };
+    *frames += 1;
+    if *frames < 3 {
+        // let the LOADING card reach the screen before the load blocks
+        return;
+    }
+    let name = name.clone();
+    sim.load_request = None;
+    let generation = sim.generation + 1;
+    let t = std::time::Instant::now();
+    let l = match level::load(&name, &mut commands, &mut meshes, &mut materials, &mut images, sim.unity_shaders.then_some(&mut *shaders), generation) {
+        Ok(l) => l,
+        Err(e) => {
+            warn!("could not load level {name}: {e}");
+            sim.banner = Some((format!("COULD NOT LOAD {}", name.to_uppercase()), 3.0));
+            return;
+        }
+    };
+    info!("level change -> {name} (generation {generation}, {:.1}s): {}; has_revolver carried {}", t.elapsed().as_secs_f32(), l.summary, sim.game.s.has_revolver);
+    for e in beams.iter() {
+        commands.entity(e).despawn();
+    }
+    match view {
+        Some(mut view) => {
+            for e in view.node_entities.values().flatten().map(|(e, _)| *e).chain(view.projectiles.iter().copied()) {
+                commands.entity(e).despawn();
+            }
+            *view = l.view;
+        }
+        None => commands.insert_resource(l.view),
+    }
+    if let Some(s) = l.unity {
+        let s = Some(Arc::new(s));
+        match scene {
+            Some(mut scene) => scene.0 = s,
+            None => commands.insert_resource(unity_render::UnityScene(s)),
+        }
+    }
+    if let Some(mut frame) = frame {
+        *frame = default();
+    }
+    let mut game = l.game;
+    if sim.game.s.has_revolver {
+        // weapons are unlocks (GameProgressSaver), not per-level state
+        give_all_weapons(&mut game);
+    }
+    let (sensitivity, tilt) = (sim.cam.sensitivity, sim.cam.tilt_enabled);
+    sim.cam = FpCamera::default();
+    sim.cam.sensitivity = sensitivity;
+    sim.cam.tilt_enabled = tilt;
+    sim.cam.rotation_y = game.spawn_yaw;
+    sim.game = game;
+    sim.generation = generation;
+    sim.title = l.summary;
+    sim.revolver = Revolver::default();
+    sim.fixed_input = PInput::default();
+    sim.log.clear();
+    sim.banner = None;
+    sim.level_time = 0.0;
+    sim.results_t = 0.0;
+    sim.results_skipped = false;
+    sim.recoil = 0.0;
+    sim.punch_cd = 0.0;
+    sim.punch_anim = 0.0;
 }
 
 fn sync_level(
@@ -673,10 +821,14 @@ fn update_hud(
     }
     text.0 = if *debug_shown { s } else { String::new() };
     hint.0 = g.s.messages.last().map(|m| m.text.clone()).unwrap_or_default();
-    banner.0 = match &sim.banner {
-        Some((b, _)) if b == "LEVEL COMPLETE" => format!("LEVEL COMPLETE\n{:.1}s  -  {} kills", sim.level_time, g.s.kills),
-        Some((b, _)) => b.clone(),
-        None => String::new(),
+    banner.0 = if let Some((name, _)) = &sim.load_request {
+        format!("LOADING {}", name.to_uppercase())
+    } else if g.s.results_shown {
+        results_text(&sim)
+    } else if g.s.level_complete && !g.s.rankless_continue {
+        "LEVEL COMPLETE".into()
+    } else {
+        sim.banner.as_ref().map(|b| b.0.clone()).unwrap_or_default()
     };
     hp_text.0 = format!("{}", g.s.hp);
     hp_bar.width = percent(g.s.hp.clamp(0, 100) as f32);
@@ -687,6 +839,30 @@ fn update_hud(
     }
     let r = &sim.revolver;
     pierce.width = percent(if !g.s.has_revolver { 0.0 } else if r.pierce_ready { r.pierce_shot_charge } else { r.pierce_charge });
+}
+
+/// FinalRank: time, kills, style (with ranks), then the total; the continue prompt once complete
+/// in the second pit.
+fn results_text(sim: &Sim) -> String {
+    let g = &sim.game;
+    let (time, kills, style, total) = g.final_ranks(sim.level_time);
+    let shown = if sim.results_skipped { TALLY_LINES } else { (sim.results_t / TALLY_STEP).floor().min(TALLY_LINES) };
+    let secs = sim.level_time;
+    let lines = [
+        format!("TIME  {}:{:06.3}  {time}", (secs / 60.0) as u32, secs % 60.0),
+        format!("KILLS  {}  {kills}", g.s.kills),
+        format!("STYLE  0  {style}"),
+        format!("RANK  {total}{}", if g.s.restarts > 0 { format!("   ({} restarts)", g.s.restarts) } else { String::new() }),
+    ];
+    let mut s = String::from("LEVEL COMPLETE");
+    for l in lines.iter().take(shown as usize) {
+        s += "\n";
+        s += l;
+    }
+    if shown >= TALLY_LINES && g.s.reached_second_pit {
+        s += "\n\n[FIRE] CONTINUE";
+    }
+    s
 }
 
 /// Per-frame game state for the Unity-shader renderer: visibility, movers, lights.
@@ -710,6 +886,38 @@ fn unity_frame(sim: Res<Sim>, scene: Res<unity_render::UnityScene>, time: Res<Ti
             rigid
         );
     }
+}
+
+/// `UK_PROBE_EXIT=1`: two seconds in, drops the player into the top of the level's first exit pit
+/// (activating it if the level hasn't opened it yet), so the FinalPit -> results -> next level
+/// chain can be driven without playing the level; pair with `UK_PROBE_CONTINUE`.
+fn exit_probe(mut sim: ResMut<Sim>, mut done: Local<bool>) {
+    if *done || sim.generation != 1 || sim.level_time < 2.0 || std::env::var_os("UK_PROBE_EXIT").is_none() {
+        return;
+    }
+    *done = true;
+    let g = &mut sim.game;
+    let def = g.def.clone();
+    let pit = (0..def.scripts.len()).find(|&i| matches!(&g.s.scripts[i], uk_game::scripts::Script::FinalPit(p) if !p.second_pit));
+    let Some(pit) = pit else {
+        info!("exit probe: no FinalPit in this level");
+        return;
+    };
+    let node = def.scripts[pit].node;
+    let mut n = Some(node);
+    while let Some(i) = n {
+        g.set_active(i, true);
+        n = def.nodes[i as usize].parent;
+    }
+    let Some(top) = def.colliders.iter().filter(|c| c.node == node && c.trigger).find_map(|c| match &c.shape {
+        uk_assets::scenedef::ShapeDef::Box { center, half, .. } => Some(*center + Vec3::Y * (half.y - 5.0)),
+        _ => None,
+    }) else {
+        return;
+    };
+    g.s.player.pos = top;
+    g.s.player.prev_pos = top;
+    info!("exit probe: dropped into {} at {:?}", def.path(node), top);
 }
 
 /// `--exit-after <seconds>`: quit after a while (headless-ish smoke runs that only read the log).
