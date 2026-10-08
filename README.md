@@ -138,6 +138,25 @@ doorway a mesh named `-door` (it collides as its convex hull).
   `locked`, `trigger_size` (4 m: how far the area reaches each side) and `rooms` (`"A, B"`, the
   rooms it joins by name, when they can't be found).
 
+Where things go. An unloaded room hides everything under it: meshes, collision, lights and
+enemies.
+
+| Put it in a room | Leave it at the root (outside every room) |
+|---|---|
+| The room's floors, walls and ceilings. They also set the room's bounds, which is how doors and the player start find it, so a room needs geometry around each of its doorways. | Anything visible from more than one room, such as an outdoor backdrop or a sun. Anything at the root is always loaded. |
+| Lights that only light that room, since they switch off with it. | The `-env` empty. Its settings apply to the whole level wherever it is, so the root is the clear place for it. |
+| Enemies that belong to the room. They appear when it loads, and disappear when it unloads. | `-navmesh` meshes. The navmesh is always whole, wherever its meshes sit. |
+| A room's `-door`s, optionally. A door in a room counts that room as one of its two sides; at the root, both sides are found by position. Either way, the door is moved out of the room when the map loads, so it never unloads. | |
+
+- **The player start** (the origin) must be inside a room's bounds for that room to start
+  loaded. If it's in no room, every room starts loaded (the map warns).
+- **Don't put geometry at the root next to a doorway** if you want it to belong to a room.
+  Root geometry counts toward no room, so a door beside it may find only one room (the map
+  warns; give the door a `rooms` property).
+- **Don't nest rooms.** An inner room's contents count only toward the inner room, and it
+  also unloads whenever its outer room does.
+- **A room without doors** is never unloaded.
+
 **Sky, fog and ambient light:** add an empty named `-env` (e.g. `Settings-env`) with any of these
 custom properties. Anything left out keeps 0-1's setting: linear fog from 0 to 250 m in
 rust brown, black ambient light, and a black background with no skybox.
