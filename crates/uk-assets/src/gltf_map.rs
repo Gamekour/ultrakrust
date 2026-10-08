@@ -514,15 +514,19 @@ fn shape_tris(shape: &ShapeDef) -> Vec<[Vec3; 3]> {
     tris.into_iter().filter(|[a, b, c]| (b - a).cross(c - a).length_squared() > 1e-12).map(out).collect()
 }
 
+/// Blender's glTF light export (Lighting Mode: Standard) comes out 1000x brighter than the light
+/// looks in Blender at ULTRAKILL's scale: every glTF intensity is scaled by this first.
+const GLTF_LIGHT_SCALE: f32 = 1.0 / 1000.0;
+
 /// KHR_lights_punctual -> a Unity light. glTF colors are linear and ULTRAKILL renders in gamma
-/// space. Directional: intensity = lux. Point / spot (candela, inverse square): Unity's falloff
+/// space. Intensities are scaled by GLTF_LIGHT_SCALE. Directional: intensity = lux. Point / spot (candela, inverse square): Unity's falloff
 /// tail is intensity * range^2 / (25 d^2), matched to I / d^2: without a glTF range, intensity 1
 /// and range 5 sqrt(I); with one, that range and intensity 25 I / range^2.
 fn add_light(cx: &mut Ctx, l: &gltf::khr_lights_punctual::Light, node: u32) {
     use gltf::khr_lights_punctual::Kind;
     let [r, g, b] = l.color();
     let color = [linear_to_srgb(r), linear_to_srgb(g), linear_to_srgb(b), 1.0];
-    let i = l.intensity();
+    let i = l.intensity() * GLTF_LIGHT_SCALE;
     let (range, intensity) = match l.range() {
         Some(rg) if rg > 0.0 => (rg, 25.0 * i / (rg * rg)),
         _ => (5.0 * i.max(0.0).sqrt(), 1.0),

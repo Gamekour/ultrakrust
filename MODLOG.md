@@ -548,4 +548,5 @@ CPU-skinned enemies, 3,393 colliders/569 triggers, 11,758 MonoBehaviours with ty
 ## 2026-10-08 — Custom maps: "no lights" was the export
 - Report: custom maps import no lights. `glb_json.py` on custom_maps/corinth_packed.glb and example.glb (Blender glTF I/O 5.0.21): no KHR_lights_punctual in extensionsUsed and no light entries. Blender's exporter only writes lights with Include > Data > Punctual Lights, which is off by default. The loader is fine: the scratchpad test.gltf's point light imports (kind 2, colour [1, 0.735, 0.537], range 50) and is enabled and active in the game (`map_probe` now prints the map's lights with their runtime state).
 - The loader now warns when a map has no lights, naming the export option. README: the same note under Lights.
+- Lights were 1000x too bright from Blender (normalize on, per the user). `GLTF_LIGHT_SCALE` = 1/1000 multiplies every glTF intensity before the Unity conversion (for point / spot, brightness at a distance is proportional to it). Test map: 100 cd -> 0.1 -> intensity 1, range 1.58 (was 15.8).
 

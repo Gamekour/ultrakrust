@@ -125,7 +125,8 @@ Add them to object names. They're case-insensitive, and `-x`, `_x` or `$x` all w
 **Lights:**
 - Point, spot and sun lights import by type and colour. Blender leaves them out of the export
   by default: tick *Include → Data → Punctual Lights* in the glTF export dialog.
-- Brightness is converted from glTF's physical units, so expect to tune it by eye.
+- Brightness is converted from glTF's physical units and scaled down 1000x, to match Blender's
+  export (with the export's lighting mode left on Standard). Expect to tune it by eye.
 - Cameras are ignored.
 
 Map-specific ULTRAKILL features (enemies, triggers, checkpoints, ...) aren't supported yet.
