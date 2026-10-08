@@ -16,6 +16,11 @@ fn main() {
     let base_nodes = base.nodes.len();
     let (def, report) = gltf_map::custom_scene(&mut db, base, std::path::Path::new(&map)).unwrap();
     println!("{report:?}");
+    let rs = &def.render_settings;
+    println!(
+        "render settings: fog {} {:.3?} {}..{} ambient mode {} {:.3?} skybox {:?} camera clear {:?}",
+        rs.fog, rs.fog_color, rs.fog_start, rs.fog_end, rs.ambient_mode, rs.ambient_sky, rs.skybox.as_ref().map(|k| (&k.file, k.path_id)), rs.camera_clear
+    );
     println!("0-1 {base_nodes} nodes -> {} kept + map; roots {:?}", def.nodes.len(), def.nodes.iter().filter(|n| n.parent.is_none()).map(|n| &n.name).collect::<Vec<_>>());
     let root = def.nodes.iter().position(|n| n.name.starts_with("glTF ")).unwrap() as u32;
     for (i, n) in def.nodes.iter().enumerate().filter(|(i, _)| def.is_descendant(*i as u32, root)) {

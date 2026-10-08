@@ -618,3 +618,17 @@ CPU-skinned enemies, 3,393 colliders/569 triggers, 11,758 MonoBehaviours with ty
   - t 0: A on, B and C off. At 0.30 s (z -0.58) Gate1 opens and B loads.
   - At 0.91 s (z -10.56) Gate2 opens: A unloads, C loads. Each door closes behind the player (Gate1 at 0.85 s, Gate2 at 1.58 s).
 - `custom_maps/example.glb` still loads, with no rooms or doors and no warnings.
+
+## 2026-10-08 — Custom maps: `-env`
+- An `-env` empty sets the map's RenderSettings from its custom properties (`gltf_map/env.rs`): `skybox`, `sky_color`, `fog`, `fog_min`, `fog_max`, `fog_color`, `ambient_color`, `ambient_strength`. Anything left out keeps 0-1's.
+- Skyboxes: the 19 campaign RenderSettings skybox materials outside 0-1 all sit in one shared file (`CAB-56872c89...`, the placeholder material's). They're looked up by id, else by name. `skybox` (uk-assets example) now prints each one's file, id and its level's `m_Fog`.
+- Read from the data:
+  - 0-1's Main Camera clears to a solid colour (flags 2, black), so its Default-Skybox never shows. A named skybox therefore also switches the camera to clear flags 1, as `SkyboxEnabler.Activate` does; `"none"` sets flags 2 with `sky_color`.
+  - 0-1's ambient is Flat (mode 3) and black. Unity has no intensity for Flat ambient, so `ambient_strength` multiplies the colour.
+  - 16 campaign levels start with `m_Fog` false (0-2, 0-3, 0-4, 3-2, 4-3, 4-4, 7-1, 7-2, 8-1, 8-3, 0-S, 1-S, 2-S, 7-S and both intermissions) and the renderer ignores the flag. Making it honour the flag would unfog those levels until FogEnabler and co. are ported, so `fog: false` instead moves the distances to 100 km and 200 km, past the 4 km far plane.
+- The map's meshes are fogged: the placeholder material has `_FOG_ON` (`find_material --names` now prints keywords).
+- `map_probe` (which now prints the RenderSettings) on the rooms test map with an `-env`:
+  - Every property: fog 10..120 in (0.2, 0.4, 0.6); ambient `#336699` x 0.5 = (0.1, 0.2, 0.3); skybox LustSky; camera clear flags 1.
+  - `skybox: "none"`, `sky_color`, `fog: false`: no skybox, clear flags 2 with (0.1, 0.2, 0.3, 1), fog 100000..200000.
+  - Errors: two `-env`s, an unknown skybox, `fog_min` 300 > `fog_max` 100, a 2-number colour and an unknown property each warn, and the bad values are ignored.
+- The renderer's startup report (`ultrakrust --map ... --exit-after 6`) draws each skybox shader type: LustSky (Skybox/Panoramic, 1000 px), GreedSky (ULTRAKILL/Skybox/Panoramic, 1024), FraudCity_SkyMat_Night (ULTRAKILL/Skybox/Skybox, 6-face cube 512), BlackNoFog (ULTRAKILL/Master, 64), Default-Skybox (Skybox/Procedural); `"none"`: no sky draw, clear (0.1, 0.2, 0.3).

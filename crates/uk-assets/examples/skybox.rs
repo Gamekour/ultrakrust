@@ -15,7 +15,7 @@ fn main() {
             for o in f.objects.iter().filter(|o| o.class_id == 104) {
                 let v = f.read(o).unwrap();
                 let p = v.get("m_SkyboxMaterial").pptr();
-                let mut out = format!("{l}: skybox pptr {p:?}");
+                let mut out = format!("{l}: fog {} skybox pptr {p:?}", v.get("m_Fog").bool());
                 if let Ok(Some((mf, _, m))) = db.read_pptr(f, p) {
                     let sh = m.get("m_Shader").pptr();
                     let shname = db.read_pptr(&mf, sh).ok().flatten().map(|(_, _, s)| s.get("m_ParsedForm").get("m_Name").str().to_string()).unwrap_or_default();
@@ -27,6 +27,7 @@ fn main() {
    {tn} {:?} fmt {} {}x{} images {} decode {dec:?}", t.get("m_Name").str(), t.get("m_TextureFormat").i64(), t.get("m_Width").i64(), t.get("m_Height").i64(), t.get("m_ImageCount").i64());
                         }
                     }
+                    out += &format!(" file {} id {}", mf.name, p.1);
                     out += &format!(" mat {:?} shader {shname:?} kw {:?}\n   tex {:?}\n   col {:?}\n   flt {:?}", m.get("m_Name").str(), props.keywords, props.textures.iter().filter(|t| t.1.texture.1 != 0).map(|t| t.0).collect::<Vec<_>>(), props.colors, props.floats);
                 }
                 println!("{out}");

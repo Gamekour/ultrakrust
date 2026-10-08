@@ -138,6 +138,17 @@ doorway a mesh named `-door` (it collides as its convex hull).
   `locked`, `trigger_size` (4 m: how far the area reaches each side) and `rooms` (`"A, B"`, the
   rooms it joins by name, when they can't be found).
 
+**Sky, fog and ambient light:** add an empty named `-env` (e.g. `Settings-env`) with any of these
+custom properties. Anything left out keeps 0-1's setting: linear fog from 0 to 250 m in
+rust brown, black ambient light, and a black background with no skybox.
+- `skybox`: a campaign skybox by name (e.g. `"LustSky"`, `"GreedSky"`; the full list is in
+  [docs/MAP_FORMAT.md](docs/MAP_FORMAT.md)), or `"none"`.
+- `sky_color`: the background colour when there's no skybox.
+- `fog` (true/false), `fog_min` and `fog_max` (metres), `fog_color`.
+- `ambient_color`, and `ambient_strength`, which multiplies it.
+- Colours are `[r, g, b]` lists of 0–1 values (a Blender colour property) or hex strings
+  (`"#843C1B"`), used as written. The settings stay the same for the whole level.
+
 **Navmesh:** name a mesh `-navmesh` (e.g. `Floor-navmesh`) to give enemies a walkable surface
 to path on. It is invisible and has no collision. Several `-navmesh` meshes merge into one.
 - **Leave about 0.5 m between its edge and walls.** The mesh is used as-is, like Godot's

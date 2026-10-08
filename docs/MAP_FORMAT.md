@@ -1,7 +1,7 @@
 # Custom map format: ULTRAKILL features (draft)
 
 > **Status: draft, partly implemented.** Implemented: geometry, collision suffixes, materials and
-> lights (see the README), enemies outside waves, `-navmesh`, `-room` and `-door`. Each section
+> lights (see the README), enemies outside waves, `-navmesh`, `-room`, `-door` and `-env`. Each section
 > says what is implemented. This document specifies the next layer: enemies,
 > arenas and waves, doors, checkpoints and the other level scripts, authored in Blender with name
 > suffixes and collections. Every feature below maps onto a script the port already runs, so a
@@ -59,7 +59,35 @@ Placement conventions:
 | `-finalpit` | Trigger | `FinalPit`: entering it ends the level and turns the view to the pit's forward; the results screen follows. | `rankless` (false) |
 | `-deathzone` | Trigger | `DeathZone`: kills the player (or hurts them, with `damage`) and respawns them at the last checkpoint. | `damage` (0 = instakill), `affects`: `all` / `player` / `enemies` (`all`) |
 | `-checkpoint` | Empty or trigger | `CheckPoint`: touching it saves the respawn point, facing its forward. An empty gets ULTRAKILL's default checkpoint volume. | `invisible` (false) |
+| `-env` | Empty | The level's RenderSettings: skybox, fog and ambient light (below). One per map. Implemented. | see below |
 | `-teleport` | Trigger | `TeleportPlayer`: moves the player to the empty named in `target`. | `target` (required), `reset_speed` (false) |
+
+### Environment (`-env`, implemented)
+Every property is optional. One left out keeps 0-1's RenderSettings: linear fog 0–250 m in
+(0.518, 0.235, 0.106), flat black ambient light, and a camera that clears to black (0-1's
+Default-Skybox never shows).
+
+| Property | Type | Becomes |
+|---|---|---|
+| `skybox` | name, or `"none"` | `RenderSettings.skybox`, and the camera clears to it (as `SkyboxEnabler` does). `"none"`: the camera clears to `sky_color`. Names (case ignored): Default-Skybox, BlackNoFog, DawnSky 1, DaySky, DaySky 2, EveningSky 1, FraudCity_SkyMat_Night, GreedSky, GreedSky2, GreedSky4, LustSky, LustSky 1, LustSky 2, OvercastSky, OvercastSky 1, RedSky, RedSky2, ViolenceSky, ViolenceSky 1, ViolenceSky3 |
+| `sky_color` | colour | The camera's background colour, shown when there is no skybox |
+| `fog` | bool | `RenderSettings.fog` |
+| `fog_min`, `fog_max` | metres | `fogStartDistance`, `fogEndDistance` (ULTRAKILL's shaders use linear fog only) |
+| `fog_color` | colour | `fogColor` |
+| `ambient_color` | colour | `ambientLight` (Flat mode, 0-1's) |
+| `ambient_strength` | number (1) | Multiplies `ambient_color`; Unity has no intensity for Flat ambient |
+
+- **Colours:** `[r, g, b]` or `[r, g, b, a]` with 0–1 values (a Blender colour custom property),
+  or `"#RRGGBB"` / `"#RRGGBBAA"`. Used as written, like Unity's colour picker; unlike glTF
+  material colours, they aren't converted from linear.
+- **Fixed for the level:** the scripts that change these at runtime (`FogEnabler`,
+  `SkyboxEnabler`, `FogSetterBounds`, ...) aren't ported yet.
+- **Fog off** moves the fog distances past the far plane, since the port's renderer fogs
+  whatever `RenderSettings.fog` says: 16 campaign levels start with it off and switch it on
+  through those unported scripts.
+- **Warnings:** more than one `-env` (the first is used), `-env` on a mesh, an unknown skybox
+  (the warning lists the names), `fog_min` not below `fog_max`, a value of the wrong type, an
+  unknown property.
 
 ### Enemies
 | Suffix | Becomes | Template (from 0-1) |

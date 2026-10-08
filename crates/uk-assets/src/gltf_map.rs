@@ -28,7 +28,8 @@
 //! place a copy of one of 0-1's enemies at the empty, standing on its origin and facing its
 //! forward (glTF -Z: Blender's +Y), in the level from the start (no spawn effect). Without a
 //! `-navmesh`, Filth and Strays walk straight at the player (warned). `-room` collections and
-//! `-door` meshes load and unload rooms as the campaign's doors do (see `rooms`).
+//! `-door` meshes load and unload rooms as the campaign's doors do (see `rooms`). An `-env` empty
+//! sets the skybox, fog and ambient light (see `env`).
 
 use crate::db::AssetDb;
 use crate::scene::{Batch, MaterialKey};
@@ -40,6 +41,7 @@ use bevy_math::{Mat4, Quat, Vec3};
 use std::collections::HashMap;
 use std::path::Path;
 
+mod env;
 mod rooms;
 
 /// TagManager "Environment".
@@ -66,6 +68,8 @@ pub struct MapReport {
     pub nav_polys: usize,
     pub rooms: usize,
     pub doors: usize,
+    /// the RenderSettings `-env` changed
+    pub env: Vec<String>,
     pub warnings: Vec<String>,
 }
 
@@ -96,7 +100,8 @@ pub fn custom_scene(db: &mut AssetDb, mut def: SceneDef, path: &Path) -> Result<
     let door_tpl = rooms::templates(&def);
     prune_base(&mut def)?;
     let (mut report, parsed) = append_gltf_with(db, &mut def, path)?;
-    let Parsed { root, enemies, nav_tris, rooms, doors } = parsed;
+    let Parsed { root, enemies, nav_tris, rooms, doors, envs } = parsed;
+    env::apply(db, &mut def, &envs, &mut report);
     place_enemies(&mut def, &enemies, &mut report);
     // prune_base stands the player's feet on the origin
     rooms::setup(&mut def, root, &rooms, &doors, door_tpl.as_ref(), Vec3::Y, &mut report);
@@ -245,10 +250,11 @@ struct NodeKind {
     navmesh: bool,
     room: bool,
     door: bool,
+    env: bool,
 }
 
 fn classify(raw: &str, warnings: &mut Vec<String>) -> NodeKind {
-    let mut k = NodeKind { name: raw.to_string(), noimp: false, col: Col::None, only: false, enemy: None, navmesh: false, room: false, door: false };
+    let mut k = NodeKind { name: raw.to_string(), noimp: false, col: Col::None, only: false, enemy: None, navmesh: false, room: false, door: false, env: false };
     if has_suffix(raw, "noimp") {
         k.noimp = true;
         return k;
@@ -256,6 +262,11 @@ fn classify(raw: &str, warnings: &mut Vec<String>) -> NodeKind {
     if let Some(&(s, e)) = EnemyKind::ALL.iter().find(|(s, _)| has_suffix(raw, s)) {
         k.name = strip_suffix(raw, s);
         k.enemy = Some(e);
+        return k;
+    }
+    if has_suffix(raw, "env") {
+        k.name = strip_suffix(raw, "env");
+        k.env = true;
         return k;
     }
     if has_suffix(raw, "room") {
@@ -349,6 +360,7 @@ struct Ctx<'a> {
     /// `-room` nodes
     rooms: Vec<u32>,
     doors: Vec<rooms::DoorProps>,
+    envs: Vec<(String, Option<String>)>,
 }
 
 /// Adds the glTF file's default scene under a new root node.
@@ -367,6 +379,8 @@ struct Parsed {
     nav_tris: Vec<[Vec3; 3]>,
     rooms: Vec<u32>,
     doors: Vec<rooms::DoorProps>,
+    /// `-env` empties: (name, extras JSON)
+    envs: Vec<(String, Option<String>)>,
 }
 
 /// `append_gltf`, also returning what the ULTRAKILL suffixes placed; warnings are left to the
@@ -409,12 +423,12 @@ fn append_gltf_with(db: &mut AssetDb, def: &mut SceneDef, path: &Path) -> Result
         rect: None,
     });
     let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
-    let mut cx = Ctx { def, buffers, material, surface, report: MapReport { nodes: 1, warnings, ..Default::default() }, next_id: -0x6c74_6700_0000, dir, mats: HashMap::new(), images: HashMap::new(), white: None, enemies: Vec::new(), nav_tris: Vec::new(), rooms: Vec::new(), doors: Vec::new() };
+    let mut cx = Ctx { def, buffers, material, surface, report: MapReport { nodes: 1, warnings, ..Default::default() }, next_id: -0x6c74_6700_0000, dir, mats: HashMap::new(), images: HashMap::new(), white: None, enemies: Vec::new(), nav_tris: Vec::new(), rooms: Vec::new(), doors: Vec::new(), envs: Vec::new() };
     let scene = g.default_scene().or_else(|| g.scenes().next()).ok_or_else(|| Error("glTF has no scene".into()))?;
     for n in scene.nodes() {
         visit(&mut cx, &n, root, Mat4::IDENTITY);
     }
-    let parsed = Parsed { root, enemies: cx.enemies, nav_tris: cx.nav_tris, rooms: cx.rooms, doors: cx.doors };
+    let parsed = Parsed { root, enemies: cx.enemies, nav_tris: cx.nav_tris, rooms: cx.rooms, doors: cx.doors, envs: cx.envs };
     let mut report = cx.report;
     // Blender's exporter leaves lights out unless asked to
     if report.lights == 0 {
@@ -487,6 +501,12 @@ fn visit(cx: &mut Ctx, n: &gltf::Node, parent: u32, parent_world: Mat4) {
     }
     if kind.room {
         cx.rooms.push(idx);
+    }
+    if kind.env {
+        match n.mesh() {
+            Some(_) => cx.report.warnings.push(format!("{raw}: -env goes on an empty; its settings are ignored")),
+            None => cx.envs.push((raw.clone(), n.extras().as_ref().map(|e| e.get().to_string()))),
+        }
     }
     if kind.door {
         match n.mesh() {

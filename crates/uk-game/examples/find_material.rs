@@ -1,5 +1,6 @@
 //! Materials of the renderers whose scene path contains a substring: path, material name, key.
-//! With `--names <file>`: every Material in that serialized file whose name contains the substring.
+//! With `--names <file>`: every Material in that serialized file whose name contains the substring, with
+//! its keywords.
 //! cargo run --release -p uk-game --example find_material -- <level0-1> <substring> [--names CAB-...]
 use uk_assets::{db::AssetDb, scenedef, texture};
 fn main() {
@@ -10,9 +11,11 @@ fn main() {
     if let Some(i) = a.iter().position(|x| x == "--names") {
         let f = db.file(&a[i + 1]).unwrap();
         for o in f.objects.iter().filter(|o| o.class_id == 21) {
-            let n = f.read(o).map(|v| v.get("m_Name").str().to_string()).unwrap_or_default();
+            let Ok(v) = f.read(o) else { continue };
+            let n = v.get("m_Name").str().to_string();
             if n.to_lowercase().contains(&a[2].to_lowercase()) {
-                println!("{n} | {} {}", a[i + 1], o.path_id);
+                let m = uk_assets::shader::MaterialProps::from_value(&v);
+                println!("{n} | {} {} | keywords {:?} _Fog {:?}", a[i + 1], o.path_id, m.keywords, m.floats.get("_Fog"));
             }
         }
         return;
