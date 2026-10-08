@@ -59,7 +59,10 @@ fn main() {
         }
         if t - last_report > 30.0 {
             last_report = t;
-            println!("{t:7.1}s  pos {:?} hp {} kills {} wp {}", g.s.player.pos, g.s.hp, g.s.kills, bot.idx);
+            // the nearest live, active enemy (its collider blocks the player)
+            let near = g.s.enemies.iter().filter(|e| e.alive && g.s.active[e.node as usize]).map(|e| (e.center().distance(g.s.player.pos), e)).min_by(|a, b| a.0.total_cmp(&b.0));
+            let near = near.map_or("none".to_string(), |(d, e)| format!("{:?} {} at {d:.1}", e.kind, def.path(e.node)));
+            println!("{t:7.1}s  pos {:?} hp {} kills {} wp {} nearest enemy {near}", g.s.player.pos, g.s.hp, g.s.kills, bot.idx);
         }
     }
     println!("end at {t:.1}s: waypoint {}/{}, kills {}, deaths {deaths}, complete {}", bot.idx, bot.route.len(), g.s.kills, g.s.level_complete);

@@ -233,6 +233,8 @@ pub struct Game {
     /// node -> mover index (nearest mover ancestor, including itself)
     pub node_mover: Vec<Option<u32>>,
     pub movers: Vec<Mover>,
+    /// the player's [`uk_core::player::Bodies`]: (scene collider, enemy index) per enemy collider
+    body_owners: Vec<(u32, usize)>,
     pub triggers: Vec<u32>,
     pub spawn_yaw: f32,
     pub player_node: Option<u32>,
@@ -369,7 +371,6 @@ impl Game {
 
         // Collision + triggers.
         let mut triggers = Vec::new();
-        let mut skipped_shapes = 0;
         for (ci, c) in def.colliders.iter().enumerate() {
             if in_player(c.node) {
                 continue;
@@ -396,24 +397,63 @@ impl Game {
                     }
                 }
                 ShapeDef::Sphere { center, radius } => {
-                    // Rare in level geometry: approximate with a box.
-                    let b = BoxCollider::new(*center, Vec3::splat(radius * 1.6));
-                    world.add_shape(group, Shape::Box(b), ci as u32);
-                    skipped_shapes += 1;
+                    world.add_shape(group, Shape::Capsule(Capsule { a: *center, b: *center, radius: *radius }), ci as u32);
                 }
                 ShapeDef::Capsule { a, b, radius } => {
-                    let center = (*a + *b) * 0.5;
-                    let axis = *b - *a;
-                    let rot = Quat::from_rotation_arc(Vec3::Y, axis.normalize_or(Vec3::Y));
-                    let bc = BoxCollider { center, half: Vec3::new(*radius, axis.length() * 0.5 + radius, *radius), rot, slippery };
-                    world.add_shape(group, Shape::Box(bc), ci as u32);
-                    skipped_shapes += 1;
+                    world.add_shape(group, Shape::Capsule(Capsule { a: *a, b: *b, radius: *radius }), ci as u32);
                 }
             }
         }
-        let _ = skipped_shapes;
         world.owner_enabled.resize(def.colliders.len(), true);
         world.build();
+
+        // Enemy colliders the player can touch: solid ones on layers its matrix rows include, and
+        // layer-12 triggers (GroundCheck / CheckForEnemyCols). One group per enemy, in its load-time pose.
+        let mut bodies = uk_core::player::Bodies::default();
+        let mut body_owners = Vec::new();
+        for _ in &enemies {
+            bodies.world.new_group();
+        }
+        let player_mask = uk_core::player::PLAYER_LAYER_COLLIDES;
+        for (ci, c) in def.colliders.iter().enumerate() {
+            let Some(root) = enemy_root[c.node as usize] else { continue };
+            if !((!c.trigger && player_mask & (1 << c.layer) != 0) || c.layer == 12) {
+                continue;
+            }
+            let ei = enemies.iter().position(|e| e.node == root).unwrap();
+            let group = ei + 1;
+            match &c.shape {
+                ShapeDef::Box { center, half, rot } => {
+                    bodies.world.add_shape(group, Shape::Box(BoxCollider { center: *center, half: *half, rot: *rot, slippery: false }), ci as u32);
+                }
+                ShapeDef::Mesh(tris) => {
+                    for t in tris {
+                        bodies.world.add_shape(group, Shape::Tri(Triangle::new(t[0], t[1], t[2])), ci as u32);
+                    }
+                }
+                ShapeDef::Sphere { center, radius } => {
+                    bodies.world.add_shape(group, Shape::Capsule(Capsule { a: *center, b: *center, radius: *radius }), ci as u32);
+                }
+                ShapeDef::Capsule { a, b, radius } => {
+                    bodies.world.add_shape(group, Shape::Capsule(Capsule { a: *a, b: *b, radius: *radius }), ci as u32);
+                }
+            }
+            body_owners.push((ci as u32, ei));
+        }
+        let nc = def.colliders.len();
+        bodies.world.owner_enabled = vec![false; nc];
+        bodies.layer = def.colliders.iter().map(|c| c.layer).collect();
+        bodies.trigger = def.colliders.iter().map(|c| c.trigger).collect();
+        bodies.slippery = def.colliders.iter().map(|c| def.nodes[c.node as usize].tag == tags::SLIPPERY).collect();
+        bodies.anchor = def
+            .colliders
+            .iter()
+            .map(|c| {
+                let g = enemy_root[c.node as usize].and_then(|r| enemies.iter().position(|e| e.node == r)).map_or(0, |e| e + 1);
+                (g as u32, def.nodes[c.node as usize].world0.w_axis.truncate())
+            })
+            .collect();
+        bodies.world.build();
 
         // Player spawn from the original rig.
         let (spawn, spawn_yaw, activated) = match player_node {
@@ -428,6 +468,7 @@ impl Game {
         let mut player = Player::new(spawn);
         player.yaw_deg = spawn_yaw;
         player.activated = activated;
+        player.bodies = bodies;
 
         let (anim, anim_states) = crate::anim::Anim::new(&def);
         let s = State {
@@ -484,6 +525,7 @@ impl Game {
             nav: crate::nav::NavGraph::build(&def.navmeshes),
             node_mover,
             movers,
+            body_owners,
             triggers,
             spawn_yaw,
             player_node,
@@ -2093,6 +2135,16 @@ impl Game {
             let g = self.movers[m].group;
             self.world.set_group_transform(g, d);
         }
+        // enemy colliders: a dead enemy's root collider is destroyed (Enemy.HandleStandardDeath) and its
+        // corpse is not ported
+        let b = &mut self.s.player.bodies;
+        for (e, en) in self.s.enemies.iter().enumerate() {
+            b.world.set_group_transform(e + 1, en.delta());
+        }
+        for &(ci, e) in &self.body_owners {
+            let c = &self.def.colliders[ci as usize];
+            b.world.owner_enabled[ci as usize] = self.s.enemies[e].alive && self.s.active[c.node as usize] && self.s.collider_enabled[ci as usize];
+        }
     }
 
     // ---------------------------------------------------------------- player
@@ -2200,7 +2252,9 @@ impl Game {
         // NewMovement.Respawn: PowerUpMeter.juice = 0 (the next meter update ends the power-up)
         self.s.power_juice = 0.0;
         if let Some(p) = self.s.checkpoint_pos {
+            let bodies = std::mem::take(&mut self.s.player.bodies);
             self.s.player = Player::new(p);
+            self.s.player.bodies = bodies;
             self.s.player.activated = true;
             self.s.player.yaw_deg = self.s.checkpoint_yaw;
         }

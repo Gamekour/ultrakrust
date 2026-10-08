@@ -174,13 +174,18 @@ impl Bot {
             self.hold_t += dt;
             let any_enemy = g.s.enemies.iter().any(|e| e.alive && g.active(e.node));
             // wait out live enemies, but not ones out of sight for long (none targetable here)
-            if self.hold_t >= wp.hold && (!any_enemy || self.hold_t >= wp.hold + 6.0) {
+            let done = self.hold_t >= wp.hold && (!any_enemy || self.hold_t >= wp.hold + 6.0);
+            let here = flat.length() < wp.radius && to.y.abs() < 3.5;
+            if done && here {
                 self.idx += 1;
                 self.hold_t = -1.0;
                 self.best_dist = f32::MAX;
                 self.since_progress = 0.0;
             }
-            return out;
+            // strafing in a fight can carry it off the route: walk back to the waypoint first
+            if !done || here {
+                return out;
+            }
         }
         out.yaw_deg = to.x.atan2(-to.z).to_degrees();
         out.pitch_deg = -8.0;
@@ -195,8 +200,8 @@ impl Bot {
         }
         let fwd = Vec3::new(to.x, 0.0, to.z).normalize_or_zero();
         // running jump over gaps: no floor just ahead but the target is further away
-        let ahead = p.pos + fwd * 1.6;
-        let floor_ahead = g.world.raycast(ahead, Vec3::NEG_Y, 10.0).is_some();
+        // (a few samples: one ray can drop through the seam between two floor panels)
+        let floor_ahead = [1.3, 1.6, 1.9].iter().any(|d| g.world.raycast(p.pos + fwd * *d, Vec3::NEG_Y, 10.0).is_some());
         if !floor_ahead && p.gc.on_ground && flat.length() > 3.0 && to.y > -2.0 {
             out.input.jump_pressed = true;
             out.input.jump_held = true;

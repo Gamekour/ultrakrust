@@ -39,6 +39,66 @@ pub struct GroundCheck {
     pub bounce_chance: f32,
     pub has_impacted: bool,
     pub can_jump: bool,
+    /// [`Bodies`] colliders it overlaps: ground ones (ColliderIsCheckable) and enemy (layer 12) ones
+    pub body_cols: Vec<u32>,
+    pub enemy_cols: Vec<u32>,
+    /// currentEnemyCol
+    pub current_enemy_col: Option<u32>,
+}
+
+/// PhysicsManager collision matrix rows (bit per layer) for the player's GameObject layers:
+/// 2 (Ignore Raycast) normally, 15 (Invincible) while dashing or just hurt, and 20 for GroundCheck.
+pub const PLAYER_LAYER_COLLIDES: u32 = layer_bits(&[0, 1, 2, 4, 5, 6, 7, 8, 11, 12, 13, 14, 16, 18, 19, 22, 23, 24, 26, 28, 30, 31]);
+pub const INVINCIBLE_LAYER_COLLIDES: u32 = layer_bits(&[0, 1, 4, 6, 7, 8, 11, 16, 18, 22, 24, 26, 28, 30, 31]);
+pub const GROUND_CHECK_LAYER_COLLIDES: u32 = layer_bits(&[4, 6, 7, 8, 10, 11, 12, 16, 18, 24, 26, 28, 30, 31]);
+
+pub const fn layer_bits(layers: &[u8]) -> u32 {
+    let mut m = 0;
+    let mut i = 0;
+    while i < layers.len() {
+        m |= 1 << layers[i];
+        i += 1;
+    }
+    m
+}
+
+/// Colliders of the other rigidbodies the player touches (enemies). They stay out of the level
+/// [`World`] because the environment queries (LMD.Environment) never see them.
+#[derive(Clone, Debug, Default)]
+pub struct Bodies {
+    /// one moving group per body; a shape's owner is its scene collider index
+    pub world: World,
+    /// per owner: GameObject layer, isTrigger, "Slippery" tag
+    pub layer: Vec<u8>,
+    pub trigger: Vec<bool>,
+    pub slippery: Vec<bool>,
+    /// per owner: the group and the collider's transform position in the group's local space
+    pub anchor: Vec<(u32, Vec3)>,
+}
+
+impl Bodies {
+    pub fn enabled(&self, o: u32) -> bool {
+        self.world.owner_enabled.get(o as usize).copied().unwrap_or(false)
+    }
+
+    /// The collider's transform position now.
+    pub fn anchor(&self, o: u32) -> Vec3 {
+        let (g, p) = self.anchor[o as usize];
+        self.world.groups[g as usize].xf.transform_point3(p)
+    }
+
+    fn owners(&self, ids: Vec<ColliderId>) -> Vec<u32> {
+        let mut out: Vec<u32> = ids.into_iter().map(|id| self.world.owner(id)).collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// GroundCheck.ColliderIsCheckable for a body (no Environment layers among them).
+    fn checkable(&self, o: u32) -> bool {
+        let l = self.layer[o as usize];
+        !self.trigger[o as usize] && !self.slippery[o as usize] && (l == 11 || l == 26)
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -46,6 +106,8 @@ pub struct WallCheck {
     pub on_wall: bool,
     pub poc: Vec3,
     pub cols: Vec<ColliderId>,
+    /// layer-11 [`Bodies`] colliders (WallCheck.OnTriggerEnter takes BigCorpse too)
+    pub body_cols: Vec<u32>,
 }
 
 /// Events for the frontend (sounds, particles, camera shake).
@@ -140,6 +202,8 @@ pub struct Player {
     /// that are flagged invincible (most enemy attacks).
     pub invincible_layer: bool,
     pub hurt_invincibility: f32,
+    /// Enemy colliders (the game keeps their poses and enabled state current).
+    pub bodies: Bodies,
 
     // ClimbStep
     climb_cooldown: f32,
@@ -215,6 +279,7 @@ impl Player {
             cam_reset_requested: false,
             invincible_layer: false,
             hurt_invincibility: 0.0,
+            bodies: Bodies::default(),
             climb_cooldown: 0.0,
             move_dir: Vec3::ZERO,
             eye_offset: 0.0,
@@ -410,9 +475,23 @@ impl Player {
         } else {
             g.has_impacted = false;
         }
-        if self.wall.on_wall {
-            self.wall.on_wall = !self.wall.cols.is_empty();
+        // UpdateState: an enemy step only lasts while that collider is active and within 40
+        let gc_pos = self.gc_pos();
+        let g = &mut self.gc;
+        if g.can_jump && !g.current_enemy_col.is_some_and(|o| self.bodies.enabled(o) && self.bodies.anchor(o).distance(gc_pos) <= 40.0) {
+            g.can_jump = false;
         }
+        if self.wall.on_wall {
+            self.wall.on_wall = !self.wall.cols.is_empty() || !self.wall.body_cols.is_empty();
+        }
+    }
+
+    /// WallCheck.CheckForEnemyCols: any active layer-12 collider (triggers too) within 2.5 of the
+    /// wall check whose transform is closer than 40.
+    fn check_for_enemy_cols(&self) -> bool {
+        let wc = self.pos + WALL_CHECK_POS;
+        let b = &self.bodies;
+        b.owners(b.world.overlap_sphere(wc, 2.5)).into_iter().any(|o| b.layer[o as usize] == 12 && b.anchor(o).distance(wc) < 40.0)
     }
 
     fn check_landing(&mut self) {
@@ -433,10 +512,13 @@ impl Player {
 
     fn handle_inputs(&mut self, world: &World, input: &Input, dt: f32, now: f64) {
         let can_ground_jump = !self.falling;
-        let enemy_step = !self.gc.on_ground && self.gc.can_jump;
+        let enemy_step = !self.gc.on_ground && (self.gc.can_jump || self.check_for_enemy_cols());
         if input.jump_pressed && !self.jump_cooldown {
             if enemy_step {
                 self.enemy_stepping = true;
+                // EnemyStepResets (rocket, hammer and rocket-ride counters are not ported)
+                self.current_wall_jumps = 0;
+                self.cling_fade = 0.0;
                 if self.sliding || now - self.slide_timestamp < 0.1 {
                     self.wind_state = 0.5;
                 }
@@ -969,13 +1051,19 @@ impl Player {
             let before = cap.a;
             self.contact_normals.clear();
             world.depenetrate_capsule(&mut cap, &mut self.contact_normals);
+            let level_contacts = self.contact_normals.len();
+            // enemies: the layer matrix of the player's current layer, solid colliders only
+            let mask = if self.invincible_layer { INVINCIBLE_LAYER_COLLIDES } else { PLAYER_LAYER_COLLIDES };
+            let b = &self.bodies;
+            b.world.depenetrate_capsule_filtered(&mut cap, &mut self.contact_normals, |o| !b.trigger[o as usize] && mask & (1 << b.layer[o as usize]) != 0);
             self.pos += cap.a - before;
-            for n in self.contact_normals.iter() {
+            for (k, n) in self.contact_normals.iter().enumerate() {
                 let into = self.vel.dot(*n);
                 if into < 0.0 {
                     self.vel -= *n * into;
                 }
-                if n.y.abs() < 0.1 && !walls.iter().any(|w| w.dot(*n) > 0.99) {
+                // ClimbStep only climbs LMD.Environment colliders
+                if k < level_contacts && n.y.abs() < 0.1 && !walls.iter().any(|w| w.dot(*n) > 0.99) {
                     walls.push(*n);
                 }
             }
@@ -1045,17 +1133,21 @@ impl Player {
                 self.gc.super_jump_chance = 0.1;
             }
         }
-        self.gc.touching = !now.is_empty();
         self.gc.cols = now;
+        self.body_ground_check(gc_cap, false);
+        self.gc.touching = !self.gc.cols.is_empty() || !self.gc.body_cols.is_empty();
 
         let slope_cap = Capsule::unity(self.pos + SLOPE_CHECK_POS + Vec3::Y * COLLIDER_CENTER_Y, STAND_HEIGHT, SLOPE_RADIUS);
         let now = world.overlap_capsule(slope_cap);
-        self.slope.touching = !now.is_empty();
         self.slope.cols = now;
+        self.body_ground_check(slope_cap, true);
+        self.slope.touching = !self.slope.cols.is_empty() || !self.slope.body_cols.is_empty();
 
         let wc = self.pos + WALL_CHECK_POS;
         let cols: Vec<ColliderId> = world.overlap_sphere(wc, WALL_RADIUS).into_iter().filter(|c| !world.get(*c).slippery()).collect();
-        if cols.iter().any(|c| !self.wall.cols.contains(c)) {
+        let b = &self.bodies;
+        let body_cols: Vec<u32> = b.owners(b.world.overlap_sphere(wc, WALL_RADIUS)).into_iter().filter(|&o| b.layer[o as usize] == 11 && !b.trigger[o as usize] && !b.slippery[o as usize]).collect();
+        if cols.iter().any(|c| !self.wall.cols.contains(c)) || body_cols.iter().any(|o| !self.wall.body_cols.contains(o)) {
             self.wall.on_wall = true;
         }
         let mut best = f32::MAX;
@@ -1067,7 +1159,44 @@ impl Player {
                 self.wall.poc = p;
             }
         }
+        // CheckForCols: a lone BigCorpse collider still gives the point of contact
+        if cols.is_empty() {
+            let w = &self.bodies.world;
+            for id in w.overlap_sphere(wc, WALL_RADIUS).into_iter().filter(|id| body_cols.contains(&w.owner(*id))) {
+                let p = w.closest_point(id, wc);
+                let d = p.distance(wc);
+                if d < best && d < 5.0 {
+                    best = d;
+                    self.wall.poc = p;
+                }
+            }
+        }
         self.wall.cols = cols;
+        self.wall.body_cols = body_cols;
+    }
+
+    /// GroundCheck.OnTriggerEnter / OnTriggerExit against the [`Bodies`]: checkable colliders
+    /// (layers 11, 26) are ground; other non-Slippery layer-12 colliders, triggers included, allow an
+    /// enemy step. A collider that got disabled sends no exit (UpdateState's checks cover it).
+    fn body_ground_check(&mut self, cap: Capsule, slope: bool) {
+        let b = &self.bodies;
+        let now: Vec<u32> = b.owners(b.world.overlap_capsule(cap)).into_iter().filter(|&o| GROUND_CHECK_LAYER_COLLIDES & (1 << b.layer[o as usize]) != 0).collect();
+        let ground: Vec<u32> = now.iter().copied().filter(|&o| b.checkable(o)).collect();
+        let enemy: Vec<u32> = now.iter().copied().filter(|&o| !b.checkable(o) && !b.slippery[o as usize] && b.layer[o as usize] == 12).collect();
+        let g = if slope { &mut self.slope } else { &mut self.gc };
+        for &o in &g.enemy_cols {
+            if !enemy.contains(&o) && b.enabled(o) {
+                g.can_jump = false;
+            }
+        }
+        for &o in &enemy {
+            if !g.enemy_cols.contains(&o) {
+                g.current_enemy_col = Some(o);
+                g.can_jump = true;
+            }
+        }
+        g.body_cols = ground;
+        g.enemy_cols = enemy;
     }
 
     /// Render position (Rigidbody interpolation).
