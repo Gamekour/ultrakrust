@@ -11,8 +11,8 @@ use crate::db::AssetDb;
 use crate::scenedef::SceneDef;
 use crate::serialized::{SerializedFile, Value};
 use crate::shader::MaterialProps;
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 const CLASS_TEXTURE2D: i32 = 28;
 const CLASS_MATERIAL: i32 = 21;
@@ -34,6 +34,8 @@ pub struct UiTexture {
     pub wrap_u: i64,
     /// `m_TextureSettings.m_FilterMode` (0 Point, 1 Bilinear, 2 Trilinear)
     pub filter: i64,
+    /// the atlas of a dynamic font asset: its pixels are written at runtime
+    pub dynamic: Option<Arc<Mutex<DynAtlas>>>,
 }
 
 /// A Sprite with the UV / padding data `UnityEngine.Sprites.DataUtility` returns.
@@ -142,6 +144,104 @@ pub struct TmpFont {
     pub bold_spacing: f32,
     pub italic_style: f32,
     pub tab_size: f32,
+    /// AtlasPopulationMode.Dynamic with a source font file: the runtime additions
+    pub dynamic_atlas: Option<Arc<Mutex<DynAtlas>>>,
+}
+
+impl TmpFont {
+    /// m_GlyphLookupDictionary (serialized glyphs, then the ones added at runtime)
+    pub fn glyph(&self, g: u32) -> Option<Glyph> {
+        self.glyphs.get(&g).copied().or_else(|| self.dynamic_atlas.as_ref().and_then(|d| d.lock().unwrap().glyphs.get(&g).copied()))
+    }
+
+    /// characterLookupTable, then TryAddCharacterInternal for a dynamic font
+    pub fn character(&self, u: u32) -> Option<TmpCharacter> {
+        if let Some(c) = self.characters.get(&u) {
+            return Some(*c);
+        }
+        self.dynamic_atlas.as_ref().and_then(|d| d.lock().unwrap().try_add(u))
+    }
+}
+
+/// A dynamic font asset's runtime state (TMP_FontAsset.TryAddCharacterInternal): the characters and
+/// glyphs FontEngine added and the Alpha8 atlas it rendered them into.
+#[derive(Debug, Default)]
+pub struct DynAtlas {
+    ttf: Arc<Vec<u8>>,
+    point_size: f32,
+    padding: u32,
+    /// GlyphRenderMode 4169 SDFAA_HINTED
+    hinted: bool,
+    pub characters: HashMap<u32, TmpCharacter>,
+    pub glyphs: HashMap<u32, Glyph>,
+    /// m_MissingUnicodesFromFontFile
+    missing: HashSet<u32>,
+    free: Vec<crate::sdf::Rect>,
+    used: Vec<crate::sdf::Rect>,
+    pub width: u32,
+    pub height: u32,
+    /// Alpha8, bottom row first; empty while the texture is still the serialized 0x0
+    pub pixels: Vec<u8>,
+    /// bumped on every write to `pixels`
+    pub version: u64,
+}
+
+impl DynAtlas {
+    pub fn try_add(&mut self, unicode: u32) -> Option<TmpCharacter> {
+        if let Some(c) = self.characters.get(&unicode) {
+            return Some(*c);
+        }
+        if self.missing.contains(&unicode) {
+            return None;
+        }
+        let mut gi = crate::sdf::glyph_index(&self.ttf, unicode);
+        if gi == 0 {
+            gi = match unicode {
+                160 => crate::sdf::glyph_index(&self.ttf, 32),
+                173 | 8209 => crate::sdf::glyph_index(&self.ttf, 45),
+                _ => 0,
+            };
+            if gi == 0 {
+                self.missing.insert(unicode);
+                return None;
+            }
+        }
+        let c = TmpCharacter { glyph: gi, scale: 1.0 };
+        if self.glyphs.contains_key(&gi) {
+            self.characters.insert(unicode, c);
+            return Some(c);
+        }
+        let r = crate::sdf::render(&self.ttf, gi, self.point_size, self.padding, self.hinted)?;
+        // Texture2D.Resize + FontEngine.ResetAtlasTexture on first use
+        if self.pixels.is_empty() {
+            self.pixels = vec![0; (self.width * self.height) as usize];
+        }
+        let (w, h, p) = (r.width as i32, r.height as i32, self.padding as i32);
+        let mut rect = [0.0; 4];
+        if w > 0 && h > 0 {
+            // FontEngine packs (w + 2p + 1) x (h + 2p + 1) and places the glyph p + 1 in
+            // (measured on the static atlases); no multi-atlas: a full atlas fails the add
+            let n = crate::sdf::pack(&mut self.free, &mut self.used, w + 2 * p + 1, h + 2 * p + 1)?;
+            let (ox, oy) = (n[0] + 1, n[1] + 1);
+            let tw = w + 2 * p;
+            for j in 0..h + 2 * p {
+                for i in 0..tw {
+                    let (x, y) = (ox + i, oy + j);
+                    if x < self.width as i32 && y < self.height as i32 {
+                        self.pixels[(y * self.width as i32 + x) as usize] = r.sdf[(j * tw + i) as usize];
+                    }
+                }
+            }
+            rect = [(n[0] + p + 1) as f32, (n[1] + p + 1) as f32, w as f32, h as f32];
+            self.version += 1;
+        }
+        self.glyphs.insert(
+            gi,
+            Glyph { width: r.width, height: r.height, bearing_x: r.bearing_x, bearing_y: r.bearing_y, advance: r.advance, rect, scale: 1.0, atlas_index: 0 },
+        );
+        self.characters.insert(unicode, c);
+        Some(c)
+    }
 }
 
 /// A material a graphic is drawn with. `file` is what its texture PPtrs resolve against.
@@ -186,7 +286,12 @@ pub struct UiAssets {
     pub legacy_fonts: Vec<LegacyFont>,
     /// Canvas.GetDefaultCanvasMaterial (index into `materials`)
     pub default_material: Option<u32>,
-    /// TMP_Settings.defaultFontAsset is not in the scene; the first font any text uses stands in
+    /// TMP_Settings.missingGlyphCharacter (0 read as 9633)
+    pub missing_glyph: u32,
+    /// TMP_Settings.defaultFontAsset
+    pub default_font: Option<u32>,
+    /// TMP_Settings.fallbackFontAssets
+    pub settings_fallbacks: Vec<u32>,
     /// (script index, field path such as "m_Sprite" or "rankImages/3") -> asset
     pub refs: HashMap<(u32, String), UiRef>,
     pub warnings: Vec<String>,
@@ -263,6 +368,7 @@ impl Loader<'_> {
                 height: v.get("m_Height").i64() as u32,
                 wrap_u: v.get("m_TextureSettings").get("m_WrapU").i64(),
                 filter: v.get("m_TextureSettings").get("m_FilterMode").i64(),
+                dynamic: None,
             });
             Some(self.out.textures.len() as u32 - 1)
         })();
@@ -370,6 +476,92 @@ impl Loader<'_> {
         m
     }
 
+    /// The runtime state of a dynamic font asset: its source font's TTF, the serialized free / used
+    /// rects and atlas pixels. None without a source font (TryAddCharacterInternal fails).
+    fn dynamic_atlas(&mut self, f: &Arc<SerializedFile>, v: &Value, atlas_textures: &[Option<u32>]) -> Option<Arc<Mutex<DynAtlas>>> {
+        let (sf, sid) = self.db.resolve(f, v.get("m_SourceFontFile").pptr()).ok()??;
+        if sf.object(sid)?.class_id != CLASS_FONT {
+            return None;
+        }
+        let ttf: Vec<u8> = match sf.read_id(sid).ok()?.get("m_FontData") {
+            Value::Bytes(b) => b.clone(),
+            Value::Array(a) => a.iter().map(|x| x.i64() as u8).collect(),
+            _ => return None,
+        };
+        if ttf.is_empty() {
+            return None;
+        }
+        let r4 = |r: &Value| [r.get("m_X").i64() as i32, r.get("m_Y").i64() as i32, r.get("m_Width").i64() as i32, r.get("m_Height").i64() as i32];
+        let (width, height) = (v.get("m_AtlasWidth").i64() as u32, v.get("m_AtlasHeight").i64() as u32);
+        let render_mode = v.get("m_AtlasRenderMode").i64();
+        let mut free: Vec<_> = v.get("m_FreeGlyphRects").array().iter().map(r4).collect();
+        if free.is_empty() {
+            let num = if render_mode & 16 != 16 { 1 } else { 0 };
+            free.push([0, 0, width as i32 - num, height as i32 - num]);
+        }
+        // a populated serialized atlas starts from its pixels
+        let tex = atlas_textures.first().copied().flatten()?;
+        let t = &self.out.textures[tex as usize];
+        let mut pixels = Vec::new();
+        if t.width > 0 && t.height > 0 {
+            let (file, id) = (t.file.clone(), t.path_id);
+            if let Some(d) = self.db.file(&file).ok().and_then(|tf| tf.read_id(id).ok()).and_then(|tv| crate::texture::decode_texture(self.db, &tv).ok()) {
+                if d.width == width && d.height == height {
+                    pixels = d.rgba.chunks(4).map(|c| c[3]).collect();
+                }
+            }
+        }
+        let d = Arc::new(Mutex::new(DynAtlas {
+            ttf: Arc::new(ttf),
+            point_size: v.get("m_FaceInfo").get("m_PointSize").f32(),
+            padding: v.get("m_AtlasPadding").i64() as u32,
+            hinted: render_mode == 4169,
+            free,
+            used: v.get("m_UsedGlyphRects").array().iter().map(r4).collect(),
+            width,
+            height,
+            pixels,
+            ..Default::default()
+        }));
+        let t = &mut self.out.textures[tex as usize];
+        t.dynamic = Some(d.clone());
+        (t.width, t.height) = (width, height);
+        Some(d)
+    }
+
+    /// TMP_Settings ("TMP Settings" in resources.assets). No file of the build carries its typetree,
+    /// so the fields are read in their serialized order: MonoBehaviour header, m_Name, seven bools
+    /// (4-aligned), missingGlyphCharacter, warningsDisabled, defaultFontAsset, defaultFontAssetPath,
+    /// defaultFontSize, two autosize ratios, two default container sizes, two bools,
+    /// fallbackFontAssets.
+    fn tmp_settings(&mut self) {
+        let Ok(f) = self.db.file("resources.assets") else {
+            self.out.warnings.push("resources.assets: TMP_Settings unreadable".into());
+            return;
+        };
+        let Some(o) = f.objects.iter().find(|o| {
+            let s = (f.data_offset + o.byte_start) as usize;
+            o.class_id == CLASS_MONOBEHAVIOUR && f.data.get(s + 28..s + 44).is_some_and(|b| b[..4] == 12u32.to_le_bytes() && &b[4..] == b"TMP Settings")
+        }) else {
+            self.out.warnings.push("TMP_Settings not found".into());
+            return;
+        };
+        let s = (f.data_offset + o.byte_start) as usize;
+        let b = &f.data[s..s + o.byte_size as usize];
+        let i32_at = |o: usize| b.get(o..o + 4).map_or(0, |x| i32::from_le_bytes(x.try_into().unwrap()));
+        let i64_at = |o: usize| b.get(o..o + 8).map_or(0, |x| i64::from_le_bytes(x.try_into().unwrap()));
+        let m = i32_at(0x48) as u32;
+        self.out.missing_glyph = if m == 0 { 9633 } else { m };
+        let default = (i32_at(0x50), i64_at(0x54));
+        let path_len = i32_at(0x5c) as usize;
+        let mut at = (0x60 + path_len + 3) & !3;
+        at += 4 + 8 + 16 + 8;
+        let n = i32_at(at).max(0) as usize;
+        let fallbacks: Vec<(i32, i64)> = (0..n).map(|k| (i32_at(at + 4 + 12 * k), i64_at(at + 8 + 12 * k))).collect();
+        self.out.default_font = self.font(&f, default);
+        self.out.settings_fallbacks = fallbacks.into_iter().filter_map(|p| self.font(&f, p)).collect();
+    }
+
     fn font(&mut self, from: &Arc<SerializedFile>, pptr: (i32, i64)) -> Option<u32> {
         let (f, id) = self.db.resolve(from, pptr).ok()??;
         let key = (f.name.clone(), id);
@@ -458,12 +650,13 @@ impl Loader<'_> {
             kerning.insert(key, (gv(a), gv(b)));
         }
         let material = self.material(&f, v.get("material").pptr());
-        let atlas_textures = v.get("m_AtlasTextures").array().iter().map(|t| self.texture(&f, t.pptr())).collect();
+        let atlas_textures: Vec<Option<u32>> = v.get("m_AtlasTextures").array().iter().map(|t| self.texture(&f, t.pptr())).collect();
         let fallback_ptrs: Vec<(i32, i64)> = v.get("m_FallbackFontAssetTable").array().iter().map(|p| p.pptr()).collect();
         let fallbacks = fallback_ptrs.into_iter().filter_map(|p| self.font(&f, p)).collect();
         let weight_ptrs: Vec<((i32, i64), (i32, i64))> =
             v.get("m_FontWeightTable").array().iter().map(|w| (w.get("regularTypeface").pptr(), w.get("italicTypeface").pptr())).collect();
         let weights = weight_ptrs.into_iter().map(|(r, i)| (self.font(&f, r), self.font(&f, i))).collect();
+        let dynamic_atlas = if v.get("m_AtlasPopulationMode").i64() == 1 { self.dynamic_atlas(&f, &v, &atlas_textures) } else { None };
         self.out.fonts[idx as usize] = TmpFont {
             name: v.get("m_Name").str().to_string(),
             file: f.name.clone(),
@@ -487,6 +680,7 @@ impl Loader<'_> {
             bold_spacing: v.get("boldSpacing").f32(),
             italic_style: v.get("italicStyle").f32(),
             tab_size: v.get("tabSize").f32(),
+            dynamic_atlas,
         };
         Some(idx)
     }
@@ -582,6 +776,7 @@ pub fn load_ui_assets(db: &mut AssetDb, def: &SceneDef) -> UiAssets {
     if l.out.default_material.is_none() {
         l.out.warnings.push("UI/Default shader not found: default canvas material missing".into());
     }
+    l.tmp_settings();
     let mut files: HashMap<String, Arc<SerializedFile>> = HashMap::new();
     for (si, s) in def.scripts.iter().enumerate() {
         let file = match &s.file {

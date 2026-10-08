@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 ab_glyph = "0.2.32"
+skrifa = "0.44"
 bevy_math.workspace = true
 lz4_flex = "0.11"
 lzma-rs = "0.3"

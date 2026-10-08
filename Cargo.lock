@@ -5180,6 +5180,7 @@ dependencies = [
  "lzma-rs",
  "naga",
  "serde_json",
+ "skrifa 0.44.0",
  "texture2ddecoder",
 ]
 

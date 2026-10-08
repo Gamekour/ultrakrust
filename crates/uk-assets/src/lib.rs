@@ -15,6 +15,7 @@ pub mod reader;
 pub mod save;
 pub mod scene;
 pub mod scenedef;
+pub mod sdf;
 pub mod serialized;
 pub mod shader;
 pub mod smolv;

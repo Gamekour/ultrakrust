@@ -117,15 +117,23 @@ impl AssetDb {
                 if !sf.has_typetrees() {
                     // Built-in resources ship without typetrees; borrow them from files of
                     // the same Unity version that are already loaded.
+                    // MonoBehaviours borrow by script type hash.
                     let mut map = HashMap::new();
+                    let mut scripts = HashMap::new();
                     for f in self.files.values() {
                         for t in &f.types {
-                            if !t.nodes.is_empty() && t.class_id != 114 {
+                            if t.nodes.is_empty() {
+                                continue;
+                            }
+                            if t.class_id != 114 {
                                 map.entry(t.class_id).or_insert_with(|| t.nodes.clone());
+                            } else if let Some(h) = t.script_hash {
+                                scripts.entry(h).or_insert_with(|| t.nodes.clone());
                             }
                         }
                     }
                     let _ = sf.fallback.set(map);
+                    let _ = sf.fallback_scripts.set(scripts);
                 }
                 let sf = Arc::new(sf);
                 self.files.insert(name.to_string(), sf.clone());
@@ -139,9 +147,15 @@ impl AssetDb {
         if let Some(r) = self.resources.get(name) {
             return Some(r.clone());
         }
-        let bp = self.cab_to_bundle.get(name).cloned()?;
-        self.load_bundle(&bp).ok()?;
-        self.resources.get(name).cloned()
+        if let Some(bp) = self.cab_to_bundle.get(name).cloned() {
+            self.load_bundle(&bp).ok()?;
+            return self.resources.get(name).cloned();
+        }
+        // loose streams next to the player's serialized files (sharedassets0.assets.resS)
+        let p = Self::data_dir(&self.install).join(name);
+        let data: Arc<[u8]> = Arc::from(std::fs::read(&p).ok()?);
+        self.resources.insert(name.to_string(), data.clone());
+        Some(data)
     }
 
     /// Resolves a PPtr found in `from` to (file, path_id). Returns None for null pointers.

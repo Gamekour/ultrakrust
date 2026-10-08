@@ -21,6 +21,8 @@ pub struct TypeNode {
 #[derive(Debug, Clone)]
 pub struct SerType {
     pub class_id: i32,
+    /// MonoBehaviour script type hash (the same script has the same hash in every file of a build)
+    pub script_hash: Option<[u8; 16]>,
     pub nodes: Vec<TypeNode>,
 }
 
@@ -56,6 +58,8 @@ pub struct SerializedFile {
     index: HashMap<i64, usize>,
     /// class id -> typetree, for files stored without typetrees (built-in resources).
     pub fallback: OnceLock<HashMap<i32, Vec<TypeNode>>>,
+    /// script type hash -> MonoBehaviour typetree, for files stored without typetrees.
+    pub fallback_scripts: OnceLock<HashMap<[u8; 16], Vec<TypeNode>>>,
 }
 
 /// Generic decoded object field.
@@ -255,6 +259,7 @@ impl SerializedFile {
             externals,
             index,
             fallback: OnceLock::new(),
+            fallback_scripts: OnceLock::new(),
         })
     }
 
@@ -271,8 +276,12 @@ impl SerializedFile {
         let bytes = &self.data[start..start + obj.byte_size as usize];
         let mut r = Reader::new(bytes, self.big_endian);
         let own = &self.types[obj.type_index].nodes;
+        let ty = &self.types[obj.type_index];
+        let by_script = ty.script_hash.and_then(|h| self.fallback_scripts.get().and_then(|m| m.get(&h)));
         let nodes: &[TypeNode] = if !own.is_empty() {
             own
+        } else if let Some(n) = by_script {
+            n
         } else {
             self.fallback
                 .get()
@@ -293,12 +302,13 @@ fn read_type(r: &mut Reader, version: u32, is_ref: bool, has_tree: bool) -> Resu
     let class_id = r.i32()?;
     let _stripped = r.u8()?;
     let script_index = r.i16()?;
+    let mut script_hash = None;
     if (is_ref && script_index >= 0) || class_id == 114 {
-        r.skip(16)?;
+        script_hash = Some(<[u8; 16]>::try_from(r.take(16)?).unwrap());
     }
     r.skip(16)?;
     if !has_tree {
-        return Ok(SerType { class_id, nodes: Vec::new() });
+        return Ok(SerType { class_id, script_hash, nodes: Vec::new() });
     }
     let node_count = r.i32()? as usize;
     let str_size = r.i32()? as usize;
@@ -341,7 +351,7 @@ fn read_type(r: &mut Reader, version: u32, is_ref: bool, has_tree: bool) -> Resu
             r.skip(deps as usize * 4)?;
         }
     }
-    Ok(SerType { class_id, nodes })
+    Ok(SerType { class_id, script_hash, nodes })
 }
 
 /// Index just past the subtree rooted at `i`.

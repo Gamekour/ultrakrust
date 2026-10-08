@@ -867,15 +867,28 @@ pub fn build(
     // uGUI: every texture a Graphic can show and every material a Graphic can draw with
     let mut ui_skipped: Vec<String> = Vec::new();
     let ui = ui.map(|(udef, assets)| {
-        let mut decode = |db: &mut AssetDb, file: &str, path_id: i64| -> Option<u32> {
+        // `blank`: a dynamic font atlas (written at runtime in prepare), starts cleared
+        let mut decode = |db: &mut AssetDb, file: &str, path_id: i64, blank: Option<&uk_assets::ui::UiTexture>| -> Option<u32> {
             *texture_ids.entry((file.to_string(), path_id)).or_insert_with(|| {
+                if let Some(t) = blank {
+                    textures.push(TexCpu { width: t.width, height: t.height, rgba: vec![0; (t.width * t.height * 4) as usize], filter: t.filter, wrap: t.wrap_u, layers: 1 });
+                    return Some(textures.len() as u32 - 1);
+                }
                 let v = db.file(file).ok()?.read_id(path_id).ok()?;
                 let t = uk_assets::texture::decode_texture(db, &v).ok()?;
                 textures.push(TexCpu { width: t.width, height: t.height, rgba: t.rgba, filter: t.filter, wrap: t.wrap, layers: t.layers });
                 Some(textures.len() as u32 - 1)
             })
         };
-        let tex: Vec<Option<u32>> = assets.textures.iter().map(|t| decode(db, &t.file, t.path_id)).collect();
+        let tex: Vec<Option<u32>> = assets
+            .textures
+            .iter()
+            .enumerate()
+            .map(|(i, t)| match &t.dynamic {
+                Some(_) => decode(db, "", -1 - i as i64, Some(t)),
+                None => decode(db, &t.file, t.path_id, None),
+            })
+            .collect();
         let mut mats = Vec::new();
         for m in &assets.materials {
             let Some(sh) = db.file(&m.shader.0).ok().and_then(|f| f.read_id(m.shader.1).ok()).and_then(|v| ShaderAsset::from_value(&v).ok()) else {
@@ -925,7 +938,7 @@ pub fn build(
                 let Slot::Texture { name, dim: TexDim::D2, .. } = s else { continue };
                 let Some(env) = m.props.textures.get(name) else { continue };
                 let Some((tf, tid)) = mf.as_ref().and_then(|f| db.resolve(f, env.texture).ok().flatten()) else { continue };
-                if let Some(t) = decode(db, &tf.name.clone(), tid) {
+                if let Some(t) = decode(db, &tf.name.clone(), tid, None) {
                     textures_m.insert(name.clone(), t);
                 }
             }
@@ -1195,6 +1208,8 @@ struct UnityGpu {
     post_readback: std::sync::Mutex<Option<(Buffer, u32, UVec2)>>,
     /// every scene texture, and the stand-ins for unbound slots (kept for the per-frame UI draws)
     tex_views: Vec<TextureView>,
+    /// dynamic TMP font atlases: (texture, runtime atlas, uploaded version)
+    dyn_atlases: Vec<(Texture, Arc<std::sync::Mutex<uk_assets::ui::DynAtlas>>, u64)>,
     fallback: Option<(TextureView, TextureView, TextureView, Buffer)>,
     /// this frame's uGUI draws, in draw order
     ui_draws: Vec<UiGpuDraw>,
@@ -1741,7 +1756,27 @@ fn prepare(
                 ]
             })
             .collect();
-        let tex_views: Vec<TextureView> = scene.textures.iter().map(|t| upload_texture(&dev, &queue, t)).collect();
+        let mut tex_views: Vec<TextureView> = scene.textures.iter().map(|t| upload_texture(&dev, &queue, t)).collect();
+        gpu.dyn_atlases.clear();
+        if let Some(u) = &scene.ui {
+            for (i, t) in u.assets.textures.iter().enumerate() {
+                let (Some(d), Some(si)) = (&t.dynamic, u.tex[i]) else { continue };
+                let tc = &scene.textures[si as usize];
+                let tex = dev.create_texture(&TextureDescriptor {
+                    label: Some("dynamic font atlas"),
+                    size: Extent3d { width: tc.width.max(1), height: tc.height.max(1), depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: TextureDimension::D2,
+                    format: TextureFormat::Rgba8Unorm,
+                    usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                tex_views[si as usize] = tex.create_view(&TextureViewDescriptor::default());
+                // nothing uploaded yet: the first prepare writes the pixels as loaded
+                gpu.dyn_atlases.push((tex, d.clone(), u64::MAX));
+            }
+        }
         let white = solid_view(&dev, &queue, [255; 4], TexDim::D2);
         let black_cube = solid_view(&dev, &queue, [0, 0, 0, 255], TexDim::Cube);
         let black_3d = solid_view(&dev, &queue, [0, 0, 0, 0], TexDim::D3);
@@ -2211,6 +2246,21 @@ fn prepare(
     }
     gpu.staging = staging;
     gpu.in_view = in_view;
+    // FontEngine wrote glyphs into a dynamic atlas (Texture2D.Apply)
+    for (tex, d, uploaded) in &mut gpu.dyn_atlases {
+        let d = d.lock().unwrap();
+        if *uploaded == d.version || d.pixels.is_empty() {
+            continue;
+        }
+        *uploaded = d.version;
+        let rgba: Vec<u8> = d.pixels.iter().flat_map(|&a| [0, 0, 0, a]).collect();
+        queue.write_texture(
+            tex.as_image_copy(),
+            &rgba,
+            TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(d.width * 4), rows_per_image: Some(d.height) },
+            Extent3d { width: d.width, height: d.height, depth_or_array_layers: 1 },
+        );
+    }
     prepare_ui(gpu, &scene, &frame, &dev, &cache, &ctx, hud_ctx.as_ref(), screen);
     if let Some(pd) = scene.post.as_ref() {
         let g = PostGlobals {

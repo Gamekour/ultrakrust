@@ -889,12 +889,13 @@ impl<'a> Gen<'a> {
             };
             let face = fa.weights.get(num).and_then(|w| if italic { w.1 } else { w.0 });
             if let Some(face) = face {
-                if let Some(c) = self.font(face).characters.get(&u) {
+                // characterLookupTable, then TryAddCharacterInternal (dynamic)
+                if let Some(c) = self.font(face).character(u) {
                     return Some((face, c.glyph, c.scale, true));
                 }
             }
         }
-        if let Some(c) = fa.characters.get(&u) {
+        if let Some(c) = fa.character(u) {
             return Some((f, c.glyph, c.scale, false));
         }
         if fallbacks {
@@ -913,18 +914,35 @@ impl<'a> Gen<'a> {
         self.char_internal(u, f, fallbacks, &mut HashSet::new())
     }
 
-    /// TMP_Text.GetTextElement
-    fn text_element(&self, u: u32, f: u32) -> Option<(u32, u32, f32, bool)> {
+    /// TMP_FontAssetUtilities.GetCharacterFromFontAssets
+    fn char_from_fonts(&self, u: u32, list: &[u32]) -> Option<(u32, u32, f32, bool)> {
+        let mut visited = HashSet::new();
+        list.iter().find_map(|&fb| self.char_internal(u, fb, true, &mut visited))
+    }
+
+    /// TMP_Text.GetTextElement (no sprite assets: TMP_Settings' default sprite asset holds no
+    /// characters the scenes use)
+    fn text_element(&mut self, u: u32, f: u32) -> Option<(u32, u32, f32, bool)> {
         if let Some(r) = self.char_from_font(u, f, false) {
             return Some(r);
         }
-        let mut visited = HashSet::new();
-        for &fb in &self.font(f).fallbacks {
-            if let Some(r) = self.char_internal(u, fb, true, &mut visited) {
+        if let Some(r) = self.char_from_fonts(u, &self.font(f).fallbacks) {
+            return Some(r);
+        }
+        if f != self.main_font {
+            if let Some(r) = self.char_from_font(u, self.main_font, false) {
+                self.current_mat_idx = 0;
+                self.current_mat = self.refs[0].rt;
+                return Some(r);
+            }
+            if let Some(r) = self.char_from_fonts(u, &self.font(self.main_font).fallbacks) {
                 return Some(r);
             }
         }
-        None
+        if let Some(r) = self.char_from_fonts(u, &self.assets.settings_fallbacks) {
+            return Some(r);
+        }
+        self.assets.default_font.and_then(|d| self.char_from_font(u, d, true))
     }
 
     /// TextMeshProUGUI.SetArraySizes
@@ -973,14 +991,21 @@ impl<'a> Gen<'a> {
             }
             let mut el = self.text_element(u, self.current_font);
             if el.is_none() {
-                // TMP_Settings.missingGlyphCharacter 0 -> 9633; no TMP_Settings fallbacks / default font
-                for sub in [9633u32, 32, 3] {
-                    u = sub;
-                    self.chars[i as usize] = sub;
-                    el = self.char_from_font(sub, self.current_font, true);
+                // TMP_Settings.missingGlyphCharacter in the current font, the settings' fallbacks and
+                // default font; then space, then end of text, in the current font
+                u = self.assets.missing_glyph;
+                self.chars[i as usize] = u;
+                el = self
+                    .char_from_font(u, self.current_font, true)
+                    .or_else(|| self.char_from_fonts(u, &self.assets.settings_fallbacks))
+                    .or_else(|| self.assets.default_font.and_then(|d| self.char_from_font(u, d, true)));
+                for sub in [32u32, 3] {
                     if el.is_some() {
                         break;
                     }
+                    u = sub;
+                    self.chars[i as usize] = sub;
+                    el = self.char_from_font(sub, self.current_font, true);
                 }
             }
             let Some((ef, glyph, escale, alt)) = el else {
@@ -1010,7 +1035,7 @@ impl<'a> Gen<'a> {
                 }
                 self.current_mat_idx = self.add_ref(self.current_mat);
             }
-            let atlas_index = self.font(ef).glyphs.get(&glyph).map_or(0, |g| g.atlas_index);
+            let atlas_index = self.font(ef).glyph(glyph).map_or(0, |g| g.atlas_index);
             if atlas_index > 0 {
                 self.current_mat = self.rt.atlas(self.font(self.current_font), self.current_mat, atlas_index);
                 self.current_mat_idx = self.add_ref(self.current_mat);
@@ -1508,7 +1533,7 @@ impl<'a> Gen<'a> {
         let sp = if self.is_sdf { style_padding } else { 0.0 };
         let c = self.cr(self.cc);
         let fa = self.font(c.font);
-        let g = fa.glyphs.get(&c.glyph).copied().unwrap_or_default();
+        let g = fa.glyph(c.glyph).unwrap_or_default();
         color[3] = self.font_color32[3].min(color[3]);
         let (aw, ah) = (fa.atlas_width, fa.atlas_height);
         let uv = Vec2::new((g.rect[0] - padding - sp) / aw, (g.rect[1] - padding - sp) / ah);
@@ -1669,7 +1694,7 @@ impl<'a> Gen<'a> {
                 self.cr(self.cc - 1).point_size * num16 / pt * cf.face.scale
             };
             let (num18, num19) = (cf.face.ascent_line, cf.face.descent_line);
-            let glyph = cf.glyphs.get(&cur.glyph).copied().unwrap_or_default();
+            let glyph = cf.glyph(cur.glyph).unwrap_or_default();
             let mut num2 = num24 * self.fsm * cur.elem_scale * glyph.scale;
             let num17 = cf.face.baseline * num24 * self.fsm * cf.face.scale;
             self.c(self.cc).scale = num2;
