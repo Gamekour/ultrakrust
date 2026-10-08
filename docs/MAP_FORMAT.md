@@ -1,7 +1,8 @@
 # Custom map format: ULTRAKILL features (draft)
 
-> **Status: draft, not implemented.** Today's loader handles geometry, collision suffixes,
-> materials and lights (see the README). This document specifies the next layer: enemies,
+> **Status: draft, partly implemented.** Implemented: geometry, collision suffixes, materials and
+> lights (see the README), enemies outside waves, `-navmesh`, `-room` and `-door`. Each section
+> says what is implemented. This document specifies the next layer: enemies,
 > arenas and waves, doors, checkpoints and the other level scripts, authored in Blender with name
 > suffixes and collections. Every feature below maps onto a script the port already runs, so a
 > custom level plays by the same rules as the campaign. Features that aren't ported yet are left
@@ -84,7 +85,7 @@ Placement conventions:
 ### Geometry with behaviour
 | Suffix | Object | Becomes | Collision | Properties (default) |
 |---|---|---|---|---|
-| `-door` | Mesh | `Door` (Normal type) plus a `DoorController` area: it opens when the player comes near and closes behind them. Arenas lock it. | Convex | `open`: local offset when open, metres (up by its own height), `speed` m/s (to match 0-1's doors), `start_open` (false), `locked` (false), `trigger_size`: depth of the approach area each side, metres (to match 0-1) |
+| `-door` | Mesh | `Door` (Normal type) plus a `DoorController` area: it opens when the player comes near and closes behind them. Arenas lock it. | Convex | `open`: how far it slides up when open, metres (its own height), `speed` m/s (25, 0-1's), `start_open` (false), `locked` (false), `trigger_size`: depth of the approach area each side, metres (4, 0-1's), `rooms`: the two rooms it joins, by name (found beside it) |
 | `-breakable` | Mesh | `Breakable`: shatters when hit. | Convex | `weak` (false: any hit breaks it), `precision_only` (false) |
 | `-glass` | Mesh | `Glass`: breaks when hit or touched. | Tri | — |
 | `-water` | Mesh or empty volume | A `Water` volume: swimming physics and the underwater overlay. | Trigger | `color` RGBA (0, 0.5, 1, 1) |
@@ -97,11 +98,27 @@ Placement conventions:
 ## Collections
 | Suffix | Becomes | Contains |
 |---|---|---|
-| `-room` | A room: an organising group, and the scope of the arenas and doors inside it. | Anything |
+| `-room` | A room: loaded and unloaded by its doors, and the scope of the arenas inside it. Implemented. | Anything |
 | `-arena` | `ActivateArena` on each of its `-start` triggers. | One or more `-start` triggers, plus one or more `-wave` collections |
 | `-wave` | `ActivateNextWave` on the collection's node. | Enemies, plus an optional `-onclear` collection |
 | `-hidden` | Starts inactive. | Anything |
 | `-onclear` | (inside a wave) `ActivateNextWave.toActivate`: shown when the wave is cleared. | Anything |
+
+### How rooms load (implemented)
+This is the campaign's pattern (`door_rooms level0-1`: the door between rooms 4 and 5 loads 4 and
+5 and unloads 3 and 6):
+- **Each door joins two rooms.** They are the smallest rooms whose bounds (their meshes and
+  colliders, padded 0.5 m) hold the points 2 m out from the door's middle, along its thinnest
+  horizontal axis. The door's own collection counts as one of them. A `rooms` property names
+  them instead. A door that finds fewer than two warns.
+- **Opening a door** loads its two rooms (`Door.activatedRooms`).
+- **Entering its area** (`DoorController`, 4 m each side of the door) unloads the rooms that
+  border those two through other doors (`Door.deactivatedRooms`, by `Door.Optimize`).
+- **At the start** every room a door joins is unloaded, except the room holding the player
+  start. If no room holds it, every room starts loaded (warned).
+- **The parts:** the door's own node gets the `Door` (Normal type, 0-1's `Door (Large)` fields),
+  and a `DoorController` area sits beside it (layer 16). Both go in a wrapper node at the map's
+  root, as in 0-1, so a door never unloads with a room.
 
 ### How an arena runs
 This is exactly what the campaign's components do:
@@ -173,8 +190,8 @@ The parser warns on the following. A warning never stops the map from loading.
 - **Scripts:** components are written as `ScriptDef`s whose `data` holds the serialized field
   names of the original. Then `scripts::parse` and the ports run them as if they came from a
   bundle, and parity fixes to those scripts reach custom maps for free.
-- **Door defaults and the `DoorController` area size:** to be read from 0-1's doors, not
-  invented.
+- **Door defaults and the `DoorController` area size:** read from 0-1's `Door (Large) With
+  Controllers (1)` (speed 25, the area 4 m deep each side); the fields are copied from it.
 - **Navmesh:** build a `NavMeshData` from the `-navmesh` triangles (polygons, adjacency), the
   same structure that's loaded from the bundles.
 - **Name parsing:** `classify` moves from "first matching suffix" to peeling suffixes, ULTRAKILL

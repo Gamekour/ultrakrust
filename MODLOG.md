@@ -603,3 +603,18 @@ CPU-skinned enemies, 3,393 colliders/569 triggers, 11,758 MonoBehaviours with ty
   - The Stray backs off to the navmesh corner (10, -10) and stays there.
   - The Malicious Face now walks its navmesh toward the player.
 - 0-1 harness: only sim_budget fails (accepted); the east-stairs autopilot gap was already there.
+
+## 2026-10-08 — Custom maps: `-room` and `-door`
+- `-room` collections and `-door` meshes (convex collision) load and unload rooms the way 0-1 does (`gltf_map/rooms.rs`).
+  - Each door gets a copy of 0-1's `Door (Large) With Controllers (1)` Door and DoorController data, read before `prune_base`.
+  - The door node moves into its own wrapper at the map root (as in 0-1), with a `DoorController` sibling: a trigger box on layer 16, the door's width and height, 4 m deep each side.
+  - `openPos` is the door's height straight up, in the wrapper's space. `speed` is 25. `noPass` and `openLight` are null.
+- Room lists are derived from the map, following 0-1's pattern (`door_rooms level0-1`):
+  - The door's two rooms: the smallest room bounds holding the points 2 m out from its middle along its thinnest horizontal axis, plus the room it sits in, or the `rooms` property.
+  - `activatedRooms` is those two. `deactivatedRooms` is the rooms bordering them through other doors.
+  - Rooms a door joins start inactive, except the one holding the player start.
+- `room_probe` on a scratchpad map (rooms A, B, C in a row along -Z; Gate1 at z -5, Gate2 at z -15 with speed 10), walking forward:
+  - Lists: Gate1 activates A, B and deactivates C; Gate2 activates B, C and deactivates A. Both open by (0, 5, 0).
+  - t 0: A on, B and C off. At 0.30 s (z -0.58) Gate1 opens and B loads.
+  - At 0.91 s (z -10.56) Gate2 opens: A unloads, C loads. Each door closes behind the player (Gate1 at 0.85 s, Gate2 at 1.58 s).
+- `custom_maps/example.glb` still loads, with no rooms or doors and no warnings.

@@ -27,7 +27,8 @@
 //! ULTRAKILL suffixes (docs/MAP_FORMAT.md), on empties: `-filth`, `-stray` and `-maliciousface`
 //! place a copy of one of 0-1's enemies at the empty, standing on its origin and facing its
 //! forward (glTF -Z: Blender's +Y), in the level from the start (no spawn effect). Without a
-//! `-navmesh`, Filth and Strays walk straight at the player (warned).
+//! `-navmesh`, Filth and Strays walk straight at the player (warned). `-room` collections and
+//! `-door` meshes load and unload rooms as the campaign's doors do (see `rooms`).
 
 use crate::db::AssetDb;
 use crate::scene::{Batch, MaterialKey};
@@ -38,6 +39,8 @@ use crate::{Error, Result};
 use bevy_math::{Mat4, Quat, Vec3};
 use std::collections::HashMap;
 use std::path::Path;
+
+mod rooms;
 
 /// TagManager "Environment".
 pub const MAP_LAYER: u8 = 8;
@@ -61,6 +64,8 @@ pub struct MapReport {
     pub enemies: usize,
     /// navmesh polygons (from `-navmesh` triangles)
     pub nav_polys: usize,
+    pub rooms: usize,
+    pub doors: usize,
     pub warnings: Vec<String>,
 }
 
@@ -88,9 +93,13 @@ impl EnemyKind {
 pub fn custom_scene(db: &mut AssetDb, mut def: SceneDef, path: &Path) -> Result<(SceneDef, MapReport)> {
     // 0-1's humanoid agent settings, before pruning drops its navmesh
     let agent = def.navmeshes.iter().filter(|m| m.agent_type == 0).max_by_key(|m| m.tiles.len()).cloned();
+    let door_tpl = rooms::templates(&def);
     prune_base(&mut def)?;
-    let (mut report, enemies, nav_tris) = append_gltf_with(db, &mut def, path)?;
+    let (mut report, parsed) = append_gltf_with(db, &mut def, path)?;
+    let Parsed { root, enemies, nav_tris, rooms, doors } = parsed;
     place_enemies(&mut def, &enemies, &mut report);
+    // prune_base stands the player's feet on the origin
+    rooms::setup(&mut def, root, &rooms, &doors, door_tpl.as_ref(), Vec3::Y, &mut report);
     let mut nav = None;
     if !nav_tris.is_empty() {
         let (mesh, dropped) = crate::navmesh::from_triangles("glTF navmesh", &nav_tris, agent.as_ref());
@@ -234,10 +243,12 @@ struct NodeKind {
     enemy: Option<EnemyKind>,
     /// the mesh is navmesh (not drawn, no collision)
     navmesh: bool,
+    room: bool,
+    door: bool,
 }
 
 fn classify(raw: &str, warnings: &mut Vec<String>) -> NodeKind {
-    let mut k = NodeKind { name: raw.to_string(), noimp: false, col: Col::None, only: false, enemy: None, navmesh: false };
+    let mut k = NodeKind { name: raw.to_string(), noimp: false, col: Col::None, only: false, enemy: None, navmesh: false, room: false, door: false };
     if has_suffix(raw, "noimp") {
         k.noimp = true;
         return k;
@@ -245,6 +256,18 @@ fn classify(raw: &str, warnings: &mut Vec<String>) -> NodeKind {
     if let Some(&(s, e)) = EnemyKind::ALL.iter().find(|(s, _)| has_suffix(raw, s)) {
         k.name = strip_suffix(raw, s);
         k.enemy = Some(e);
+        return k;
+    }
+    if has_suffix(raw, "room") {
+        k.name = strip_suffix(raw, "room");
+        k.room = true;
+        return k;
+    }
+    // a door collides as its convex hull
+    if has_suffix(raw, "door") {
+        k.name = strip_suffix(raw, "door");
+        k.door = true;
+        k.col = Col::Convex;
         return k;
     }
     let found = [("convcolonly", Col::Convex, true), ("colonly", Col::Tri, true), ("convcol", Col::Convex, false), ("col", Col::Tri, false)].into_iter().find(|(s, ..)| has_suffix(raw, s));
@@ -284,6 +307,15 @@ fn set_field(v: &mut crate::serialized::Value, key: &str, on: bool) {
     }
 }
 
+/// Sets a serialized field on a struct value, adding it when missing.
+fn set_value(v: &mut crate::serialized::Value, key: &str, val: crate::serialized::Value) {
+    let crate::serialized::Value::Struct(fields) = v else { return };
+    match fields.iter_mut().find(|(k, _)| &**k == key) {
+        Some((_, f)) => *f = val,
+        None => fields.push((key.into(), val)),
+    }
+}
+
 fn extras_str(extras: &Option<Box<serde_json::value::RawValue>>, keys: &[&str]) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(extras.as_ref()?.get()).ok()?;
     keys.iter().find_map(|k| v.get(*k)?.as_str().map(str::to_uppercase))
@@ -314,6 +346,9 @@ struct Ctx<'a> {
     enemies: Vec<(EnemyKind, u32)>,
     /// `-navmesh` triangles, world space
     nav_tris: Vec<[Vec3; 3]>,
+    /// `-room` nodes
+    rooms: Vec<u32>,
+    doors: Vec<rooms::DoorProps>,
 }
 
 /// Adds the glTF file's default scene under a new root node.
@@ -323,9 +358,20 @@ pub fn append_gltf(db: &mut AssetDb, def: &mut SceneDef, path: &Path) -> Result<
     Ok(report)
 }
 
-/// `append_gltf`, also returning the enemy placements and the `-navmesh` triangles (Bevy world
-/// space); warnings are left to the caller.
-fn append_gltf_with(db: &mut AssetDb, def: &mut SceneDef, path: &Path) -> Result<(MapReport, Vec<(EnemyKind, u32)>, Vec<[Vec3; 3]>)> {
+/// What `append_gltf_with` found for `custom_scene` to wire up.
+struct Parsed {
+    /// the glTF scene's root node
+    root: u32,
+    enemies: Vec<(EnemyKind, u32)>,
+    /// `-navmesh` triangles, Bevy world space
+    nav_tris: Vec<[Vec3; 3]>,
+    rooms: Vec<u32>,
+    doors: Vec<rooms::DoorProps>,
+}
+
+/// `append_gltf`, also returning what the ULTRAKILL suffixes placed; warnings are left to the
+/// caller.
+fn append_gltf_with(db: &mut AssetDb, def: &mut SceneDef, path: &Path) -> Result<(MapReport, Parsed)> {
     let bytes = std::fs::read(path).map_err(|e| Error(format!("{}: {e}", path.display())))?;
     let g = gltf::Gltf::from_slice(&bytes).map_err(|e| Error(format!("{}: {e}", path.display())))?;
     let mut warnings = Vec::new();
@@ -363,18 +409,19 @@ fn append_gltf_with(db: &mut AssetDb, def: &mut SceneDef, path: &Path) -> Result
         rect: None,
     });
     let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
-    let mut cx = Ctx { def, buffers, material, surface, report: MapReport { nodes: 1, warnings, ..Default::default() }, next_id: -0x6c74_6700_0000, dir, mats: HashMap::new(), images: HashMap::new(), white: None, enemies: Vec::new(), nav_tris: Vec::new() };
+    let mut cx = Ctx { def, buffers, material, surface, report: MapReport { nodes: 1, warnings, ..Default::default() }, next_id: -0x6c74_6700_0000, dir, mats: HashMap::new(), images: HashMap::new(), white: None, enemies: Vec::new(), nav_tris: Vec::new(), rooms: Vec::new(), doors: Vec::new() };
     let scene = g.default_scene().or_else(|| g.scenes().next()).ok_or_else(|| Error("glTF has no scene".into()))?;
     for n in scene.nodes() {
         visit(&mut cx, &n, root, Mat4::IDENTITY);
     }
-    let (mut report, enemies, nav_tris) = (cx.report, cx.enemies, cx.nav_tris);
+    let parsed = Parsed { root, enemies: cx.enemies, nav_tris: cx.nav_tris, rooms: cx.rooms, doors: cx.doors };
+    let mut report = cx.report;
     // Blender's exporter leaves lights out unless asked to
     if report.lights == 0 {
         report.warnings.push("no lights in the file (Blender: export with Include > Data > Punctual Lights)".into());
     }
     report.warnings.dedup();
-    Ok((report, enemies, nav_tris))
+    Ok((report, parsed))
 }
 
 /// The placeholder material and the surface its collision geometry is tagged with (its own
@@ -438,9 +485,19 @@ fn visit(cx: &mut Ctx, n: &gltf::Node, parent: u32, parent_world: Mat4) {
         }
         cx.enemies.push((e, idx));
     }
+    if kind.room {
+        cx.rooms.push(idx);
+    }
+    if kind.door {
+        match n.mesh() {
+            Some(_) => cx.doors.push(rooms::DoorProps::read(idx, n.extras())),
+            None => cx.report.warnings.push(format!("{raw}: -door goes on a mesh; ignored")),
+        }
+    }
     match n.mesh() {
         Some(_) if kind.enemy.is_some() => {}
         Some(mesh) => add_mesh(cx, &mesh, idx, world, &kind),
+        None if kind.door => {}
         None if kind.navmesh => cx.report.warnings.push(format!("{raw}: -navmesh goes on a mesh; ignored")),
         None if kind.col != Col::None => add_empty_shape(cx, n, idx, world, &raw),
         None => {}

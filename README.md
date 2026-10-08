@@ -126,6 +126,18 @@ Add them to object names. They're case-insensitive, and `-x`, `_x` or `$x` all w
 empty's forward (Blender's +Y), and is in the level from the start, with no spawn bubble. There
 are no arenas or waves yet.
 
+**Rooms and doors** load and unload parts of the map as the campaign does. Put each room's
+contents in a collection named `-room` (export with *Full Collection Hierarchy*), and make each
+doorway a mesh named `-door` (it collides as its convex hull).
+- A door slides up by its own height when the player comes within 4 m of it, and closes behind
+  them. It joins the two rooms on either side of it (found 2 m out from its middle, along its
+  thinnest horizontal axis).
+- Opening a door loads its two rooms. Walking into a door's area unloads the rooms beyond them.
+- Every room that a door joins starts unloaded, except the room the player starts in.
+- Custom properties on a door: `open` (metres it slides up), `speed` (25 m/s), `start_open`,
+  `locked`, `trigger_size` (4 m: how far the area reaches each side) and `rooms` (`"A, B"`, the
+  rooms it joins by name, when they can't be found).
+
 **Navmesh:** name a mesh `-navmesh` (e.g. `Floor-navmesh`) to give enemies a walkable surface
 to path on. It is invisible and has no collision. Several `-navmesh` meshes merge into one.
 - **Leave about 0.5 m between its edge and walls.** The mesh is used as-is, like Godot's
