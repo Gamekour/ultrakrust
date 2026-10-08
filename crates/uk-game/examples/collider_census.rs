@@ -1,4 +1,5 @@
 //! Per level: collider components in the scene file vs colliders extracted, and why the rest were dropped.
+//! collider_census [level filter]; WARN=1 lists the scene's load warnings
 use uk_assets::{db::AssetDb, scenedef};
 fn main() {
     let filter = std::env::args().nth(1).unwrap_or_default();
@@ -17,5 +18,10 @@ fn main() {
         for c in &def.colliders { match c.shape { scenedef::ShapeDef::Box { .. } => got[0] += 1, scenedef::ShapeDef::Mesh(_) => got[1] += 1, scenedef::ShapeDef::Sphere { .. } => got[2] += 1, scenedef::ShapeDef::Capsule { .. } => got[3] += 1 } }
         let n = p.file_name().unwrap().to_string_lossy().replace("campaign_scenes_", "");
         println!("{:16} box {:5}/{:5} mesh {:5}/{:5} sphere {:4}/{:4} capsule {:4}/{:4} terrain {terrain} warnings {}", n.split(".bundle").next().unwrap(), got[0], in_file[0], got[1], in_file[1], got[2], in_file[2], got[3], in_file[3], def.warnings.len());
+        if std::env::var("WARN").is_ok() {
+            for w in &def.warnings {
+                println!("  {w}");
+            }
+        }
     }
 }

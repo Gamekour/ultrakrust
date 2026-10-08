@@ -541,7 +541,7 @@ fn add_light(cx: &mut Ctx, l: &gltf::khr_lights_punctual::Light, node: u32) {
 }
 
 /// Incremental 3D convex hull, outward-facing triangles. None when the points are (nearly) flat.
-fn convex_hull(tris: &[[Vec3; 3]]) -> Option<Vec<[Vec3; 3]>> {
+pub(crate) fn convex_hull(tris: &[[Vec3; 3]]) -> Option<Vec<[Vec3; 3]>> {
     let mut seen = HashMap::new();
     let pts: Vec<Vec3> = tris.iter().flatten().filter(|p| seen.insert(((p.x * 1e4) as i64, (p.y * 1e4) as i64, (p.z * 1e4) as i64), ()).is_none()).copied().collect();
     if pts.len() < 4 {
@@ -581,7 +581,8 @@ fn convex_hull(tris: &[[Vec3; 3]]) -> Option<Vec<[Vec3; 3]>> {
         if visible.is_empty() {
             continue;
         }
-        let edges: std::collections::HashSet<(usize, usize)> = visible.iter().flat_map(|f| [(f[0], f[1]), (f[1], f[2]), (f[2], f[0])]).collect();
+        // a Vec, not a set: the face order must not change between loads (determinism)
+        let edges: Vec<(usize, usize)> = visible.iter().flat_map(|f| [(f[0], f[1]), (f[1], f[2]), (f[2], f[0])]).collect();
         faces = rest;
         for &(u, v) in &edges {
             if !edges.contains(&(v, u)) {

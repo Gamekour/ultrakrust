@@ -14,7 +14,8 @@ pub const PORTED: &[(&str, Port)] = &[
     // progression / level scripts (scripts.rs)
     ("ObjectActivator", Port::Full),
     ("ObjectActivationCheck", Port::Full),
-    ("Door", Port::Partial("Normal door type only; no sounds")),
+    ("Door", Port::Partial("Normal and BigDoorController types; SubDoorController not ported; no sounds")),
+    ("BigDoor", Port::Partial("no sounds, openLight or screen shake")),
     ("DoorController", Port::Full),
     ("DoorOpener", Port::Full),
     ("ActivateArena", Port::Partial("forEnemy (Enemy-tagged trigger) arenas never activate")),

@@ -123,6 +123,10 @@ pub struct ObjectActivator {
 
 #[derive(Clone, Debug)]
 pub struct Door {
+    /// DoorType: 0 Normal (moves itself), 1 BigDoorController (its BigDoor children rotate),
+    /// 2 SubDoorController (not ported)
+    pub door_type: i64,
+    pub reverse_direction: bool,
     pub start_open: bool,
     pub open: bool,
     pub locked: bool,
@@ -147,11 +151,31 @@ pub struct Door {
     pub requests: i32,
     pub docons: Vec<u32>,
     pub doconless_col: Option<u32>,
+    /// BigDoorController: GetComponentsInChildren<BigDoor>(includeInactive)
+    pub bdoors: Vec<u32>,
+}
+
+/// A door leaf that rotates by `open_rotation` (Unity euler degrees) under a BigDoorController Door.
+#[derive(Clone, Debug)]
+pub struct BigDoor {
+    pub open: bool,
+    pub open_rotation: Vec3,
+    pub speed: f32,
+    pub gradual_speed_multiplier: f32,
+    pub reverse_direction: bool,
+    pub player_speed_multiplier: bool,
+    // runtime (Unity-space local rotations)
+    pub got_pos: bool,
+    pub orig_rot: Quat,
+    pub target_open: Quat,
+    pub temp_speed: f32,
+    pub controller: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
 pub struct DoorController {
     pub kind: i64,
+    pub reverse_direction: bool,
     pub door: Option<u32>,
     pub open: bool,
     pub player_in: bool,
@@ -285,6 +309,7 @@ pub enum Script {
     ObjectActivator(Box<ObjectActivator>),
     ObjectActivationCheck { ready: bool },
     Door(Box<Door>),
+    BigDoor(Box<BigDoor>),
     DoorController(DoorController),
     DoorOpener { door: Option<u32>, one_time: bool, done: bool },
     Arena(Arena),
@@ -373,6 +398,8 @@ pub fn parse(def: &SceneDef, idx: usize) -> Script {
         })),
         "ObjectActivationCheck" => Script::ObjectActivationCheck { ready: b("readyToActivate") },
         "Door" => Script::Door(Box::new(Door {
+            door_type: v.get("doorType").i64(),
+            reverse_direction: b("reverseDirection"),
             start_open: b("startOpen"),
             open: b("open"),
             locked: b("locked"),
@@ -396,9 +423,23 @@ pub fn parse(def: &SceneDef, idx: usize) -> Script {
             requests: v.get("requests").i64() as i32,
             docons: Vec::new(),
             doconless_col: None,
+            bdoors: Vec::new(),
+        })),
+        "BigDoor" => Script::BigDoor(Box::new(BigDoor {
+            open: b("open"),
+            open_rotation: Vec3::from(v.get("openRotation").vec3()),
+            speed: f("speed"),
+            gradual_speed_multiplier: f("gradualSpeedMultiplier"),
+            reverse_direction: b("reverseDirection"),
+            player_speed_multiplier: b("playerSpeedMultiplier"),
+            got_pos: false,
+            orig_rot: Quat::IDENTITY,
+            target_open: Quat::IDENTITY,
+            temp_speed: 0.0,
+            controller: None,
         })),
         "DoorController" => {
-            Script::DoorController(DoorController { kind: v.get("type").i64(), door: None, open: false, player_in: false, destroyed: false })
+            Script::DoorController(DoorController { kind: v.get("type").i64(), reverse_direction: b("reverseDirection"), door: None, open: false, player_in: false, destroyed: false })
         }
         "DoorOpener" => Script::DoorOpener { door: def.script_ref(v.get("door")), one_time: b("oneTime"), done: false },
         "ActivateArena" => Script::Arena(Arena {

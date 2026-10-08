@@ -1220,6 +1220,13 @@ fn add_objects(ld: &mut Loader, def: &mut SceneDef, raw_go: &HashMap<i64, Value>
                                     tris.push([p(t[0]), p(t[1]), p(t[2])]);
                                 }
                             }
+                            // PhysX collides a convex MeshCollider as the hull of its vertices
+                            // (flat meshes keep their triangles)
+                            if v.get("m_Convex").bool() {
+                                if let Some(hull) = crate::gltf_map::convex_hull(&tris) {
+                                    tris = hull;
+                                }
+                            }
                             ShapeDef::Mesh(tris)
                         }
                     };

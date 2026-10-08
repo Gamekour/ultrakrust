@@ -7,6 +7,7 @@ use crate::enemy::{self, Enemy, Projectile};
 use crate::scripts::{self, Call, Script, Target, UEvent};
 use bevy_math::{Affine3A, Mat4, Quat, Vec3};
 use std::sync::Arc;
+use uk_assets::scene::to_bevy_quat;
 use uk_assets::scenedef::{tags, SceneDef, ShapeDef};
 use uk_core::collide::{BoxCollider, Capsule, Shape, Triangle, World};
 use uk_core::player::{Input, Player};
@@ -96,6 +97,8 @@ pub struct State {
     pub local_pos: Vec<Vec3>,
     /// Nodes whose localScale a script has changed: (node, new localScale), Unity values.
     pub local_scale: Vec<(u32, Vec3)>,
+    /// Nodes whose localRotation a script has changed: (node, new localRotation), Bevy space.
+    pub local_rot: Vec<(u32, Quat)>,
     /// Light.enabled / Light.range per `SceneDef::lights` entry.
     pub lights: Vec<(bool, f32)>,
     pub invokes: Vec<Invoke>,
@@ -375,6 +378,12 @@ impl Game {
                 mark_mover(s.node, &mut world, &mut movers, &mut node_mover);
             }
         }
+        // BigDoor leaves rotate inside their (unmoving) BigDoorController Door's mover
+        for (i, s) in def.scripts.iter().enumerate() {
+            if matches!(scripts_rt[i], Script::BigDoor(_)) && !in_player(s.node) {
+                mark_mover(s.node, &mut world, &mut movers, &mut node_mover);
+            }
+        }
         for e in &enemies {
             mark_mover(e.node, &mut world, &mut movers, &mut node_mover);
         }
@@ -493,6 +502,7 @@ impl Game {
             scripts: scripts_rt,
             local_pos: def.nodes.iter().map(|n| n.local_pos).collect(),
             local_scale: Vec::new(),
+            local_rot: Vec::new(),
             lights: def.lights.iter().map(|l| (l.enabled, l.range)).collect(),
             invokes: Vec::new(),
             inside: Vec::new(),
@@ -830,6 +840,7 @@ impl Game {
                 }
             }
             Script::Door(_) => self.door_awake(sc),
+            Script::BigDoor(_) => self.big_door_awake(sc),
             Script::FinalDoorOpener { opened, .. } => {
                 if !*opened {
                     if let Some(fd) = self.parent_script(node, |s| matches!(s, Script::FinalDoor(_))) {
@@ -1395,10 +1406,25 @@ impl Game {
     fn door_awake(&mut self, sc: u32) {
         let node = self.def.scripts[sc as usize].node;
         let parent = self.def.nodes[node as usize].parent;
-        let docons = match parent {
-            Some(p) => self.children_scripts(p, |s| matches!(s, Script::DoorController(_))),
-            None => Vec::new(),
+        let Script::Door(d) = &self.s.scripts[sc as usize] else { return };
+        let door_type = d.door_type;
+        // BigDoor / SubDoor controllers look for DoorControllers below themselves, Normal doors
+        // beside themselves
+        let is_dc = |s: &Script| matches!(s, Script::DoorController(_));
+        let docons = match (door_type, parent) {
+            (1 | 2, _) => self.children_scripts(node, is_dc),
+            (_, Some(p)) => self.children_scripts(p, is_dc),
+            _ => Vec::new(),
         };
+        // GetComponentsInChildren<BigDoor>(true): inactive ones too
+        let mut bdoors = Vec::new();
+        if door_type == 1 {
+            let mut stack = vec![node];
+            while let Some(m) = stack.pop() {
+                bdoors.extend(self.scripts_by_node[m as usize].iter().copied().filter(|&b| matches!(self.s.scripts[b as usize], Script::BigDoor(_))));
+                stack.extend(self.def.nodes[m as usize].children.iter().rev().copied());
+            }
+        }
         let layer = self.def.nodes[node as usize].layer;
         let local = self.s.local_pos[node as usize];
         let solid_col = self.node_colliders(node).into_iter().find(|&c| !self.def.colliders[c as usize].trigger);
@@ -1411,15 +1437,25 @@ impl Game {
             d.got_pos = true;
             d.closed_pos = local;
             d.open_pos = local + d.open_offset;
-            if d.start_open {
+            if d.start_open && d.door_type == 0 {
                 self.s.local_pos[node as usize] = d.open_pos;
             }
         }
+        if d.door_type == 1 && d.start_open && !d.open {
+            for &b in &bdoors {
+                if let Script::BigDoor(bd) = &mut self.s.scripts[b as usize] {
+                    bd.open = true;
+                }
+            }
+        }
+        let Script::Door(d) = &mut self.s.scripts[sc as usize] else { return };
+        d.bdoors = bdoors;
         d.docons = docons;
         if d.docons.is_empty() && ![6u8, 8, 24].contains(&layer) {
             if let Some(c) = solid_col {
                 d.doconless_col = Some(c);
-                self.s.collider_enabled[c as usize] = !(d.start_open || d.open);
+                let leaves = d.door_type != 1 || !d.bdoors.is_empty();
+                self.s.collider_enabled[c as usize] = !d.start_open && !d.open && leaves;
             }
         }
         d.got_values = true;
@@ -1464,7 +1500,7 @@ impl Game {
         }
         let local = self.s.local_pos[node as usize];
         let Script::Door(d) = &mut self.s.scripts[sc as usize] else { return };
-        if (d.open && !skull) || local == d.open_pos {
+        if (d.open && !skull) || (local == d.open_pos && d.door_type == 0) {
             return;
         }
         if !d.got_values {
@@ -1473,10 +1509,21 @@ impl Game {
         }
         d.open = true;
         let close_others = !enemy_open && !d.dont_close_others && !d.docons.is_empty();
-        d.target_pos = d.open_pos;
-        d.in_pos = false;
+        if d.door_type == 0 {
+            d.target_pos = d.open_pos;
+            d.in_pos = false;
+        }
         if let Some(c) = d.doconless_col {
             self.s.collider_enabled[c as usize] = false;
+        }
+        if d.door_type == 1 {
+            let (bdoors, rev) = (d.bdoors.clone(), d.reverse_direction);
+            for b in bdoors {
+                if let Script::BigDoor(bd) = &mut self.s.scripts[b as usize] {
+                    bd.reverse_direction = rev;
+                }
+                self.big_door_open(b);
+            }
         }
         self.events.push(GameEvent::DoorMoved);
         if close_others {
@@ -1489,9 +1536,12 @@ impl Game {
                     continue;
                 }
                 let onode = self.def.scripts[other as usize].node;
-                let ctl = self.def.nodes[onode as usize]
-                    .parent
-                    .and_then(|p| self.child_script(p, |s| matches!(s, Script::DoorController(_))));
+                let is_dc = |s: &Script| matches!(s, Script::DoorController(_));
+                let ctl = if od.door_type != 0 {
+                    self.child_script(onode, is_dc)
+                } else {
+                    self.def.nodes[onode as usize].parent.and_then(|p| self.child_script(p, is_dc))
+                };
                 if let Some(ctl) = ctl {
                     if let Script::DoorController(dc) = &self.s.scripts[ctl as usize] {
                         if dc.kind == 0 {
@@ -1514,7 +1564,7 @@ impl Game {
             d.requests -= 1;
             return;
         }
-        if local == d.closed_pos {
+        if local == d.closed_pos && d.door_type == 0 {
             return;
         }
         d.open = false;
@@ -1524,10 +1574,17 @@ impl Game {
             d.requests = 0;
         }
         d.start_open = false;
-        d.target_pos = d.closed_pos;
-        d.in_pos = false;
+        if d.door_type == 0 {
+            d.target_pos = d.closed_pos;
+            d.in_pos = false;
+        }
         if let Some(c) = d.doconless_col {
             self.s.collider_enabled[c as usize] = true;
+        }
+        if d.door_type == 1 {
+            for b in d.bdoors.clone() {
+                self.big_door_close(b);
+            }
         }
         self.events.push(GameEvent::DoorMoved);
     }
@@ -1544,11 +1601,16 @@ impl Game {
             return;
         }
         d.locked = true;
-        let (np, closed) = (d.no_pass, d.closed_pos);
+        let (np, closed, door_type, bdoors) = (d.no_pass, d.closed_pos, d.door_type, d.bdoors.clone());
         if let Some(np) = np {
             self.set_active(np, true);
         }
-        if local != closed {
+        let open = match door_type {
+            0 => local != closed,
+            1 => bdoors.iter().any(|&b| matches!(&self.s.scripts[b as usize], Script::BigDoor(bd) if bd.open)),
+            _ => false,
+        };
+        if open {
             self.door_close(sc, true);
         }
     }
@@ -1581,7 +1643,7 @@ impl Game {
         let node = self.def.scripts[sc as usize].node;
         let local = self.s.local_pos[node as usize];
         let Script::Door(d) = &mut self.s.scripts[sc as usize] else { return };
-        if d.in_pos {
+        if d.in_pos || d.door_type != 0 {
             return;
         }
         let span = d.closed_pos.distance(d.open_pos).min(100.0).max(1e-4);
@@ -1599,6 +1661,104 @@ impl Game {
         }
     }
 
+    pub fn local_rot_of(&self, n: u32) -> Quat {
+        self.s.local_rot.iter().find(|e| e.0 == n).map_or(self.def.nodes[n as usize].local_rot, |e| e.1)
+    }
+
+    fn set_local_rot(&mut self, n: u32, q: Quat) {
+        match self.s.local_rot.iter_mut().find(|e| e.0 == n) {
+            Some(e) => e.1 = q,
+            None => self.s.local_rot.push((n, q)),
+        }
+    }
+
+    /// Unity-space localRotation (to_bevy_quat is its own inverse).
+    fn unity_local_rot(&self, n: u32) -> Quat {
+        to_bevy_quat(self.local_rot_of(n))
+    }
+
+    /// BigDoor.Awake.
+    fn big_door_awake(&mut self, sc: u32) {
+        let node = self.def.scripts[sc as usize].node;
+        let cur = self.unity_local_rot(node);
+        let controller = self.parent_script(node, |s| matches!(s, Script::Door(_)));
+        let Script::BigDoor(bd) = &mut self.s.scripts[sc as usize] else { return };
+        if !bd.got_pos {
+            bd.target_open = crate::particles::unity_euler(unity_euler_angles(cur) + bd.open_rotation);
+            bd.orig_rot = cur;
+            bd.got_pos = true;
+        }
+        bd.controller = controller;
+        bd.temp_speed = bd.speed;
+        if bd.open {
+            let t = bd.target_open;
+            self.set_local_rot(node, to_bevy_quat(t));
+        }
+    }
+
+    /// BigDoor.Open (no sounds or openLight).
+    fn big_door_open(&mut self, sc: u32) {
+        let node = self.def.scripts[sc as usize].node;
+        let cur = self.unity_local_rot(node);
+        let Script::BigDoor(bd) = &mut self.s.scripts[sc as usize] else { return };
+        if bd.open {
+            return;
+        }
+        bd.open = true;
+        // before Awake origRotation is still zero, the angle is not under 20 and Awake sets the target
+        if bd.got_pos && quat_angle(cur, bd.orig_rot) < 20.0 {
+            let sign = if bd.reverse_direction { -1.0 } else { 1.0 };
+            bd.target_open = crate::particles::unity_euler(unity_euler_angles(bd.orig_rot) + bd.open_rotation * sign);
+        }
+    }
+
+    fn big_door_close(&mut self, sc: u32) {
+        if let Script::BigDoor(bd) = &mut self.s.scripts[sc as usize] {
+            bd.open = false;
+        }
+    }
+
+    /// BigDoor.Update (no sounds, screen shake or openLight).
+    fn big_door_update(&mut self, sc: u32, dt: f32) {
+        let node = self.def.scripts[sc as usize].node;
+        let cur = self.unity_local_rot(node);
+        let pv = self.s.player.vel.length();
+        let Script::BigDoor(bd) = &mut self.s.scripts[sc as usize] else { return };
+        let goal = if bd.open { bd.target_open } else { bd.orig_rot };
+        let moving = !quat_eq(cur, goal);
+        if bd.gradual_speed_multiplier != 0.0 {
+            if moving {
+                bd.temp_speed += dt * bd.temp_speed * bd.gradual_speed_multiplier;
+            } else {
+                bd.temp_speed = bd.speed;
+            }
+        }
+        if !moving {
+            return;
+        }
+        let speed = if bd.player_speed_multiplier { bd.temp_speed.max(bd.temp_speed * pv / 15.0) } else { bd.temp_speed };
+        let new = quat_rotate_towards(cur, goal, dt * speed);
+        let (open, controller) = (bd.open, bd.controller);
+        self.set_local_rot(node, to_bevy_quat(new));
+        self.events.push(GameEvent::DoorMoved);
+        if !quat_eq(new, goal) {
+            return;
+        }
+        let Some(c) = controller else { return };
+        let Script::Door(d) = &self.s.scripts[c as usize] else { return };
+        // controller.onFullyOpened, or Door.BigDoorClosed
+        let calls = if open {
+            d.on_fully_opened.clone()
+        } else if d.door_type != 0 {
+            d.on_fully_closed.clone()
+        } else {
+            Vec::new()
+        };
+        for call in calls {
+            self.run_call(&call);
+        }
+    }
+
     fn door_controller_update(&mut self, sc: u32) {
         let Script::DoorController(dc) = &self.s.scripts[sc as usize] else { return };
         if dc.destroyed {
@@ -1608,8 +1768,13 @@ impl Game {
         let locked = self.door_locked(door);
         let (player_in, open, kind) = (dc.player_in, dc.open, dc.kind);
         if player_in && !open && !locked {
+            let mut rev = false;
             if let Script::DoorController(dc) = &mut self.s.scripts[sc as usize] {
                 dc.open = true;
+                rev = dc.reverse_direction;
+            }
+            if let Script::Door(d) = &mut self.s.scripts[door as usize] {
+                d.reverse_direction = rev;
             }
             self.door_optimize(door);
             match kind {
@@ -2367,12 +2532,23 @@ impl Game {
         if let Some(e) = self.s.enemies.iter().find(|e| e.node == mv.node) {
             return e.delta();
         }
-        let d = self.s.local_pos[node] - self.def.nodes[node].local_pos;
-        if d == Vec3::ZERO {
-            return Affine3A::IDENTITY;
+        let nd = &self.def.nodes[node];
+        let d = self.s.local_pos[node] - nd.local_pos;
+        let rot = self.s.local_rot.iter().find(|e| e.0 == mv.node).map(|e| e.1);
+        let parent_lin = nd.parent.map(|p| self.def.nodes[p as usize].world0).unwrap_or(Mat4::IDENTITY);
+        match rot {
+            Some(r) if r != nd.local_rot => {
+                // parent * T(pos) * R * R0^-1 * T(-pos0) * parent^-1
+                let m = parent_lin
+                    * Mat4::from_translation(self.s.local_pos[node])
+                    * Mat4::from_quat(r * nd.local_rot.inverse())
+                    * Mat4::from_translation(-nd.local_pos)
+                    * parent_lin.inverse();
+                Affine3A::from_mat4(m)
+            }
+            _ if d == Vec3::ZERO => Affine3A::IDENTITY,
+            _ => Affine3A::from_translation(parent_lin.transform_vector3(d)),
         }
-        let parent_lin = self.def.nodes[node].parent.map(|p| self.def.nodes[p as usize].world0).unwrap_or(Mat4::IDENTITY);
-        Affine3A::from_translation(parent_lin.transform_vector3(d))
     }
 
     fn sync_world(&mut self) {
@@ -2728,6 +2904,7 @@ impl Game {
             }
             match &self.s.scripts[sc as usize] {
                 Script::Door(_) => self.door_update(sc, dt),
+                Script::BigDoor(_) => self.big_door_update(sc, dt),
                 Script::SpawnEffect { .. } => self.spawn_effect_update(sc, dt),
                 Script::DoorController(_) => self.door_controller_update(sc),
                 Script::ObjectActivator(oa) => {
@@ -2833,4 +3010,32 @@ pub(crate) fn shape_closest_point(shape: &ShapeDef, p: Vec3) -> Vec3 {
             .min_by(|x, y| x.distance_squared(p).total_cmp(&y.distance_squared(p)))
             .unwrap_or(p),
     }
+}
+
+/// Quaternion == (dot above 1 - 1e-6).
+fn quat_eq(a: Quat, b: Quat) -> bool {
+    a.dot(b) > 0.999999
+}
+
+/// Quaternion.Angle in degrees.
+fn quat_angle(a: Quat, b: Quat) -> f32 {
+    if quat_eq(a, b) {
+        return 0.0;
+    }
+    a.dot(b).abs().min(1.0).acos() * 2.0 * 57.29578
+}
+
+/// Quaternion.RotateTowards.
+fn quat_rotate_towards(from: Quat, to: Quat, max_deg: f32) -> Quat {
+    let a = quat_angle(from, to);
+    if a == 0.0 {
+        return to;
+    }
+    from.slerp(to, (max_deg / a).min(1.0))
+}
+
+/// Quaternion.eulerAngles: degrees in [0, 360), applied Z, X, then Y.
+fn unity_euler_angles(q: Quat) -> Vec3 {
+    let (y, x, z) = q.to_euler(bevy_math::EulerRot::YXZ);
+    (Vec3::new(x, y, z) * 57.29578).map(|v| v.rem_euclid(360.0))
 }
