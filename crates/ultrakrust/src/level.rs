@@ -82,6 +82,7 @@ pub fn load(
             prefs.set(k, v);
         }
     }
+    game.save = uk_assets::save::Save::load(&install, prefs.int("selectedSaveSlot"));
     game.prefs = prefs;
     game.set_ui(uk_assets::ui::load_ui_assets(&mut db, &def));
 

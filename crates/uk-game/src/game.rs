@@ -25,6 +25,8 @@ pub enum Act {
     HideMessage,
     /// PlayerActivatorRelay.Activate
     HudRelay,
+    /// LevelStatsEnabler.LevelStatsTutorial
+    LevelStatsTutorial,
 }
 
 #[derive(Clone, Debug)]
@@ -252,6 +254,10 @@ pub struct Game {
     pub sway: Option<crate::hud::Sway>,
     /// GunControl.gunPanel: the weapon icon panels
     gun_panel: Vec<u32>,
+    /// The player's save slot and PlayerPrefs (read-only; PlayerPrefs writes stay in memory)
+    pub save: uk_assets::save::Save,
+    /// UI actions this frame, set by the frontend before `update`
+    pub hud_input: crate::hud::HudInput,
 }
 
 struct WaterDef {
@@ -466,6 +472,8 @@ impl Game {
             prefs: Default::default(),
             colors: crate::hud::ColorBlind { variation: Vec::new(), hud: [crate::hud::WHITE; 10] },
             sway: crate::hud::Sway::from_def(&def),
+            save: Default::default(),
+            hud_input: Default::default(),
             gun_panel: def.scripts.iter().find(|s| s.class == "GunControl").map_or(Vec::new(), |s| s.data.get("gunPanel").array().iter().filter_map(|p| def.node_ref(p)).collect()),
         };
         g.distortion_fields = (0..def.scripts.len() as u32)
@@ -1768,6 +1776,12 @@ impl Game {
         self.s.player.prev_pos = self.s.player.pos;
     }
 
+    /// HudMessageReceiver.SendHudMessage (automatic timer)
+    pub fn send_hud_message(&mut self, text: &str) {
+        self.s.messages.retain(|m| m.owner.is_some());
+        self.s.messages.push(Message { text: text.to_string(), owner: None, until: Some(self.s.time + 5.0) });
+    }
+
     fn hud_message(&mut self, sc: u32, enter: bool) {
         let Script::HudMessage(h) = &mut self.s.scripts[sc as usize] else { return };
         if enter {
@@ -2265,6 +2279,7 @@ impl Game {
                 }
                 Act::HideMessage => {}
                 Act::HudRelay => self.relay_activate(inv.script),
+                Act::LevelStatsTutorial => self.level_stats_tutorial(),
             }
         }
         // per-script Update

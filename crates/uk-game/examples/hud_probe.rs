@@ -69,6 +69,7 @@ fn main() {
             prefs.set(k, v.parse::<f64>().unwrap());
         }
     }
+    g.save = uk_assets::save::Save::load(&install, prefs.int("selectedSaveSlot"));
     g.prefs = prefs;
     g.set_ui(ui::load_ui_assets(&mut db, &def));
     let assets = g.ui_assets.clone().unwrap();
@@ -110,6 +111,27 @@ fn main() {
             }
         }
     }
+    // LevelStatsEnabler: rank data, PlayerPrefs, Tab hold / double tap
+    println!("levelNumber={} rank={:?} LevStaOpe={} LevStaTut={}", g.level_number(), g.save.rank(g.level_number()).map(|r| r.get("levelNumber").i64()), g.save.pp_int("LevStaOpe", 0), g.save.pp_int("LevStaTut", 0));
+    let lse: Vec<(u32, Option<u32>)> = g.s.scripts.iter().enumerate().filter_map(|(sc, s)| match s { Script::Hud(h) => match &**h { HudScript::LevelStatsEnabler(e) => Some((g.def.scripts[sc].node, e.level_stats)), _ => None }, _ => None }).collect();
+    let show_ls = |g: &Game| lse.iter().map(|&(n, c)| format!("{}={} child={:?}", g.def.path(n), g.active(n) as u8, c.map(|c| g.active(c) as u8))).collect::<Vec<_>>().join(" ");
+    println!("LSE: {}", show_ls(&g));
+    let tab = |g: &mut Game, t: &mut f64, p: bool, c: bool, label: &str| {
+        g.hud_input = uk_game::hud::HudInput { stats_performed: p, stats_canceled: c };
+        step(g, 1, t);
+        g.hud_input = Default::default();
+        println!("  {label}: {} LevStaOpe={}", show_ls(g), g.save.pp_int("LevStaOpe", 0));
+    };
+    tab(&mut g, &mut t, true, false, "tab down");
+    step(&mut g, 30, &mut t);
+    tab(&mut g, &mut t, false, true, "tab up (0.5s)");
+    step(&mut g, 40, &mut t);
+    tab(&mut g, &mut t, true, false, "tab down (after doubleTap expiry)");
+    tab(&mut g, &mut t, false, true, "tab up");
+    tab(&mut g, &mut t, true, false, "tab down again (double tap)");
+    tab(&mut g, &mut t, false, true, "tab up (kept open)");
+    tab(&mut g, &mut t, true, false, "tab down (close)");
+    tab(&mut g, &mut t, false, true, "tab up");
     // uGUI draws of the HUD
     let frame = |g: &Game| {
         ugui::build_frame(&UiInput { def: &g.def, ui: g.ui.as_ref().unwrap(), assets: &assets, state: &g.s.ui, active: &g.s.active, script_enabled: &g.s.script_enabled, screen: [1920.0, 1080.0], dpi: 96.0, world_of: Some(&|n| g.node_world(n)) })

@@ -274,6 +274,24 @@ pub enum HudScript {
     ColorGet { hct: usize, variation: Option<usize> },
     Controller(Box<Controller>),
     Pos(Box<HudPos>),
+    LevelStatsEnabler(Box<LevelStatsEnabler>),
+}
+
+#[derive(Clone, Debug)]
+pub struct LevelStatsEnabler {
+    pub secret_level: i64,
+    pub can_always_enable: bool,
+    pub level_stats: Option<u32>,
+    pub keep_open: bool,
+    pub double_tap: f32,
+}
+
+/// The frontend's UI input this frame (InputManager actions the HUD scripts read).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HudInput {
+    /// Stats (Tab): WasPerformedThisFrame / WasCanceledThisFrame
+    pub stats_performed: bool,
+    pub stats_canceled: bool,
 }
 
 fn v2(v: &Value) -> [f32; 2] {
@@ -373,6 +391,13 @@ pub fn parse(def: &SceneDef, idx: usize) -> Option<HudScript> {
             anchored_position: v2(v.get("anchoredPosition")),
             default_rect: None,
             default_tr: None,
+        })),
+        "LevelStatsEnabler" => HudScript::LevelStatsEnabler(Box::new(LevelStatsEnabler {
+            secret_level: v.get("secretLevel").i64(),
+            can_always_enable: b("canAlwaysEnable"),
+            level_stats: None,
+            keep_open: false,
+            double_tap: 0.0,
         })),
         _ => return None,
     })
@@ -576,6 +601,7 @@ impl Game {
             Some(HudScript::ColorGet { .. }) => self.color_get_update(sc),
             Some(HudScript::Controller(_)) => self.controller_start(sc),
             Some(HudScript::Pos(_)) => self.hud_pos_check(sc),
+            Some(HudScript::LevelStatsEnabler(_)) => self.level_stats_enabler_start(sc),
             _ => {}
         }
     }
@@ -593,6 +619,7 @@ impl Game {
                 Some(HudScript::OpenEffect(_)) => self.open_effect_update(sc, dt),
                 Some(HudScript::HealthBar(_)) => self.health_bar_update(sc, dt),
                 Some(HudScript::Stamina(_)) => self.stamina_update(sc, dt),
+                Some(HudScript::LevelStatsEnabler(_)) => self.level_stats_enabler_update(sc, dt),
                 _ => {}
             }
         }
@@ -1071,6 +1098,85 @@ impl Game {
             if tr != rest_local(&self.def, node) || self.s.ui.local.contains_key(&node) {
                 self.s.ui.local.insert(node, tr);
             }
+        }
+    }
+
+    // ---------------------------------------------------------------- LevelStatsEnabler
+
+    /// StatsManager.levelNumber
+    pub fn level_number(&self) -> i64 {
+        self.def.scripts.iter().find(|s| s.class == "StatsManager").map_or(0, |s| s.data.get("levelNumber").i64())
+    }
+
+    /// LevelStatsEnabler.Start (a release build, not a custom level)
+    fn level_stats_enabler_start(&mut self, sc: u32) {
+        let node = self.def.scripts[sc as usize].node;
+        let Some(HudScript::LevelStatsEnabler(e)) = self.hud(sc).cloned() else { return };
+        if !e.can_always_enable {
+            let hide = if e.secret_level < 0 {
+                let lvl = self.level_number();
+                let rank = if lvl != 0 { self.save.rank(lvl) } else { None };
+                lvl == 0 || rank.is_none_or(|r| r.get("levelNumber").i64() != lvl)
+            } else {
+                let m = self.save.general().map_or(0, |g| g.get("secretMissions").array().get(e.secret_level as usize).map_or(0, |v| v.i64()));
+                m < 2
+            };
+            if hide {
+                self.save.player_prefs.insert("LevStaOpe".into(), uk_assets::save::PlayerPref::Int(0));
+                self.set_active(node, false);
+            } else if e.secret_level < 0 && self.save.pp_int("LevStaTut", 0) == 0 {
+                self.invoke(sc, Act::LevelStatsTutorial, 1.5);
+            }
+        }
+        let child = self.def.nodes[node as usize].children.first().copied();
+        let open = self.save.pp_int("LevStaOpe", 0) != 0;
+        if let Some(HudScript::LevelStatsEnabler(e)) = self.hud(sc) {
+            e.level_stats = child;
+            e.keep_open = open;
+        }
+        if let (Some(c), false) = (child, open) {
+            self.set_active(c, false);
+        }
+    }
+
+    /// LevelStatsEnabler.LevelStatsTutorial
+    pub(crate) fn level_stats_tutorial(&mut self) {
+        self.save.player_prefs.insert("LevStaTut".into(), uk_assets::save::PlayerPref::Int(1));
+        self.send_hud_message("Hold <color=orange>TAB</color> to see current stats when <color=orange>REPLAYING</color> a level.
+<color=orange>DOUBLE TAP</color> to keep open.");
+    }
+
+    fn level_stats_enabler_update(&mut self, sc: u32, dt: f32) {
+        let inp = self.hud_input;
+        let Some(HudScript::LevelStatsEnabler(e)) = self.hud(sc) else { return };
+        let mut set = None;
+        let mut pref = None;
+        if !e.keep_open {
+            if inp.stats_performed {
+                if e.double_tap > 0.0 {
+                    pref = Some(1);
+                    e.keep_open = true;
+                } else {
+                    e.double_tap = 0.5;
+                }
+                set = Some(true);
+            } else if inp.stats_canceled {
+                set = Some(false);
+            }
+        } else if inp.stats_performed {
+            e.keep_open = false;
+            pref = Some(0);
+            set = Some(false);
+        }
+        if e.double_tap > 0.0 {
+            e.double_tap = move_towards(e.double_tap, 0.0, dt);
+        }
+        let ls = e.level_stats;
+        if let Some(p) = pref {
+            self.save.player_prefs.insert("LevStaOpe".into(), uk_assets::save::PlayerPref::Int(p));
+        }
+        if let (Some(on), Some(n)) = (set, ls) {
+            self.set_active(n, on);
         }
     }
 

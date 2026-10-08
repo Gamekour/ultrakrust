@@ -486,6 +486,7 @@ fn frame_sim(
         },
     };
     sim.fixed_input = PInput { move_axis: axis, jump_held: input.jump_held, ..default() };
+    sim.game.hud_input = uk_game::hud::HudInput { stats_performed: keys.just_pressed(KeyCode::Tab), stats_canceled: keys.just_released(KeyCode::Tab) };
 
     // Camera input is locked while V1 falls into the level (GameState "pit-falling").
     let can_look = captured && (sim.game.s.player.activated || sim.noclip);
