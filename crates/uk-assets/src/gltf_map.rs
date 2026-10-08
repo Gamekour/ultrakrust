@@ -13,8 +13,11 @@
 //! (`empty_display_type` / `empty_draw_type`: CUBE -> box of size 2, IMAGE -> world boundary,
 //! SINGLE_ARROW -> ray, which Unity has no collider for, anything else -> sphere of radius 1).
 //!
-//! Cameras are not imported. Lights (KHR_lights_punctual) become Unity lights by type. Every mesh
-//! draws with one placeholder material (0-2's exit elevator floor), every collider is a static
+//! Cameras are not imported. Lights (KHR_lights_punctual) become Unity lights by type. Meshes draw
+//! with 0-2's exit elevator floor material (ULTRAKILL/Master); a glTF material overrides its base
+//! colour (`_MainTex` x `_Color`) and emission (EMISSIVE: `_EmissiveTex` x `_EmissiveColor`,
+//! `_EmissiveIntensity` from KHR_materials_emissive_strength). Smoothness and metallic are taken
+//! as 0 (the shader has no such inputs outside REFLECTION). Every collider is a static
 //! Environment (layer 8) collider, and the collision geometry is tagged as a metal surface.
 //!
 //! The rest of the scene comes from 0-1: its player rig (HUD included), GameController managers,
@@ -22,7 +25,9 @@
 
 use crate::db::AssetDb;
 use crate::scene::{Batch, MaterialKey};
-use crate::scenedef::{ColliderDef, LightDef, NodeDef, RenderDef, SceneDef, ShapeDef, SurfaceMat, SurfaceMeshDef};
+use crate::scenedef::{ColliderDef, LightDef, MaterialOverride, NodeDef, RenderDef, SceneDef, ShapeDef, SurfaceMat, SurfaceMeshDef};
+use crate::texture::TextureData;
+use std::sync::Arc;
 use crate::{Error, Result};
 use bevy_math::{Mat4, Quat, Vec3};
 use std::collections::HashMap;
@@ -44,6 +49,8 @@ pub struct MapReport {
     pub renderers: usize,
     pub colliders: usize,
     pub lights: usize,
+    pub materials: usize,
+    pub textures: usize,
     pub tris: usize,
     pub warnings: Vec<String>,
 }
@@ -160,6 +167,12 @@ struct Ctx<'a> {
     surface: SurfaceMat,
     report: MapReport,
     next_id: i64,
+    dir: std::path::PathBuf,
+    /// glTF material -> index into `material_overrides`
+    mats: HashMap<usize, u32>,
+    /// glTF texture -> decoded image (None: undecodable)
+    images: HashMap<usize, Option<Arc<TextureData>>>,
+    white: Option<Arc<TextureData>>,
 }
 
 /// Adds the glTF file's default scene under a new root node.
@@ -200,7 +213,8 @@ pub fn append_gltf(db: &mut AssetDb, def: &mut SceneDef, path: &Path) -> Result<
         world0: Mat4::IDENTITY,
         rect: None,
     });
-    let mut cx = Ctx { def, buffers, material, surface, report: MapReport { nodes: 1, warnings, ..Default::default() }, next_id: -0x6c74_6700_0000 };
+    let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let mut cx = Ctx { def, buffers, material, surface, report: MapReport { nodes: 1, warnings, ..Default::default() }, next_id: -0x6c74_6700_0000, dir, mats: HashMap::new(), images: HashMap::new(), white: None };
     let scene = g.default_scene().or_else(|| g.scenes().next()).ok_or_else(|| Error("glTF has no scene".into()))?;
     for n in scene.nodes() {
         visit(&mut cx, &n, root, Mat4::IDENTITY);
@@ -296,7 +310,8 @@ fn add_mesh(cx: &mut Ctx, mesh: &gltf::Mesh, node: u32, world: Mat4, kind: &Node
             None => (0..pos.len() as u32).collect(),
         };
         let tris: Vec<[u32; 3]> = idx.chunks_exact(3).filter(|t| t.iter().all(|&i| (i as usize) < pos.len())).map(|t| [t[0], t[1], t[2]]).collect();
-        col_tris.extend(tris.iter().map(|t| t.map(|i| pos[i as usize])));
+        // front faces counter-clockwise (a mirroring node transform turns them around)
+        col_tris.extend(tris.iter().map(|t| if flip { [pos[t[0] as usize], pos[t[2] as usize], pos[t[1] as usize]] } else { t.map(|i| pos[i as usize]) }));
         if kind.only {
             continue;
         }
@@ -327,6 +342,13 @@ fn add_mesh(cx: &mut Ctx, mesh: &gltf::Mesh, node: u32, world: Mat4, kind: &Node
         };
         cx.report.tris += tris.len();
         cx.report.renderers += 1;
+        if let (Some(mi), Some(_)) = (prim.material().index(), &cx.material) {
+            if prim.material().pbr_metallic_roughness().base_color_texture().is_some_and(|t| t.tex_coord() != 0) {
+                cx.report.warnings.push(format!("{}: only UV set 0 is imported", kind.name));
+            }
+            let ov = material_override(cx, &prim.material(), mi);
+            cx.def.renderer_override.insert(cx.def.renderers.len() as u32, ov);
+        }
         cx.def.renderers.push(RenderDef { node, material: cx.material.clone(), batch, enabled: true, skin: None });
     }
     match kind.col {
@@ -342,8 +364,95 @@ fn add_mesh(cx: &mut Ctx, mesh: &gltf::Mesh, node: u32, world: Mat4, kind: &Node
     }
 }
 
-/// A static Environment collider, its triangles tagged with the metal surface.
+/// The glTF material as overrides on the placeholder: base colour and emission. glTF factors are
+/// linear, ULTRAKILL renders in gamma space; texture bytes are used as they are (sRGB both).
+fn material_override(cx: &mut Ctx, m: &gltf::Material, mi: usize) -> u32 {
+    if let Some(&i) = cx.mats.get(&mi) {
+        return i;
+    }
+    let srgb = |c: [f32; 3], a: f32| [linear_to_srgb(c[0]), linear_to_srgb(c[1]), linear_to_srgb(c[2]), a];
+    let pbr = m.pbr_metallic_roughness();
+    let [r, g, b, a] = pbr.base_color_factor();
+    let main = match pbr.base_color_texture() {
+        Some(t) => image(cx, &t.texture()),
+        None => None,
+    };
+    let main = main.unwrap_or_else(|| white(cx));
+    let mut ov = MaterialOverride {
+        name: m.name().unwrap_or("glTF material").to_string(),
+        keywords: Vec::new(),
+        floats: vec![("_Metallic".into(), 0.0), ("_Glossiness".into(), 0.0)],
+        colors: vec![("_Color".into(), srgb([r, g, b], a))],
+        textures: vec![("_MainTex".into(), main)],
+    };
+    let e = m.emissive_factor();
+    let etex = m.emissive_texture().and_then(|t| image(cx, &t.texture()));
+    if e.iter().any(|&c| c > 0.0) {
+        ov.keywords.push("EMISSIVE".into());
+        let etex = etex.unwrap_or_else(|| white(cx));
+        ov.textures.push(("_EmissiveTex".into(), etex));
+        ov.colors.push(("_EmissiveColor".into(), srgb(e, 1.0)));
+        let strength = m.emissive_strength().unwrap_or(1.0);
+        for (k, v) in [("EMISSIVE", 1.0), ("_EmissiveIntensity", strength), ("_UseAlbedoAsEmissive", 0.0), ("_EmissiveReplaces", 0.0), ("_EmissiveMask", 0.0), ("_EmissiveToVertexColors", 0.0)] {
+            ov.floats.push((k.into(), v));
+        }
+    }
+    cx.def.material_overrides.push(ov);
+    cx.report.materials += 1;
+    let i = cx.def.material_overrides.len() as u32 - 1;
+    cx.mats.insert(mi, i);
+    i
+}
+
+fn white(cx: &mut Ctx) -> Arc<TextureData> {
+    cx.white.get_or_insert_with(|| Arc::new(TextureData { name: "white".into(), width: 1, height: 1, rgba: vec![255; 4], filter: 0, wrap: 0, layers: 1 })).clone()
+}
+
+/// A glTF texture decoded (PNG / JPEG), rows flipped to Unity's bottom-first order, with its
+/// sampler's filter (NEAREST -> point, else bilinear) and wrap (S axis: repeat / clamp / mirror).
+fn image(cx: &mut Ctx, t: &gltf::Texture) -> Option<Arc<TextureData>> {
+    let ti = t.index();
+    if let Some(x) = cx.images.get(&ti) {
+        return x.clone();
+    }
+    let img = t.source();
+    let bytes = match img.source() {
+        gltf::image::Source::View { view, .. } => cx.buffers.get(view.buffer().index()).and_then(|b| b.get(view.offset()..view.offset() + view.length())).map(<[u8]>::to_vec),
+        gltf::image::Source::Uri { uri, .. } if !uri.starts_with("data:") => std::fs::read(cx.dir.join(uri)).ok(),
+        gltf::image::Source::Uri { .. } => None,
+    };
+    let name = img.name().map(str::to_string).unwrap_or_else(|| format!("image{}", img.index()));
+    let out = match bytes.map(|b| image::load_from_memory(&b)) {
+        Some(Ok(d)) => {
+            let d = image::imageops::flip_vertical(&d.to_rgba8());
+            let s = t.sampler();
+            use gltf::texture::{MagFilter, WrappingMode};
+            let filter = if s.mag_filter() == Some(MagFilter::Nearest) { 0 } else { 1 };
+            let wrap = match s.wrap_s() {
+                WrappingMode::ClampToEdge => 1,
+                WrappingMode::MirroredRepeat => 2,
+                WrappingMode::Repeat => 0,
+            };
+            cx.report.textures += 1;
+            Some(Arc::new(TextureData { name, width: d.width(), height: d.height(), rgba: d.into_raw(), filter, wrap, layers: 1 }))
+        }
+        Some(Err(e)) => {
+            cx.report.warnings.push(format!("texture {name}: {e}"));
+            None
+        }
+        None => {
+            cx.report.warnings.push(format!("texture {name}: data not found (embedded data: URIs are not supported)"));
+            None
+        }
+    };
+    cx.images.insert(ti, out.clone());
+    out
+}
+
+/// A static Environment collider, its triangles (counter-clockwise fronts) tagged with the metal
+/// surface. The surface scene keeps Unity's winding, mirrored in Bevy space: stored reversed.
 fn add_collider(cx: &mut Ctx, node: u32, shape: ShapeDef, surface_tris: Vec<[Vec3; 3]>) {
+    let surface_tris: Vec<[Vec3; 3]> = surface_tris.into_iter().map(|[a, b, c]| [a, c, b]).collect();
     cx.next_id -= 1;
     cx.def.colliders.push(ColliderDef { node, shape, trigger: false, enabled: true, layer: MAP_LAYER, path_id: cx.next_id });
     cx.report.colliders += 1;
@@ -372,9 +481,14 @@ fn add_empty_shape(cx: &mut Ctx, n: &gltf::Node, node: u32, world: Mat4, raw: &s
     add_collider(cx, node, shape, tris);
 }
 
-/// Triangles of a box / sphere collider for the surface tagging.
+/// Triangles of a box / sphere collider for the surface tagging, facing out.
 fn shape_tris(shape: &ShapeDef) -> Vec<[Vec3; 3]> {
-    match *shape {
+    let center = match *shape {
+        ShapeDef::Box { center, .. } | ShapeDef::Sphere { center, .. } => center,
+        _ => Vec3::ZERO,
+    };
+    let out = |[a, b, c]: [Vec3; 3]| if (b - a).cross(c - a).dot(a + b + c - 3.0 * center) < 0.0 { [a, c, b] } else { [a, b, c] };
+    let tris: Vec<[Vec3; 3]> = match *shape {
         ShapeDef::Box { center, half, rot } => {
             let c = |x: f32, y: f32, z: f32| center + rot * (half * Vec3::new(x, y, z));
             let v: Vec<Vec3> = (0..8).map(|i| c(if i & 1 == 0 { -1.0 } else { 1.0 }, if i & 2 == 0 { -1.0 } else { 1.0 }, if i & 4 == 0 { -1.0 } else { 1.0 })).collect();
@@ -391,7 +505,9 @@ fn shape_tris(shape: &ShapeDef) -> Vec<[Vec3; 3]> {
             (0..rings).flat_map(|i| (0..segs).flat_map(move |j| [[p(i, j), p(i + 1, j), p(i + 1, j + 1)], [p(i, j), p(i + 1, j + 1), p(i, j + 1)]])).collect()
         }
         _ => Vec::new(),
-    }
+    };
+    // the sphere's pole triangles are degenerate: dropped
+    tris.into_iter().filter(|[a, b, c]| (b - a).cross(c - a).length_squared() > 1e-12).map(out).collect()
 }
 
 /// KHR_lights_punctual -> a Unity light. glTF colors are linear and ULTRAKILL renders in gamma

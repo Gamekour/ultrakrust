@@ -681,6 +681,9 @@ pub fn build(
         .collect();
     let first_particle = def.renderers.len() + sky_def.is_some() as usize;
     let mut particle_slots: HashMap<(String, i64), Vec<usize>> = HashMap::new();
+    // custom-map materials: the base material with overridden properties, and their own textures
+    let mut override_props: HashMap<u32, Arc<MaterialProps>> = HashMap::new();
+    let mut override_tex: HashMap<*const uk_assets::texture::TextureData, u32> = HashMap::new();
     for (ri, r) in def.renderers.iter().chain(sky_def.iter()).chain(particle_defs.iter()).enumerate() {
         let sky = ri == def.renderers.len() && sky_def.is_some();
         let particle = ri >= first_particle;
@@ -701,6 +704,30 @@ pub fn build(
         let Some((mut mat, skey)) = mat else {
             *skipped.entry("material unreadable".into()).or_default() += 1;
             continue;
+        };
+        let ov = def.renderer_override.get(&(ri as u32)).copied().filter(|_| ri < def.renderers.len());
+        if let Some(oi) = ov {
+            mat = override_props
+                .entry(oi)
+                .or_insert_with(|| {
+                    let o = &def.material_overrides[oi as usize];
+                    let mut m = (*mat).clone();
+                    m.name = o.name.clone();
+                    for k in &o.keywords {
+                        if !m.keywords.contains(k) {
+                            m.keywords.push(k.clone());
+                        }
+                    }
+                    m.floats.extend(o.floats.iter().cloned());
+                    m.colors.extend(o.colors.iter().cloned());
+                    Arc::new(m)
+                })
+                .clone();
+        }
+        // the cache key of the material's variant choice
+        let ckey = match ov {
+            Some(oi) => (format!("override#{oi}"), 0),
+            None => (key.file.clone(), key.path_id),
         };
         if let Some(&never) = simplifiers.get(&r.node).filter(|_| !sky) {
             mat = simplified
@@ -731,7 +758,7 @@ pub fn build(
         };
         let Some(pass) = sh.passes.first() else { continue };
         // variant choice is per material (keywords), not per renderer
-        let vsub = match chosen.get(&(key.file.clone(), key.path_id)) {
+        let vsub = match chosen.get(&ckey) {
             Some(s) => s.clone(),
             None => {
                 let mut enabled: Vec<&str> = mat.keywords.iter().map(|s| s.as_str()).collect();
@@ -740,7 +767,7 @@ pub fn build(
                     enabled.push("VERTEX_WARPING");
                 }
                 let s = sh.select(&pass.vertex, &enabled).cloned();
-                chosen.insert((key.file.clone(), key.path_id), s.clone());
+                chosen.insert(ckey.clone(), s.clone());
                 s
             }
         };
@@ -803,6 +830,16 @@ pub fn build(
                 TexDim::Cube => 6,
                 TexDim::D3 => continue,
             };
+            if let Some((_, t)) = ov.and_then(|oi| def.material_overrides[oi as usize].textures.iter().find(|(n, _)| n == name)) {
+                let id = *override_tex.entry(Arc::as_ptr(t)).or_insert_with(|| {
+                    textures.push(TexCpu { width: t.width, height: t.height, rgba: t.rgba.clone(), filter: t.filter, wrap: t.wrap, layers: t.layers });
+                    textures.len() as u32 - 1
+                });
+                if layers == 1 {
+                    tex.insert(name.clone(), id);
+                }
+                continue;
+            }
             let Some(env) = mat.textures.get(name) else { continue };
             let f = db.file(&key.file).ok();
             let tid = f.and_then(|f| db.resolve(&f, env.texture).ok().flatten()).and_then(|(tf, tid)| {
@@ -1089,8 +1126,16 @@ pub fn build(
     let mut sk: Vec<_> = skipped.into_iter().collect();
     sk.sort_by(|a, b| b.1.cmp(&a.1));
     let enemy_draws: Vec<&Draw> = draws.iter().filter(|d| simplifiers.contains_key(&d.node)).collect();
+    let custom: std::collections::BTreeSet<(String, String, std::collections::BTreeSet<String>)> = draws
+        .iter()
+        .filter(|d| override_props.values().any(|m| Arc::ptr_eq(m, &d.material)))
+        .map(|d| {
+            let tex = d.textures.iter().map(|(n, &t)| format!("{n} {}x{}", textures[t as usize].width, textures[t as usize].height)).collect();
+            (d.material.name.clone(), variants[d.variant as usize].label.clone(), tex)
+        })
+        .collect();
     let summary = format!(
-        "unity shaders: post-process {}, outline {}, sky {} (camera {:?}), enemy simplifiers {} on {} draws ({} write SV_Target1: {:?}), {} variants, {}/{} renderers drawn, {} textures, {} lights; skipped: {:?}; ui: {}; particle materials {}/{}: {:?}",
+        "unity shaders: post-process {}, outline {}, sky {} (camera {:?}), enemy simplifiers {} on {} draws ({} write SV_Target1: {:?}), {} variants, {}/{} renderers drawn, {} textures, {} lights; custom materials {:?}; skipped: {:?}; ui: {}; particle materials {}/{}: {:?}",
         post.as_ref().map_or("missing".to_string(), |p| {
             let n = p.variants.iter().flatten().count();
             let tex: Vec<String> = p.textures.iter().map(|(n, t)| format!("{n} {}x{}", textures[*t as usize].width, textures[*t as usize].height)).collect();
@@ -1108,6 +1153,7 @@ pub fn build(
         total,
         textures.len(),
         def.lights.len(),
+        custom,
         sk.iter().take(6).collect::<Vec<_>>(),
         ui.as_ref().map_or("none".to_string(), |u| format!(
             "{} canvases, {}/{} textures, {}/{} materials ({} variants: {:?}), skipped {:?}",

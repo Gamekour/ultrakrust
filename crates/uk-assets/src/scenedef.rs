@@ -281,6 +281,18 @@ impl FootstepFx {
     }
 }
 
+/// A material from outside the game (a custom map's glTF material): `RenderDef::material` (a
+/// Unity material) supplies the shader and every property not overridden here.
+#[derive(Debug, Clone)]
+pub struct MaterialOverride {
+    pub name: String,
+    pub keywords: Vec<String>,
+    pub floats: Vec<(String, f32)>,
+    pub colors: Vec<(String, [f32; 4])>,
+    /// texture property -> image (rows bottom first, as Unity's)
+    pub textures: Vec<(String, Arc<crate::texture::TextureData>)>,
+}
+
 #[derive(Debug)]
 pub struct ScriptDef {
     pub node: u32,
@@ -343,6 +355,10 @@ pub struct SceneDef {
     pub particle_systems: Vec<SceneParticleDef>,
     /// ParticleSystem component path id -> index into `particle_systems`.
     pub comp_to_particle: HashMap<i64, u32>,
+    /// Materials made outside Unity (custom maps), drawn as their base material with overrides.
+    pub material_overrides: Vec<MaterialOverride>,
+    /// renderer index -> index into `material_overrides`
+    pub renderer_override: HashMap<u32, u32>,
 }
 
 impl SceneDef {
@@ -382,6 +398,15 @@ impl SceneDef {
                 nd
             })
             .collect();
+        let mut rmap = vec![None; self.renderers.len()];
+        let mut c = 0u32;
+        for (i, r) in self.renderers.iter().enumerate() {
+            if kept[r.node as usize] {
+                rmap[i] = Some(c);
+                c += 1;
+            }
+        }
+        self.renderer_override = self.renderer_override.iter().filter_map(|(&k, &v)| Some((rmap[k as usize]?, v))).collect();
         self.renderers.retain(|r| kept[r.node as usize]);
         for r in &mut self.renderers {
             r.node = m(r.node).unwrap();

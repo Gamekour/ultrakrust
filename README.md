@@ -1,71 +1,156 @@
 # ULTRAKRUST
 
-A Rust (Bevy) reimplementation of ULTRAKILL, starting with V1's movement.
+An unofficial reimplementation of ULTRAKILL in Rust, on the Bevy engine. ULTRAKRUST loads levels
+straight from your own ULTRAKILL install while it runs, and draws them with the game's own compiled
+shaders. The gameplay scripts are ports of ULTRAKILL's own, so movement, combat and level logic
+behave the way the original does.
 
-**Milestone 3: 0-1 is playable.** Start to finish: the drop-in intro, punching through the planks, the revolver
-pickup and title card, every arena and wave, doors, glass floors, fans, checkpoints and respawns, Filth, Strays,
-the Malicious Face, and the final pit. Gameplay scripts are ports of ULTRAKILL's own (see MODLOG.md), running on
-the level data read from your install.
+**You need to own ULTRAKILL on Steam.** This repository contains no game files: no models,
+textures, sounds, shaders or decompiled code. Everything is read from your install at runtime and
+never written back.
 
-**Milestone 2: real levels.** `ultrakrust` loads level 0-1 straight from your Steam install at
-runtime (geometry, textures, collision, spawn point) with a Rust reader for Unity's bundle format.
-`--level 1-1` picks another level, `--sandbox` opens the movement test map, `N` toggles noclip.
-`--all-weapons` starts with every ported weapon unlocked (currently the Revolver; kept across level changes).
-The exit elevator works as in ULTRAKILL: the results tally comes up, and **LMB** in the shaft below loads the next level.
+## What works
+- **Level 0-1 from start to finish.** That covers the drop-in intro, the revolver pickup and title
+  card, every arena and wave, doors, glass, fans, checkpoints and respawns, Filth, Strays, the
+  Malicious Face, and the final pit with the results screen.
+- **Every campaign scene loads,** with its geometry, collision, lights, triggers and level-start
+  logic. The exit elevator loads the next level. Most enemies and weapons beyond those above are
+  not ported yet.
+- **V1's movement:** walk, jump, dash, slide, slam, slam-jump, wall-jump, wall cling and super
+  slide jumps, at the game's 125 Hz physics step and with its tuning values.
+- **Effects:** blood and gore, environment hit particles, slide and wall scrapes, the HUD and
+  ULTRAKILL's post-processing.
+- **Custom maps** from glTF files (see below).
 
-**Milestone 1: movement sandbox.** Walk, jump, dash, slide, slam, slam-jump, wall-jump (×3),
-wall cling, super slide jumps and the piercer revolver, on a test map built to exercise each of them.
+[PARITY.md](PARITY.md) has the measured gap analysis against the original. [MODLOG.md](MODLOG.md)
+records each change, with the probe numbers behind it.
 
-## How it was built
-- The movement logic is a clean-room port. It's based on reading how ULTRAKILL's `NewMovement`, `GroundCheck`,
-  `WallCheck`, `CameraController` and `Revolver` behave in a locally decompiled copy of the
-  author's own install. No decompiled code is included in this repository.
-- Every tuning value (walk speed 750, jump power 90, air acceleration 6000, wall-jump power 150,
-  the 125 Hz physics step, gravity -40, collider sizes, the frictionless player material) was read
-  from the game's own data files. See [MODLOG.md](MODLOG.md) and
-  [`crates/uk-core/src/consts.rs`](crates/uk-core/src/consts.rs).
-- No game files, textures, models or sounds ship with this project. Levels and textures are read
-  from *your* ULTRAKILL install at runtime (set `ULTRAKILL_DIR` if it isn't in the default Steam folder).
+## Getting started
+1. Install ULTRAKILL through Steam.
+2. Install Rust from [rustup.rs](https://rustup.rs) (stable toolchain).
+3. Clone this repository and run:
 
-## Parity
-`cargo run --release -p ultrakrust` draws levels with ULTRAKILL's own compiled shaders (`--legacy-render` for the old stand-in) (translated at load
-from your install; nothing is stored). `cargo run --release -p uk-harness -- --render` checks every level that way.
-
-See [PARITY.md](PARITY.md) for the measured gap analysis and work order. Run the headless harness with
-`cargo run --release -p uk-harness -- --full`. It prints only failures, regressions and gaps.
-
-## Layout
-| Crate | What |
-|---|---|
-| `crates/uk-core` | Engine-agnostic simulation: collision world (oriented boxes + triangle meshes with a BVH), player movement, camera, revolver. Headless tests check it against values derived from the original formulas. |
-| `crates/uk-assets` | Runtime reader for your install: UnityFS bundles (LZ4/LZMA), SerializedFiles via typetrees, meshes, textures (RGB24/RGBA32/DXT1/DXT5), materials, and level scene extraction. |
-| `crates/uk-game` | Level runtime: Unity-like object model (activation, triggers, timers, UnityEvents) running ports of the progression scripts, enemies, combat, checkpoints. Headless probes + an autopilot in `examples/`. |
-| `crates/uk-harness` | Headless parity, regression and performance harness: probes as checks, coverage of every scene, determinism, baseline in `parity/baseline.tsv`. |
-| `crates/ultrakrust` | Bevy 0.19 frontend: level loading, input, test map, view model, HUD, `--tour` screenshots. |
-
-## Run
 ```bash
 cargo run --release -p ultrakrust
 ```
+
+The first build takes several minutes. The game is found automatically in the default Steam folder
+or any Steam library. If it isn't, point `ULTRAKILL_DIR` at the folder that contains
+`ULTRAKILL_Data`:
+
+```bash
+ULTRAKILL_DIR="D:/Games/ULTRAKILL" cargo run --release -p ultrakrust
+```
+
+### Options
+Pass these after `--`, e.g. `cargo run --release -p ultrakrust -- --level 1-1`.
+
+| Flag | What it does |
+|---|---|
+| `--level 1-1` | Start in another level (default 0-1). |
+| `--map path/to/map.glb` | Load a custom glTF map (see below). |
+| `--all-weapons` | Start with every ported weapon. |
+| `--sandbox` | The movement test map instead of a level. |
+| `--legacy-render` | Bevy's own renderer instead of ULTRAKILL's shaders. |
+| `--exit-after 10` | Quit after this many seconds. |
+
+### Controls
+ULTRAKILL's default bindings:
+
+| Key | Action |
+|---|---|
+| **WASD** | Move |
+| **Space** | Jump |
+| **Left Shift** | Dash |
+| **Left Ctrl** | Slide (in the air: ground slam) |
+| **LMB** | Fire |
+| **Hold RMB** | Charge a piercing shot |
+| **F** | Punch (also parries projectiles) |
+| **R** | Restart from the checkpoint |
+| **Tab** | Level stats |
+
+Extras:
+
+| Key | Action |
+|---|---|
+| **N** | Noclip |
+| **F3** | Developer overlay |
+| **T** | Camera tilt |
+| **[ ]** | Mouse sensitivity |
+| **Esc** | Release the mouse |
+
+Your saved settings and progress are read from your ULTRAKILL install (read-only).
+
+## Custom maps
+Build a map in Blender (or anything that exports glTF), export it as `.glb` (or `.gltf` with a
+separate `.bin`), and run:
+
+```bash
+cargo run --release -p ultrakrust -- --map path/to/map.glb
+```
+
+You get V1, the HUD and the level timer, with your feet at the origin (0, 0, 0), facing −Z
+(Blender's +Y).
+
+**Collision** uses [Godot's import name suffixes](https://docs.godotengine.org/en/stable/tutorials/assets_pipeline/importing_3d_scenes/node_type_customization.html).
+Add them to object names. They're case-insensitive, and `-x`, `_x` or `$x` all work.
+
+| Suffix | Result |
+|---|---|
+| `-col` | Visible mesh + exact (triangle mesh) collision |
+| `-convcol` | Visible mesh + convex hull collision |
+| `-colonly` | Invisible collision only. On an empty: a sphere (radius 1) by default |
+| `-convcolonly` | Invisible convex hull collision only |
+| `-noimp` | Not imported (with its children) |
+
+- **Shapes on empties.** glTF doesn't store an empty's display type. To give a `-colonly` empty a
+  shape, add a custom property `empty_display_type` (exported as glTF extras):
+  - `CUBE`: a box of size 2.
+  - `IMAGE`: an infinite ground plane.
+  - `SINGLE_ARROW`: a ray. Skipped, since Unity has no ray collider.
+- **Meshes without a suffix** are visible but have no collision.
+- **Normals matter.** ULTRAKILL culls back faces, and its surface queries are single-sided. Run
+  *Mesh → Normals → Recalculate Outside* in Blender if a floor is invisible from above.
+
+**Materials** draw with ULTRAKILL's master shader:
+- **Base colour:** the texture times the factor.
+- **Emission:** the texture times the colour, times *Emission Strength*.
+- **Texture filtering:** set the image to *Closest* in Blender for the crunchy point-filtered look.
+- **Formats:** PNG and JPEG textures; embedded or separate files both work. Embedded `data:` URIs
+  in a `.gltf` don't.
+- **Ignored for now:** smoothness, metallic and vertex colours.
+- **No material:** objects fall back to the 0-2 elevator floor.
+- **Surfaces:** everything you collide with counts as metal for footsteps and hit effects.
+
+**Lights:**
+- Point, spot and sun lights import by type and colour.
+- Brightness is converted from glTF's physical units, so expect to tune it by eye.
+- Cameras are ignored.
+
+Map-specific ULTRAKILL features (enemies, triggers, checkpoints, ...) aren't supported yet.
+
+## For developers
+| Crate | What it does |
+|---|---|
+| `crates/uk-core` | Engine-agnostic simulation: collision world, player movement, camera, revolver |
+| `crates/uk-assets` | Runtime reader for the install: Unity bundles, serialized files, meshes, textures, materials, shaders, scenes, particles, glTF maps |
+| `crates/uk-game` | Level runtime: a Unity-like object model running the ported scripts, enemies, combat, effects. Headless probes in `examples/` |
+| `crates/uk-harness` | Headless parity, regression and performance checks over every scene |
+| `crates/ultrakrust` | The Bevy frontend: rendering with ULTRAKILL's shaders, input, HUD |
+
 ```bash
 cargo test --release --workspace
 ```
 ```bash
-cargo run --release -p uk-assets --example dump_level -- level0-1
+cargo run --release -p uk-harness
+```
+```bash
+cargo run --release -p uk-game --example map_probe -- path/to/map.glb
 ```
 
-Controls (ULTRAKILL defaults): **WASD** move, **Space** jump, **Left Shift** dash,
-**Left Ctrl** slide (in the air: ground slam), **LMB** fire, **hold RMB** charge a piercing shot,
-**F** punch (also parries projectiles), **R** restart from checkpoint (ignored once the level is over), **N** noclip, **F3** developer overlay, **T** camera tilt,
-**[ ]** mouse sensitivity, **Esc** release the mouse. `--demo <dir>` plays a scripted run and saves screenshots.
+The harness prints only failures, regressions and gaps against `parity/baseline.tsv`.
 
-## Faithfulness notes
-- Physics runs at the game's 125 Hz fixed step. Per-frame logic (inputs, slide state, cling, slam)
-  runs every rendered frame, as it does in Unity.
-- Quirks are kept on purpose. Wall cling calls `Clamp(-1, 1, x)` with the arguments in the wrong order, so the result
-  is always 1. The stamina-fail dash jump scales by the frame delta.
-- Not yet ported: navmesh pathing (enemies chase directly), animations (enemies are posed statically),
-  sound/music, the level's lights and lightmaps, other weapons, style meter and ranks.
-
-Built with AI assistance (Claude), using ILSpy and UnityPy for inspection. ULTRAKILL is © New Blood
-Interactive / Arsi "Hakita" Patala. This is an unofficial fan project, and you need to own the game.
+## Credits
+ULTRAKILL is © New Blood Interactive and Arsi "Hakita" Patala. ULTRAKRUST is an unofficial,
+non-commercial fan project, not affiliated with or endorsed by them. Please buy the game. Built
+with AI assistance (Claude), using ILSpy and UnityPy to inspect the author's own copy of the game.

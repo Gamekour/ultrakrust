@@ -9,7 +9,8 @@ license.workspace = true
 ab_glyph = "0.2.32"
 skrifa = "0.44"
 bevy_math.workspace = true
-gltf = { version = "1.4.1", default-features = false, features = ["names", "utils", "extras", "KHR_lights_punctual"] }
+gltf = { version = "1.4.1", default-features = false, features = ["names", "utils", "extras", "KHR_lights_punctual", "KHR_materials_emissive_strength"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 lz4_flex = "0.11"
 lzma-rs = "0.3"
 serde_json = "1"

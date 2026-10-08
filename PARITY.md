@@ -28,7 +28,7 @@ All numbers below are measured by tooling (`uk-harness --full`, `parity_scripts`
 | Scenes that build a level runtime | 54 | 54 | every scene builds a `Game` without panicking |
 | Level start through the level's own trigger (`FinalDoorOpener.GoTime` / `PlayerActivator.startTimer` → `OnLevelStart.StartLevel`, `onStart`, StatsManager timer) | 41 campaign levels | 41/41 | harness `first_rooms` |
 | Exit elevator -> next level (`FinalPit`, `TeleportFinalPit`, FinalRank, `targetLevelName`) | every campaign level | Full in the sim; results tally, Fire1 continue, R ignored once over | harness `0-1.exit_to_next_level`, `0-1.exit_ignores_restart`; frontend `UK_PROBE_EXIT` 0-1 -> 0-2 |
-| Custom glTF maps (`--map`, not in ULTRAKILL) | — | Godot suffix colliders, lights by type, 0-1's player and managers, the elevator floor material as a placeholder; no ULTRAKILL-specific flags yet | `map_probe` |
+| Custom glTF maps (`--map`, not in ULTRAKILL) | — | Godot suffix colliders, lights by type, 0-1's player and managers, materials (base colour / emissive texture and factor on ULTRAKILL/Master, smoothness and metallic 0); no ULTRAKILL-specific flags yet | `map_probe` |
 
 **0-1 checks passing:** load, all 11 live door controllers, all 14 arenas, boss → final door → final pit, checkpoint respawn,
 tick-for-tick determinism, sim under budget (p99 1.3 ms/tick), navmesh, Fan Room path.

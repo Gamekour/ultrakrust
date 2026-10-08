@@ -26,6 +26,39 @@ fn main() {
         }).collect();
         println!("  {} at {:.2?} renderers {rs:?} colliders {cs:?}", def.path(i as u32), n.world0.w_axis.truncate());
     }
+    for (ri, oi) in &def.renderer_override {
+        let o = &def.material_overrides[*oi as usize];
+        println!(
+            "  renderer {ri} ({}) material {:?}: keywords {:?} floats {:?} colors {:.3?} textures {:?}",
+            def.path(def.renderers[*ri as usize].node),
+            o.name,
+            o.keywords,
+            o.floats,
+            o.colors,
+            o.textures.iter().map(|(n, t)| (n, t.width, t.height, t.filter, t.wrap, t.rgba[..4].to_vec(), t.rgba[t.rgba.len() - 4..].to_vec())).collect::<Vec<_>>()
+        );
+    }
+    // winding: counter-clockwise faces vs their vertex normals, and vs the way out of the mesh
+    for r in def.renderers.iter().filter(|r| def.is_descendant(r.node, root)) {
+        let b = &r.batch;
+        let p = |i: u32| Vec3::from(b.positions[i as usize]);
+        let c = b.positions.iter().map(|&q| Vec3::from(q)).sum::<Vec3>() / b.positions.len() as f32;
+        let (mut agree, mut out) = (0, 0);
+        let n = b.indices.len() / 3;
+        for t in b.indices.chunks_exact(3) {
+            let g = (p(t[1]) - p(t[0])).cross(p(t[2]) - p(t[0]));
+            agree += (g.dot(Vec3::from(b.normals[t[0] as usize])) > 0.0) as usize;
+            out += (g.dot(p(t[0]) + p(t[1]) + p(t[2]) - 3.0 * c) > 0.0) as usize;
+        }
+        for t in b.indices.chunks_exact(3) {
+            let (a, bb, cc) = (p(t[0]), p(t[1]), p(t[2]));
+            let g = (bb - a).cross(cc - a).normalize_or_zero();
+            if g.y.abs() > 0.9 && (a.y - bb.y).abs() < 1e-3 && (a.y - cc.y).abs() < 1e-3 {
+                println!("    horizontal tri at y {:.2} ccw normal {:.2?} vertex normal {:.2?} x {:.2}..{:.2}", a.y, g, b.normals[t[0] as usize], a.x.min(bb.x).min(cc.x), a.x.max(bb.x).max(cc.x));
+            }
+        }
+        println!("  {}: {n} tris, ccw face agrees with the vertex normal {agree}, faces away from the centre {out}", def.path(r.node));
+    }
     println!("surface meshes on the map: {:?}", def.surface_meshes.iter().filter(|s| def.is_descendant(s.node, root)).map(|s| (s.tris.len(), s.mats[0].surface)).collect::<Vec<_>>());
     let mut g = Game::new(Arc::new(def));
     g.start_custom_map();

@@ -1,15 +1,35 @@
+# build output
 /target
 *.pdb
-# never commit game-derived data
+
+# never commit game-derived data: everything is read from the player's own install at runtime
 /decomp/
 /extracted/
 *.assets
 *.bundle
 *.resS
+*.resource
 *.dll
+*.cs
+*.ttf
+*.otf
+# translated game shaders / caches
+*.wgsl
+*.spv
+
+# harness output (parity/baseline.tsv and parity/scripts.tsv are tracked)
 parity/report.tsv
 parity/native.tsv
 parity/scenes.tsv
-# translated game shaders / caches must never be committed
-*.wgsl
-*.spv
+
+# local tooling and editors
+/.claude/
+.vscode/
+.idea/
+*.swp
+*.log
+
+# OS clutter
+.DS_Store
+Thumbs.db
+desktop.ini

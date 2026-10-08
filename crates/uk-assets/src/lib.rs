@@ -39,11 +39,28 @@ impl std::error::Error for Error {}
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Default Steam install location; override with the `ULTRAKILL_DIR` environment variable.
+/// The ULTRAKILL install: `ULTRAKILL_DIR` if set, else the default Steam folder, else any Steam
+/// library listed in Steam's `libraryfolders.vdf`.
 pub fn find_install() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
     if let Ok(p) = std::env::var("ULTRAKILL_DIR") {
         return Some(p.into());
     }
-    let default = std::path::PathBuf::from(r"C:\Program Files (x86)\Steam\steamapps\common\ULTRAKILL");
-    default.join("ULTRAKILL_Data").is_dir().then_some(default)
+    let mut steam_roots = vec![PathBuf::from(r"C:\Program Files (x86)\Steam"), PathBuf::from(r"C:\Program Files\Steam")];
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        steam_roots.extend([home.join(".steam/steam"), home.join(".local/share/Steam")]);
+    }
+    let mut libraries = steam_roots.clone();
+    for root in &steam_roots {
+        let Ok(vdf) = std::fs::read_to_string(root.join("steamapps").join("libraryfolders.vdf")) else { continue };
+        // lines like: "path"		"D:\\SteamLibrary"
+        for line in vdf.lines() {
+            let parts: Vec<&str> = line.split('"').collect();
+            if parts.len() >= 4 && parts[1] == "path" {
+                libraries.push(PathBuf::from(parts[3].replace("\\\\", "\\")));
+            }
+        }
+    }
+    libraries.into_iter().map(|l| l.join("steamapps").join("common").join("ULTRAKILL")).find(|p| p.join("ULTRAKILL_Data").is_dir())
 }
