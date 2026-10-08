@@ -140,9 +140,7 @@ pub struct LightCpu {
     pub kind: u8,
     pub color: [f32; 4],
     pub intensity: f32,
-    pub range: f32,
     pub spot_angle: f32,
-    pub enabled: bool,
 }
 
 /// Everything static about the level's Unity-shaded scene.
@@ -324,7 +322,8 @@ pub struct UnityFrame {
     /// Re-skinned vertex buffers (draw index, full vertex bytes) for this frame.
     pub skinned: Arc<Vec<(usize, Vec<u8>)>>,
     /// Unity-space light world positions / forward directions, and whether each is active.
-    pub lights: Arc<Vec<(Vec3, Vec3, bool)>>,
+    /// (position, forward, on, range) per scene light, Unity space; scripts change on / range
+    pub lights: Arc<Vec<(Vec3, Vec3, bool, f32)>>,
     /// NewMovement.currentColor.a (the hurt flash)
     pub hurt: f32,
     /// DeathSequence's `_Deathness`/`_Sharpness` while the player is dead (DEAD keyword on)
@@ -1120,7 +1119,7 @@ pub fn build(
     let lights = def
         .lights
         .iter()
-        .map(|l| LightCpu { node: l.node, kind: l.kind, color: l.color, intensity: l.intensity, range: l.range, spot_angle: l.spot_angle, enabled: l.enabled })
+        .map(|l| LightCpu { node: l.node, kind: l.kind, color: l.color, intensity: l.intensity, spot_angle: l.spot_angle })
         .collect();
     let total: usize = draws.len() + skipped.values().sum::<usize>();
     let mut sk: Vec<_> = skipped.into_iter().collect();
@@ -1403,7 +1402,7 @@ pub fn frame(game: &uk_game::Game, scene: &SceneData, time: f32, screen: [f32; 2
                 None => Mat4::IDENTITY,
             };
             // skinned vertices already carry the animated bones; rigid ones follow their node
-            if d.skin.is_some() { mover } else { mover * game.anim.delta_of(d.node) }
+            if d.skin.is_some() { mover } else { mover * game.scale_delta(d.node) * game.anim.delta_of(d.node) }
         })
         .collect::<Vec<_>>();
     let mut skinned = Vec::new();
@@ -1432,12 +1431,15 @@ pub fn frame(game: &uk_game::Game, scene: &SceneData, time: f32, screen: [f32; 2
     let lights = scene
         .lights
         .iter()
-        .map(|l| {
+        .enumerate()
+        .map(|(i, l)| {
             let w = game.def.nodes[l.node as usize].world0;
             let (_, rot, pos) = w.to_scale_rotation_translation();
             // world0 is Bevy space; Unity forward (+z) is Bevy -z
             let fwd = rot * Vec3::NEG_Z;
-            (Vec3::new(pos.x, pos.y, -pos.z), Vec3::new(fwd.x, fwd.y, -fwd.z), l.enabled && game.active(l.node))
+            // Light.enabled / range as scripts left them; a point / spot light with no range lights nothing
+            let (enabled, range) = game.s.lights[i];
+            (Vec3::new(pos.x, pos.y, -pos.z), Vec3::new(fwd.x, fwd.y, -fwd.z), enabled && game.active(l.node) && (l.kind == 1 || range > 0.0), range)
         })
         .collect();
     let s = &game.s;
@@ -2010,7 +2012,7 @@ fn vertex_lights(scene: &SceneData, frame: &UnityFrame, d: &Draw, v: Mat4) -> [[
 fn pick_lights(scene: &SceneData, frame: &UnityFrame, d: &Draw) -> Vec<usize> {
     let mut picked: Vec<(f32, usize)> = Vec::new();
     for (i, l) in scene.lights.iter().enumerate() {
-        let Some(&(pos, _, on)) = frame.lights.get(i) else { continue };
+        let Some(&(pos, _, on, range)) = frame.lights.get(i) else { continue };
         if !on || l.intensity <= 0.0 {
             continue;
         }
@@ -2018,11 +2020,11 @@ fn pick_lights(scene: &SceneData, frame: &UnityFrame, d: &Draw) -> Vec<usize> {
             f32::MAX
         } else {
             let dist = (pos.distance(d.center) - d.radius).max(0.0);
-            if dist > l.range {
+            if dist > range {
                 continue;
             }
             let lum = l.color[0] * 0.3 + l.color[1] * 0.59 + l.color[2] * 0.11;
-            lum * l.intensity / (1.0 + 25.0 * dist * dist / (l.range * l.range).max(1e-4))
+            lum * l.intensity / (1.0 + 25.0 * dist * dist / (range * range).max(1e-4))
         };
         picked.push((score, i));
     }
@@ -2040,7 +2042,7 @@ fn light_block(scene: &SceneData, frame: &UnityFrame, picked: &[usize], v: Mat4)
     }
     for (k, &i) in picked.iter().take(8).enumerate() {
         let l = &scene.lights[i];
-        let (pos, fwd, _) = frame.lights[i];
+        let (pos, fwd, _, range) = frame.lights[i];
         out[1][k] = [l.color[0] * l.intensity, l.color[1] * l.intensity, l.color[2] * l.intensity, 1.0];
         if l.kind == 1 {
             let dir = v.transform_vector3(-fwd);
@@ -2049,7 +2051,7 @@ fn light_block(scene: &SceneData, frame: &UnityFrame, picked: &[usize], v: Mat4)
         } else {
             let p = v.transform_point3(pos);
             out[0][k] = [p.x, p.y, p.z, 1.0];
-            let r2 = (l.range * l.range).max(1e-6);
+            let r2 = (range * range).max(1e-6);
             if l.kind == 0 {
                 let cos_phi = (l.spot_angle.to_radians() * 0.5).cos();
                 let cos_theta = (l.spot_angle.to_radians() * 0.25).cos();
@@ -2690,9 +2692,9 @@ fn prepare(
     }
     // light choice only changes when lights switch on/off (or move): re-rank then, not per frame
     let mut key: u64 = 0xcbf29ce484222325;
-    for (i, (p, _, on)) in frame.lights.iter().enumerate() {
+    for (i, (p, _, on, range)) in frame.lights.iter().enumerate() {
         if *on {
-            key = (key ^ i as u64).wrapping_mul(0x100000001b3);
+            key = (key ^ i as u64 ^ (range.to_bits() as u64) << 32).wrapping_mul(0x100000001b3);
             key = (key ^ p.x.to_bits() as u64 ^ (p.z.to_bits() as u64) << 32).wrapping_mul(0x100000001b3);
         }
     }

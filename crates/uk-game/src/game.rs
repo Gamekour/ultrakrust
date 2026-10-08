@@ -28,6 +28,8 @@ pub enum Act {
     HudMessageDone,
     /// HudMessage.Begone
     HudMessageBegone,
+    /// RemoveOnTime.Remove
+    RemoveOnTime,
     /// PlayerActivatorRelay.Activate
     HudRelay,
     /// LevelStatsEnabler.LevelStatsTutorial
@@ -92,6 +94,10 @@ pub struct State {
     pub collider_enabled: Vec<bool>,
     pub scripts: Vec<Script>,
     pub local_pos: Vec<Vec3>,
+    /// Nodes whose localScale a script has changed: (node, new localScale), Unity values.
+    pub local_scale: Vec<(u32, Vec3)>,
+    /// Light.enabled / Light.range per `SceneDef::lights` entry.
+    pub lights: Vec<(bool, f32)>,
     pub invokes: Vec<Invoke>,
     /// Trigger colliders the player is currently inside.
     pub inside: Vec<u32>,
@@ -486,6 +492,8 @@ impl Game {
             collider_enabled: def.colliders.iter().map(|c| c.enabled).collect(),
             scripts: scripts_rt,
             local_pos: def.nodes.iter().map(|n| n.local_pos).collect(),
+            local_scale: Vec::new(),
+            lights: def.lights.iter().map(|l| (l.enabled, l.range)).collect(),
             invokes: Vec::new(),
             inside: Vec::new(),
             player,
@@ -982,10 +990,92 @@ impl Game {
                 }
                 Script::Hud(_) => self.hud_start(sc),
                 Script::HudMessage(_) => self.hud_message_start(sc),
+                // RemoveOnTime.Start (useAudioLength needs an AudioSource clip: audio is not ported)
+                &Script::RemoveOnTime { time, randomizer } => {
+                    let t = time + (self.fx.rng.f() * 2.0 - 1.0) * randomizer;
+                    self.invoke(sc, Act::RemoveOnTime, t);
+                }
+                Script::SpawnEffect { .. } => self.spawn_effect_start(sc),
                 Script::HudMessageReceiver => self.msg_receiver_start(sc),
                 _ => {}
             }
         }
+    }
+
+    /// SpawnEffect.Start: bubble = transform.GetChild(0); unless simpleSpawns, the first active
+    /// Light in children is enabled and the ParticleSystem plays (with children).
+    fn spawn_effect_start(&mut self, sc: u32) {
+        let node = self.def.scripts[sc as usize].node;
+        let bubble = self.def.nodes[node as usize].children.first().copied();
+        let simple = self.prefs.flag("simpleSpawns");
+        let mut light = None;
+        if !simple {
+            // GetComponentInChildren<Light>(): depth first, active GameObjects only
+            let mut stack = vec![node];
+            while let Some(n) = stack.pop() {
+                if !self.s.active[n as usize] {
+                    continue;
+                }
+                if let Some(l) = self.def.lights.iter().position(|l| l.node == n) {
+                    light = Some(l as u32);
+                    break;
+                }
+                stack.extend(self.def.nodes[n as usize].children.iter().rev());
+            }
+            if let Some(l) = light {
+                self.s.lights[l as usize].0 = true;
+            }
+            if let Some(ps) = self.def.particle_systems.iter().position(|p| p.node == node) {
+                self.scene_particle_call(ps as u32, "Play");
+            }
+        }
+        if let Script::SpawnEffect { bubble: b, light: l, simple: s } = &mut self.s.scripts[sc as usize] {
+            (*b, *l, *s) = (bubble, light, simple);
+        }
+    }
+
+    /// SpawnEffect.Update
+    fn spawn_effect_update(&mut self, sc: u32, dt: f32) {
+        let Script::SpawnEffect { bubble, light, simple } = self.s.scripts[sc as usize] else { return };
+        if let Some(b) = bubble {
+            let cur = self.local_scale_of(b);
+            let next = if cur.x > 0.0 { cur - Vec3::ONE * 2.0 * dt } else { Vec3::ZERO };
+            self.set_local_scale(b, next);
+        }
+        if let (false, Some(l)) = (simple, light) {
+            let r = &mut self.s.lights[l as usize].1;
+            if *r > 0.0 {
+                *r -= dt * 50.0;
+            }
+        }
+    }
+
+    /// Transform.localScale (Unity value), with script changes.
+    pub fn local_scale_of(&self, n: u32) -> Vec3 {
+        self.s.local_scale.iter().find(|e| e.0 == n).map_or(self.def.nodes[n as usize].local_scale, |e| e.1)
+    }
+
+    pub(crate) fn set_local_scale(&mut self, n: u32, v: Vec3) {
+        match self.s.local_scale.iter_mut().find(|e| e.0 == n) {
+            Some(e) => e.1 = v,
+            None => self.s.local_scale.push((n, v)),
+        }
+    }
+
+    /// World-space (Unity) correction for script-changed localScales above or at `n`: maps the
+    /// node's animated world matrix to the rescaled one.
+    pub fn scale_delta(&self, n: u32) -> Mat4 {
+        let mut d = Mat4::IDENTITY;
+        for &(b, v) in &self.s.local_scale {
+            if !self.def.is_descendant(n, b) {
+                continue;
+            }
+            let rest = self.def.nodes[b as usize].local_scale;
+            let rel = Vec3::new(v.x / rest.x, v.y / rest.y, v.z / rest.z);
+            let w = self.anim.world_of(b);
+            d = w * Mat4::from_scale(rel) * w.inverse() * d;
+        }
+        d
     }
 
     /// GetComponentInParent (self first, then ancestors).
@@ -2624,6 +2714,11 @@ impl Game {
                 Act::HudMessageBegone => self.hud_message_begone(inv.script),
                 Act::HudRelay => self.relay_activate(inv.script),
                 Act::LevelStatsTutorial => self.level_stats_tutorial(),
+                Act::RemoveOnTime => {
+                    let n = self.def.scripts[inv.script as usize].node;
+                    self.destroy(n);
+                    self.s.local_scale.retain(|&(m, _)| !self.def.is_descendant(m, n));
+                }
             }
         }
         // per-script Update
@@ -2633,6 +2728,7 @@ impl Game {
             }
             match &self.s.scripts[sc as usize] {
                 Script::Door(_) => self.door_update(sc, dt),
+                Script::SpawnEffect { .. } => self.spawn_effect_update(sc, dt),
                 Script::DoorController(_) => self.door_controller_update(sc),
                 Script::ObjectActivator(oa) => {
                     if let Some(o) = oa.obac {

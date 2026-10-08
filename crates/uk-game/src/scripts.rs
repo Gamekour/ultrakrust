@@ -318,6 +318,11 @@ pub enum Script {
     DualWieldPickup { infinite: bool, juice: f32 },
     /// DisablePowerUp: Start ends a running power-up.
     DisablePowerUp,
+    /// RemoveOnTime: Start invokes Remove (Destroy(gameObject)) after time +- randomizer.
+    RemoveOnTime { time: f32, randomizer: f32 },
+    /// SpawnEffect (an enemy's spawn bubble): Start lights its light and plays its particles;
+    /// Update shrinks the bubble (first child) by 2/s and the light's range by 50/s.
+    SpawnEffect { bubble: Option<u32>, light: Option<u32>, simple: bool },
     /// HUD scripts (hud.rs)
     Hud(Box<crate::hud::HudScript>),
     Other,
@@ -517,6 +522,8 @@ pub fn parse(def: &SceneDef, idx: usize) -> Script {
         "OnLevelStart" => Script::OnLevelStart { on_start: parse_uevent(def, v.get("onStart")), activated: false },
         "DualWieldPickup" => Script::DualWieldPickup { infinite: b("infiniteUses"), juice: f("juiceAmount") },
         "DisablePowerUp" => Script::DisablePowerUp,
+        "RemoveOnTime" => Script::RemoveOnTime { time: f("time"), randomizer: f("randomizer") },
+        "SpawnEffect" => Script::SpawnEffect { bubble: None, light: None, simple: false },
         _ => crate::hud::parse(def, idx).map_or(Script::Other, |h| Script::Hud(Box::new(h))),
     }
 }
