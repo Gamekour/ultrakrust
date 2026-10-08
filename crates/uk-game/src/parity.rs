@@ -55,7 +55,7 @@ pub const PORTED: &[(&str, Port)] = &[
     ("EnemyIdentifier", Port::Partial("damage/limb multipliers; no buffs, blessing, radiance, sand")),
     ("Zombie", Port::Partial("navmesh pursuit (TrackTick); no anim, no agent avoidance")),
     ("ZombieMelee", Port::Partial("no anim timing")),
-    ("ZombieProjectiles", Port::Partial("no anim timing")),
+    ("ZombieProjectiles", Port::Partial("no anim timing; Flee is a straight back-off (no destination sampling)")),
     ("SpiderBody", Port::Partial("Malicious Face: no anim, no enraged phase visuals, no head pitch (SetFollowHeadRotation), no BreakCorpse")),
     ("MaliciousFace", Port::Partial("see SpiderBody")),
     ("Projectile", Port::Partial("basic straight projectile")),
@@ -135,7 +135,7 @@ pub const NATIVE: &[(i32, &str, f64)] = &[
     (95, "Animator", 0.5), // state machines, transitions, blend trees, layers, clip events; Filth/Stray driven; no root motion, IK, additive layers, humanoid muscles
     (74, "AnimationClip", 0.8), // streamed/dense/constant transform curves + events; non-transform bindings unapplied
     (91, "AnimatorController", 0.85), // fully decoded; override controllers + state machine behaviours not run
-    (195, "NavMeshAgent", 0.3), // path following via TrackTick/SetDestination; no avoidance, off-mesh links walked, no autoBraking
+    (195, "NavMeshAgent", 0.3), // path following via TrackTick/SetDestination; walking agents stay on the mesh; no avoidance, off-mesh links walked, no autoBraking
     (208, "NavMeshObstacle", 0.0),
     (238, "NavMeshData", 0.8),  // tiles + off-mesh links decoded and queried; area costs/masks not applied
     (224, "RectTransform", 0.8), // anchors, pivots, scaler; no layout groups/fitters

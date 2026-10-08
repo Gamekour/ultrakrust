@@ -113,8 +113,16 @@ Add them to object names. They're case-insensitive, and `-x`, `_x` or `$x` all w
 **Enemies** go on empties, by suffix: `-filth`, `-stray` or `-maliciousface` (e.g.
 `Guard-stray`). Each one is a copy of a 0-1 enemy. It stands on the empty's origin, faces the
 empty's forward (Blender's +Y), and is in the level from the start, with no spawn bubble. There
-are no arenas or waves yet. Custom maps have no navmesh yet, so Filth and Strays walk straight at
-the player instead of pathing around walls.
+are no arenas or waves yet.
+
+**Navmesh:** name a mesh `-navmesh` (e.g. `Floor-navmesh`) to give enemies a walkable surface
+to path on. It is invisible and has no collision. Several `-navmesh` meshes merge into one.
+- **Leave about 0.5 m between its edge and walls.** The mesh is used as-is, like Godot's
+  `-navmesh`; Unity's bake would shrink it by the agent radius (0.5 m) for you. If an edge runs
+  along a wall, enemies get stuck on corners.
+- Enemies walk only where the navmesh is, and connected pieces must share vertices.
+- Without a navmesh, Filth and Strays walk straight at the player instead of pathing around walls
+  (the map warns).
 - **Normals matter.** ULTRAKILL culls back faces, and its surface queries are single-sided. Run
   *Mesh → Normals → Recalculate Outside* in Blender if a floor is invisible from above.
 

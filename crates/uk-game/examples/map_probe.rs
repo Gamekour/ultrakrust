@@ -62,6 +62,10 @@ fn main() {
     println!("surface meshes on the map: {:?}", def.surface_meshes.iter().filter(|s| def.is_descendant(s.node, root)).map(|s| (s.tris.len(), s.mats[0].surface)).collect::<Vec<_>>());
     let mut g = Game::new(Arc::new(def));
     g.start_custom_map();
+    match &g.nav {
+        Some(n) => println!("navmesh: {} polys, {} links, {} components", n.polys.len(), n.polys.iter().map(|p| p.links.len()).sum::<usize>(), n.components()),
+        None => println!("navmesh: none"),
+    }
     for (i, l) in g.def.lights.iter().enumerate().filter(|(_, l)| g.def.is_descendant(l.node, root)) {
         let (on, range) = g.s.lights[i];
         println!("light {}: kind {} color {:.3?} intensity {:.3} range {range:.2} spot {:.1} enabled {on} active {}", g.def.path(l.node), l.kind, l.color, l.intensity, l.spot_angle, g.active(l.node));
@@ -80,7 +84,10 @@ fn main() {
     let p = &g.s.player;
     println!("start: pos {:.3?} yaw {:.1} activated {} timer {} level started {}", p.pos, g.spawn_yaw, p.activated, g.s.stats.timer, g.s.stats.level_started);
     let mut t = 0.0f64;
-    for i in 0..180 {
+    // STEPS: fixed steps to run (180); TRACK=1 prints each enemy's position every 30 steps
+    let steps: usize = std::env::var("STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(180);
+    let track = std::env::var("TRACK").is_ok();
+    for i in 0..steps {
         g.fixed_update(&Input::default());
         t += FIXED_DT as f64;
         g.update(&Input::default(), FIXED_DT, t);
@@ -89,8 +96,13 @@ fn main() {
             let p = &g.s.player;
             println!("t {:.2}: pos {:.3?} vel {:.2?} grounded {} hp {}", g.s.time, p.pos, p.vel, p.gc.on_ground, g.s.hp);
         }
+        if track && i % 30 == 29 {
+            for e in &g.s.enemies {
+                println!("  track t {:.2} {:?}: pos {:.2?} path corners {} ({})", g.s.time, e.kind, e.pos, e.path.len(), e.path_i);
+            }
+        }
     }
-    println!("enemies after 3 s:");
+    println!("enemies at the end:");
     enemies(&g);
     let p = g.s.player.pos;
     if let Some(h) = g.world.raycast(p, -Vec3::Y, 10.0) {

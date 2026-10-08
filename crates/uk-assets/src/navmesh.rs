@@ -185,3 +185,91 @@ pub fn load_scene_navmeshes(db: &mut crate::db::AssetDb, bundle: &std::path::Pat
     out.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(out)
 }
+
+/// Detour's per-tile limit on polygons and vertices (u16 indices; 0 means "no neighbour").
+pub const MAX_TILE_ITEMS: usize = 0xffff;
+
+/// A one-tile navmesh made from triangles (Bevy space), the way a baked tile is laid out: one
+/// polygon per triangle, vertices welded within 1 mm, polygons wound clockwise seen from above
+/// (as every baked tile is in Bevy space), edge `k` (verts k to k+1) linked to the polygon
+/// sharing it, and each triangle its own height detail. Triangles that are degenerate or face
+/// sideways (no extent seen from above) are dropped. Returns the mesh and the dropped count.
+pub fn from_triangles(name: &str, tris: &[[Vec3; 3]], like: Option<&NavMeshData>) -> (NavMeshData, usize) {
+    use std::collections::HashMap;
+    let mut verts: Vec<Vec3> = Vec::new();
+    let mut weld: HashMap<[i64; 3], u16> = HashMap::new();
+    let mut polys: Vec<NavPoly> = Vec::new();
+    let mut detail = Vec::new();
+    let mut dropped = 0;
+    for t in tris {
+        let up = (t[1] - t[0]).cross(t[2] - t[0]).y;
+        if up.abs() < 1e-6 || polys.len() >= MAX_TILE_ITEMS {
+            dropped += 1;
+            continue;
+        }
+        // clockwise from above: the cross product points down
+        let t = if up > 0.0 { [t[0], t[2], t[1]] } else { *t };
+        let mut ids = [0u16; 3];
+        let mut full = false;
+        for (k, &p) in t.iter().enumerate() {
+            let key = (p * 1000.0).round().as_i64vec3().to_array();
+            ids[k] = match weld.get(&key) {
+                Some(&i) => i,
+                None if verts.len() < MAX_TILE_ITEMS => {
+                    weld.insert(key, verts.len() as u16);
+                    verts.push(p);
+                    verts.len() as u16 - 1
+                }
+                None => {
+                    full = true;
+                    0
+                }
+            };
+        }
+        if full || ids[0] == ids[1] || ids[1] == ids[2] || ids[0] == ids[2] {
+            dropped += 1;
+            continue;
+        }
+        polys.push(NavPoly { verts: ids.to_vec(), neis: vec![0; 3], flags: 1, area: 0 });
+        detail.push(vec![[verts[ids[0] as usize], verts[ids[1] as usize], verts[ids[2] as usize]]]);
+    }
+    // edge (a, b) of one polygon meets (b, a) of its neighbour
+    let mut edges: HashMap<(u16, u16), usize> = HashMap::new();
+    for (pi, p) in polys.iter().enumerate() {
+        for k in 0..3 {
+            edges.entry((p.verts[k], p.verts[(k + 1) % 3])).or_insert(pi);
+        }
+    }
+    for pi in 0..polys.len() {
+        for k in 0..3 {
+            let (a, b) = (polys[pi].verts[k], polys[pi].verts[(k + 1) % 3]);
+            if let Some(&o) = edges.get(&(b, a)) {
+                if o != pi {
+                    polys[pi].neis[k] = o as u16 + 1;
+                }
+            }
+        }
+    }
+    let (mut bmin, mut bmax) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    for &v in &verts {
+        bmin = bmin.min(v);
+        bmax = bmax.max(v);
+    }
+    if verts.is_empty() {
+        (bmin, bmax) = (Vec3::ZERO, Vec3::ZERO);
+    }
+    // the humanoid agent's settings (0-1's when given; Unity's defaults otherwise)
+    let (agent_radius, agent_height, agent_climb) = like.map_or((0.5, 2.0, 0.75), |m| (m.agent_radius, m.agent_height, m.agent_climb));
+    let tile = NavTile { x: 0, y: 0, layer: 0, verts, polys, detail, bmin, bmax };
+    let mesh = NavMeshData {
+        name: name.to_string(),
+        agent_type: 0,
+        agent_radius,
+        agent_height,
+        agent_climb,
+        tile_world_size: (bmax - bmin).max_element().max(1.0),
+        tiles: vec![tile],
+        links: Vec::new(),
+    };
+    (mesh, dropped)
+}

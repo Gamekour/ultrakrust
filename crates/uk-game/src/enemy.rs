@@ -530,6 +530,22 @@ pub fn fixed_update(g: &mut Game) {
                 en.vel -= n * into;
             }
         }
+        // a walking NavMeshAgent can't leave the navmesh: the feet snap back onto it (knockback
+        // and ledges, airborne, are free)
+        if let (true, Some(nav), Some(agent)) = (en.grounded, g.nav.as_ref(), en.agent) {
+            let feet = en.pos + Vec3::Y * (en.center_y - en.half_height.max(en.radius));
+            if let Some((_, on)) = nav.nearest(feet, agent.half_ext) {
+                let off = Vec3::new(on.x - feet.x, 0.0, on.z - feet.z);
+                if off.length_squared() > 1e-6 {
+                    en.pos += off;
+                    let out = -off.normalize();
+                    let v = en.vel.dot(out);
+                    if v > 0.0 {
+                        en.vel -= out * v;
+                    }
+                }
+            }
+        }
         if en.pos.y < -1000.0 {
             out_of_world.push(i);
         }

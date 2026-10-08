@@ -75,8 +75,11 @@ Placement conventions:
 - **Properties:** `spawn_in` (true in waves, else false) overrides the bubble.
 - **Filth and Strays need a navmesh to path to the player** (see `-navmesh`). Without one they
   walk straight at the player (the port's fallback), and the parser warns.
-- **Implemented:** the three suffixes, outside waves only (no `-wave` or `spawn_in` yet). Every
-  placement warns about the missing navmesh until `-navmesh` is imported.
+- **Navmesh, implemented:** one tile, with one polygon per triangle. Vertices are welded within
+  1 mm. Polygons link across shared edges, and vertical or degenerate triangles are dropped. The
+  mesh is used as-is: authors leave the agent radius (0.5 m) clear of walls themselves, since
+  there's no erosion. Agent settings come from 0-1's humanoid navmesh.
+- **Implemented:** the three suffixes, outside waves only (no `-wave` or `spawn_in` yet).
 
 ### Geometry with behaviour
 | Suffix | Object | Becomes | Collision | Properties (default) |
@@ -85,7 +88,7 @@ Placement conventions:
 | `-breakable` | Mesh | `Breakable`: shatters when hit. | Convex | `weak` (false: any hit breaks it), `precision_only` (false) |
 | `-glass` | Mesh | `Glass`: breaks when hit or touched. | Tri | — |
 | `-water` | Mesh or empty volume | A `Water` volume: swimming physics and the underwater overlay. | Trigger | `color` RGBA (0, 0.5, 1, 1) |
-| `-navmesh` | Mesh | The enemies' walkable surface: invisible, no collision. Several are merged. Already a Godot suffix; today it's ignored. | — | — |
+| `-navmesh` | Mesh | The enemies' walkable surface: invisible, no collision. Several are merged. Already a Godot suffix. Implemented. | — | — |
 | `-hint` | Trigger | `HudMessage`: shows `message` while the player is inside it (or for `seconds`). | Trigger | `message` (required), `seconds` (0 = while inside), `once` (true) |
 | `-trigger` | Trigger | `ObjectActivator`: activates everything named in `activates` when the player enters it. | Trigger | `activates` (required), `delay` s (0), `once` (true) |
 | `-start` | Trigger | (inside an `-arena`) starts the fight; see below. | Trigger | — |

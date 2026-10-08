@@ -586,3 +586,20 @@ CPU-skinned enemies, 3,393 colliders/569 triggers, 11,758 MonoBehaviours with ty
   - At start: Filth yaw 0 (hp 0.5), Stray yaw -90 (hp 1.5), Malicious Face hp 25, with its body at (0, 9, 8), the template's offset.
   - After 3 s: the Filth walked to the player and hit them (player hp 100 to 70), and the Stray turned to face them.
 - Custom maps have no navmesh (retain_nodes clears 0-1's), so Filth and Strays use the port's straight-line fallback. The parser warns. MAP_FORMAT said they would stand still, which is now corrected.
+
+## 2026-10-08 — Custom maps: `-navmesh`
+- A `-navmesh` mesh (invisible, no collision; several merge) becomes the level's navmesh: `navmesh::from_triangles` lays the triangles out as one baked tile.
+  - One polygon per triangle, with vertices welded within 1 mm.
+  - Each polygon edge links to the polygon sharing it, and each triangle is its own detail mesh.
+  - Vertical or degenerate triangles are dropped (warned), with Detour's 65,535-per-tile cap.
+  - Polygons are wound clockwise from above in Bevy space, as every baked tile is (`nav_winding level0-1`: 412 cw, 0 ccw).
+  - Agent settings come from 0-1's humanoid navmesh (radius 0.5, height 2, climb 1.5), read before pruning clears it.
+  - The mesh is assigned after the template `retain_nodes`, which clears navmeshes.
+- No erosion: the mesh is used as-is (Godot's convention). Authors leave about 0.5 m clear of walls.
+  - With a hole exactly the barrier's footprint, the Filth's path corner sat on the wall corner, and it stuck at (2.47, -3.49).
+- Walking Filth and Strays now stay on the navmesh, as a NavMeshAgent does: grounded feet snap back to `nav.nearest`, and outward velocity is removed. Airborne (knockback, ledges) is free. Before, the Stray's back-off (the port's stand-in for ZombieProjectiles.Flee, which samples its destination onto the navmesh) walked it off the 20 m floor, and it fell to y -57.
+- `map_probe` on a scratchpad map: a 1 m grid navmesh with 1 m margins around a barrier (x -8..2, z -3..-2) between the Filth and the player, and around the wall. Result: 648 polygons, 1,806 links, 1 component.
+  - The Filth: (-4, -5), then around the barrier's east end ((3.06, -3.97) at 0.72 s, (3.76, -1.94) at 0.96 s), then to the player. It hit them at 1.9 s (hp 100 to 70).
+  - The Stray backs off to the navmesh corner (10, -10) and stays there.
+  - The Malicious Face now walks its navmesh toward the player.
+- 0-1 harness: only sim_budget fails (accepted); the east-stairs autopilot gap was already there.
