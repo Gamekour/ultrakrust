@@ -62,6 +62,10 @@ fn main() {
     println!("surface meshes on the map: {:?}", def.surface_meshes.iter().filter(|s| def.is_descendant(s.node, root)).map(|s| (s.tris.len(), s.mats[0].surface)).collect::<Vec<_>>());
     let mut g = Game::new(Arc::new(def));
     g.start_custom_map();
+    for (i, l) in g.def.lights.iter().enumerate().filter(|(_, l)| g.def.is_descendant(l.node, root)) {
+        let (on, range) = g.s.lights[i];
+        println!("light {}: kind {} color {:.3?} intensity {:.3} range {range:.2} spot {:.1} enabled {on} active {}", g.def.path(l.node), l.kind, l.color, l.intensity, l.spot_angle, g.active(l.node));
+    }
     let p = &g.s.player;
     println!("start: pos {:.3?} yaw {:.1} activated {} timer {} level started {}", p.pos, g.spawn_yaw, p.activated, g.s.stats.timer, g.s.stats.level_started);
     let mut t = 0.0f64;

@@ -545,3 +545,7 @@ CPU-skinned enemies, 3,393 colliders/569 triggers, 11,758 MonoBehaviours with ty
 - Runtime transform / light state: `State::local_scale` (script-changed localScales; `Game::scale_delta` maps a node's animated world to the rescaled one, and unity_render applies it per draw) and `State::lights` (Light.enabled / range per scene light; the frame's light tuple carries the range, a point / spot light with range <= 0 is off). The legacy renderer does not apply them.
 - `spawn_fx` (0-1, Gun Room Wave 2 / Zombie (6)): 108 enemies have a spawnEffect, 103 with spawnIn. Bubble world x-scale 2.25 -> 1.35 (0.2 s) -> 0 (0.5 s). The light goes on at the first frame, range 25 -> 15 -> 5 -> -0.2 (off). 60 particles, all dead by 0.6 s. The object is destroyed between 2.0 and 2.2 s, and no scale overrides are left.
 
+## 2026-10-08 — Custom maps: "no lights" was the export
+- Report: custom maps import no lights. `glb_json.py` on custom_maps/corinth_packed.glb and example.glb (Blender glTF I/O 5.0.21): no KHR_lights_punctual in extensionsUsed and no light entries. Blender's exporter only writes lights with Include > Data > Punctual Lights, which is off by default. The loader is fine: the scratchpad test.gltf's point light imports (kind 2, colour [1, 0.735, 0.537], range 50) and is enabled and active in the game (`map_probe` now prints the map's lights with their runtime state).
+- The loader now warns when a map has no lights, naming the export option. README: the same note under Lights.
+

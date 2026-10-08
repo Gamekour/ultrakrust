@@ -123,7 +123,8 @@ Add them to object names. They're case-insensitive, and `-x`, `_x` or `$x` all w
 - **Surfaces:** everything you collide with counts as metal for footsteps and hit effects.
 
 **Lights:**
-- Point, spot and sun lights import by type and colour.
+- Point, spot and sun lights import by type and colour. Blender leaves them out of the export
+  by default: tick *Include → Data → Punctual Lights* in the glTF export dialog.
 - Brightness is converted from glTF's physical units, so expect to tune it by eye.
 - Cameras are ignored.
 

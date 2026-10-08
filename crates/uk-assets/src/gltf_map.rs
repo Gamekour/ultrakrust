@@ -220,6 +220,10 @@ pub fn append_gltf(db: &mut AssetDb, def: &mut SceneDef, path: &Path) -> Result<
         visit(&mut cx, &n, root, Mat4::IDENTITY);
     }
     let mut report = cx.report;
+    // Blender's exporter leaves lights out unless asked to
+    if report.lights == 0 {
+        report.warnings.push("no lights in the file (Blender: export with Include > Data > Punctual Lights)".into());
+    }
     def.warnings.extend(report.warnings.iter().cloned());
     report.warnings.dedup();
     Ok(report)
