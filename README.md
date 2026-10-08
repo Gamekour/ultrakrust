@@ -129,7 +129,8 @@ Add them to object names. They're case-insensitive, and `-x`, `_x` or `$x` all w
   export (with the export's lighting mode left on Standard). Expect to tune it by eye.
 - Cameras are ignored.
 
-Map-specific ULTRAKILL features (enemies, triggers, checkpoints, ...) aren't supported yet.
+Map-specific ULTRAKILL features (enemies, triggers, checkpoints, ...) aren't supported yet. The
+planned format is drafted in [docs/MAP_FORMAT.md](docs/MAP_FORMAT.md).
 
 ## For developers
 | Crate | What it does |
