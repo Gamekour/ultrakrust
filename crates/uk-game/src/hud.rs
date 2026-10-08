@@ -104,6 +104,20 @@ impl ColorBlind {
 
 /// `float.ToString(format)` for the fixed formats the HUD uses ("F0", "0.00"): Mono formats a
 /// float from its 7 significant digits, then rounds half away from zero.
+/// LevelStats' time: `minutes + ":" + seconds.ToString("00.000")` after subtracting whole minutes
+/// in f32 steps.
+pub fn stats_time_text(total: f32) -> String {
+    let mut seconds = total;
+    let mut minutes = 0.0f32;
+    while seconds >= 60.0 {
+        seconds -= 60.0;
+        minutes += 1.0;
+    }
+    let s = net_fixed(seconds, 3);
+    let pad = if s.find('.').unwrap_or(s.len()) < 2 { "0" } else { "" };
+    format!("{}:{pad}{s}", minutes as i64)
+}
+
 pub fn net_fixed(x: f32, decimals: usize) -> String {
     let s = format!("{:.6e}", x.abs());
     let (mant, exp) = s.split_once('e').unwrap();
@@ -275,6 +289,42 @@ pub enum HudScript {
     Controller(Box<Controller>),
     Pos(Box<HudPos>),
     LevelStatsEnabler(Box<LevelStatsEnabler>),
+    LevelStats(Box<LevelStats>),
+    /// StyleHUD: only the meter's visibility (no style points are scored, so comboActive stays false)
+    Style { force_meter_on: bool },
+    Railcannon(Box<RailcannonMeter>),
+}
+
+/// RailcannonMeter (Image refs are script indices). WeaponCharges.raicharge is 0 until the railcannon is ported.
+#[derive(Clone, Debug)]
+pub struct RailcannonMeter {
+    pub background: Option<u32>,
+    /// meters + colorlessMeter (trueMeters)
+    pub true_meters: Vec<Option<u32>>,
+    pub colorless: Option<u32>,
+    pub alt_hud_panels: Vec<Option<u32>>,
+    pub mini: Option<u32>,
+    pub flash: f32,
+    pub has_flashed: bool,
+}
+
+/// LevelStats: the replay stats panel (TMP_Text / Image refs are script indices).
+#[derive(Clone, Debug)]
+pub struct LevelStats {
+    pub cyber_grind: bool,
+    pub secret_level: bool,
+    pub level_name: Option<u32>,
+    pub time: Option<u32>,
+    pub time_rank: Option<u32>,
+    pub kills: Option<u32>,
+    pub kills_rank: Option<u32>,
+    pub style: Option<u32>,
+    pub style_rank: Option<u32>,
+    pub secrets: Vec<Option<u32>>,
+    pub challenge: Option<u32>,
+    pub major_assists: Option<u32>,
+    pub ready: bool,
+    pub check_secrets: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -392,6 +442,22 @@ pub fn parse(def: &SceneDef, idx: usize) -> Option<HudScript> {
             default_rect: None,
             default_tr: None,
         })),
+        "LevelStats" => HudScript::LevelStats(Box::new(LevelStats {
+            cyber_grind: b("cyberGrind"),
+            secret_level: b("secretLevel"),
+            level_name: def.script_ref(v.get("levelName")),
+            time: def.script_ref(v.get("time")),
+            time_rank: def.script_ref(v.get("timeRank")),
+            kills: def.script_ref(v.get("kills")),
+            kills_rank: def.script_ref(v.get("killsRank")),
+            style: def.script_ref(v.get("style")),
+            style_rank: def.script_ref(v.get("styleRank")),
+            secrets: v.get("secrets").array().iter().map(|p| def.script_ref(p)).collect(),
+            challenge: def.script_ref(v.get("challenge")),
+            major_assists: def.script_ref(v.get("majorAssists")),
+            ready: false,
+            check_secrets: true,
+        })),
         "LevelStatsEnabler" => HudScript::LevelStatsEnabler(Box::new(LevelStatsEnabler {
             secret_level: v.get("secretLevel").i64(),
             can_always_enable: b("canAlwaysEnable"),
@@ -399,6 +465,16 @@ pub fn parse(def: &SceneDef, idx: usize) -> Option<HudScript> {
             keep_open: false,
             double_tap: 0.0,
         })),
+        "RailcannonMeter" => HudScript::Railcannon(Box::new(RailcannonMeter {
+            background: def.script_ref(v.get("meterBackground")),
+            true_meters: v.get("meters").array().iter().map(|p| def.script_ref(p)).chain([def.script_ref(v.get("colorlessMeter"))]).collect(),
+            colorless: def.script_ref(v.get("colorlessMeter")),
+            alt_hud_panels: v.get("altHudPanels").array().iter().map(|p| def.node_ref(p)).collect(),
+            mini: def.node_ref(v.get("miniVersion")),
+            flash: 0.0,
+            has_flashed: false,
+        })),
+        "StyleHUD" => HudScript::Style { force_meter_on: b("forceMeterOn") },
         _ => return None,
     })
 }
@@ -552,6 +628,7 @@ impl Game {
             Some(HudScript::Stamina(_)) => self.stamina_update_colors(sc),
             Some(HudScript::ColorGet { .. }) => self.color_get_update(sc),
             Some(HudScript::Pos(_)) => self.hud_pos_check(sc),
+            Some(HudScript::Railcannon(_)) => self.railcannon_check_status(sc),
             _ => {}
         }
     }
@@ -602,6 +679,8 @@ impl Game {
             Some(HudScript::Controller(_)) => self.controller_start(sc),
             Some(HudScript::Pos(_)) => self.hud_pos_check(sc),
             Some(HudScript::LevelStatsEnabler(_)) => self.level_stats_enabler_start(sc),
+            Some(HudScript::LevelStats(_)) => self.level_stats_start(sc),
+            Some(HudScript::Railcannon(_)) => self.railcannon_check_status(sc),
             _ => {}
         }
     }
@@ -620,6 +699,15 @@ impl Game {
                 Some(HudScript::HealthBar(_)) => self.health_bar_update(sc, dt),
                 Some(HudScript::Stamina(_)) => self.stamina_update(sc, dt),
                 Some(HudScript::LevelStatsEnabler(_)) => self.level_stats_enabler_update(sc, dt),
+                Some(HudScript::LevelStats(l)) if l.ready => self.level_stats_check(sc),
+                Some(HudScript::Railcannon(_)) => self.railcannon_update(sc, dt),
+                Some(&mut HudScript::Style { force_meter_on }) => {
+                    // StyleHUD.UpdateMeter: styleHud (child 0) is shown while comboActive || forceMeterOn
+                    let node = self.def.scripts[sc as usize].node;
+                    if let Some(&hud) = self.def.nodes[node as usize].children.first() {
+                        self.set_active(hud, force_meter_on);
+                    }
+                }
                 _ => {}
             }
         }
@@ -975,6 +1063,95 @@ impl Game {
         }
     }
 
+    // ---------------------------------------------------------------- RailcannonMeter
+
+    /// RailcannonMeter.RailcannonStatus: a railcannon variant owned (CheckGear) and enabled, and weapons
+    fn railcannon_status(&self) -> bool {
+        let general = self.save.general();
+        let no_weapons = !self.s.has_revolver;
+        (0..4).any(|i| {
+            let gear = general.as_ref().map_or(0, |g| g.get(&format!("rai{i}")).i64());
+            gear == 1 && self.prefs.int_or(&format!("weapon.rai{i}"), 1) == 1 && !no_weapons
+        })
+    }
+
+    /// RailcannonMeter.CheckStatus (Start / OnEnable)
+    fn railcannon_check_status(&mut self, sc: u32) {
+        let Some(HudScript::Railcannon(r)) = self.hud(sc).cloned() else { return };
+        let me = self.def.scripts_on(self.def.scripts[sc as usize].node).find(|(_, s)| s.class == "Image").map(|(i, _)| i);
+        let on = self.prefs.flag("railcannonMeter") && self.railcannon_status();
+        let icons = self.prefs.flag("weaponIcons");
+        if let Some(me) = me {
+            self.s.script_enabled[me as usize] = on && icons;
+        }
+        if let Some(m) = r.mini {
+            self.set_active(m, on && !icons);
+        }
+        for p in r.alt_hud_panels.iter().flatten() {
+            self.set_active(*p, on);
+        }
+    }
+
+    /// RailcannonMeter.Update
+    fn railcannon_update(&mut self, sc: u32, dt: f32) {
+        let Some(ui) = self.ui_def() else { return };
+        let Some(HudScript::Railcannon(mut r)) = self.hud(sc).cloned() else { return };
+        let me = self.def.scripts_on(self.def.scripts[sc as usize].node).find(|(_, s)| s.class == "Image").map(|(i, _)| i);
+        let self_on = me.is_some_and(|i| self.s.script_enabled[i as usize]);
+        let mini_on = r.mini.is_some_and(|m| self.s.active_self[m as usize]);
+        // WeaponCharges.raicharge (railcannon not ported)
+        let raicharge = 0.0f32;
+        let enable = |g: &mut Self, s: Option<u32>, on: bool| {
+            if let Some(s) = s {
+                g.s.script_enabled[s as usize] = on;
+            }
+        };
+        if self_on || mini_on {
+            for (i, &m) in r.true_meters.iter().enumerate() {
+                enable(self, m, self_on || i != 0);
+            }
+            if raicharge > 4.0 {
+                // Time.timeScale is always 1 here
+                if !r.has_flashed {
+                    r.flash = 1.0;
+                }
+                r.has_flashed = true;
+                let mut c = self.colors.hud(hct::RAILCANNON_FULL);
+                if r.flash > 0.0 {
+                    c = std::array::from_fn(|i| c[i] + (WHITE[i] - c[i]) * r.flash);
+                    r.flash = (r.flash - dt).max(0.0);
+                }
+                for &m in r.true_meters.iter().flatten() {
+                    if let Some(g) = self.graphic_of_script(&ui, m) {
+                        self.s.ui.fill[g as usize] = 1.0;
+                        self.set_graphic_color(g, if Some(m) != r.colorless { c } else { WHITE });
+                    }
+                }
+            } else {
+                r.flash = 0.0;
+                r.has_flashed = false;
+                let c = self.colors.hud(hct::RAILCANNON_CHARGING);
+                for &m in r.true_meters.iter().flatten() {
+                    if let Some(g) = self.graphic_of_script(&ui, m) {
+                        self.set_graphic_color(g, c);
+                        self.s.ui.fill[g as usize] = (raicharge / 4.0).clamp(0.0, 1.0);
+                    }
+                }
+            }
+            enable(self, r.background, !(raicharge > 4.0 || !self_on));
+        } else {
+            r.flash = 0.0;
+            r.has_flashed = false;
+            enable(self, r.background, false);
+            for &m in &r.true_meters {
+                enable(self, m, false);
+            }
+        }
+        if let Some(HudScript::Railcannon(x)) = self.hud(sc) {
+            **x = *r;
+        }
+    }
+
     // ---------------------------------------------------------------- HudController / HUDPos
 
     fn controller_start(&mut self, sc: u32) {
@@ -1108,15 +1285,136 @@ impl Game {
         self.def.scripts.iter().find(|s| s.class == "StatsManager").map_or(0, |s| s.data.get("levelNumber").i64())
     }
 
+    /// StatsManager.levelNumber != 0 and GetRank(returnNull) holds a RankData for it (release build)
+    fn has_level_rank(&self) -> bool {
+        let lvl = self.level_number();
+        lvl != 0 && self.save.rank(lvl).is_some_and(|r| r.get("levelNumber").i64() == lvl)
+    }
+
+    /// StockMapInfo.Instance.assets.LargeText
+    fn stock_large_text(&self) -> Option<String> {
+        let s = self.def.scripts.iter().find(|s| s.class == "StockMapInfo")?;
+        Some(s.data.get("assets").get("LargeText").str().to_string())
+    }
+
+    pub(crate) fn set_tmp_text(&mut self, script: Option<u32>, text: &str) {
+        let Some(ui) = self.ui_def() else { return };
+        let Some(g) = script.and_then(|s| self.graphic_of_script(&ui, s)) else { return };
+        if self.s.ui.text[g as usize].as_deref() != Some(text) {
+            self.s.ui.text[g as usize] = Some(text.into());
+        }
+    }
+
+    /// StatsManager.GetRanks (TMP rich-text letter)
+    pub fn rank_text(&self, field: &str, value: f32, reverse: bool) -> &'static str {
+        let sm = self.def.scripts.iter().find(|s| s.class == "StatsManager");
+        let ranks: Vec<i64> = sm.map(|s| s.data.get(field).array().iter().map(|v| v.i64()).collect()).unwrap_or_default();
+        let n = ranks.iter().take_while(|&&t| if reverse { value <= t as f32 } else { value >= t as f32 }).count();
+        match n {
+            _ if n >= ranks.len() => "<color=#FF0000>S</color>",
+            0 => "<color=#0094FF>D</color>",
+            1 => "<color=#4CFF00>C</color>",
+            2 => "<color=#FFD800>B</color>",
+            _ => "<color=#FF6A00>A</color>",
+        }
+    }
+
+    /// LevelStats.Start (release build, not a custom level)
+    fn level_stats_start(&mut self, sc: u32) {
+        let node = self.def.scripts[sc as usize].node;
+        let Some(HudScript::LevelStats(l)) = self.hud(sc).cloned() else { return };
+        if l.secret_level || l.cyber_grind {
+            self.set_tmp_text(l.level_name, if l.cyber_grind { "THE CYBER GRIND" } else { "SECRET MISSION" });
+            if let Some(HudScript::LevelStats(l)) = self.hud(sc) {
+                l.ready = true;
+            }
+            self.level_stats_check(sc);
+            return;
+        }
+        if self.has_level_rank() {
+            let name = self.stock_large_text().unwrap_or_else(|| "???".into());
+            self.set_tmp_text(l.level_name, &name);
+            if let Some(HudScript::LevelStats(l)) = self.hud(sc) {
+                l.ready = true;
+            }
+            self.level_stats_check(sc);
+        } else {
+            self.set_active(node, false);
+        }
+        let n = self.secret_objects().len();
+        for s in l.secrets.iter().skip(n).rev() {
+            if let Some(s) = s {
+                let sn = self.def.scripts[*s as usize].node;
+                self.set_active(sn, false);
+            }
+        }
+    }
+
+    /// LevelStats.CheckStats (no ChallengeManager / major assists: "NO")
+    fn level_stats_check(&mut self, sc: u32) {
+        let Some(HudScript::LevelStats(l)) = self.hud(sc).cloned() else { return };
+        let st = self.s.stats.clone();
+        if l.time.is_some() {
+            self.set_tmp_text(l.time, &stats_time_text(st.seconds));
+        }
+        if l.time_rank.is_some() {
+            let r = self.rank_text("timeRanks", st.seconds, true);
+            self.set_tmp_text(l.time_rank, r);
+        }
+        if l.cyber_grind {
+            return;
+        }
+        if l.kills.is_some() {
+            self.set_tmp_text(l.kills, &self.s.kills.to_string());
+        }
+        if l.kills_rank.is_some() {
+            let r = self.rank_text("killRanks", self.s.kills as f32, false);
+            self.set_tmp_text(l.kills_rank, r);
+        }
+        if l.style.is_some() {
+            self.set_tmp_text(l.style, &st.style_points.to_string());
+        }
+        if l.style_rank.is_some() {
+            let r = self.rank_text("styleRanks", st.style_points as f32, false);
+            self.set_tmp_text(l.style_rank, r);
+        }
+        if l.check_secrets && !l.secrets.is_empty() {
+            let mut all = true;
+            let n = self.secret_objects().len();
+            let filled = self.ui_assets.as_ref().and_then(|a| a.sprite(sc, "filledSecret"));
+            let ui = self.ui_def();
+            for (num, num2) in (0..n).rev().enumerate() {
+                if st.prev_secrets.contains(&num) || st.new_secrets.contains(&num) {
+                    let g = l.secrets.get(num2).copied().flatten().and_then(|s| ui.as_ref().and_then(|u| self.graphic_of_script(u, s)));
+                    if let Some(g) = g {
+                        self.s.ui.sprite[g as usize] = filled;
+                    }
+                } else {
+                    all = false;
+                }
+            }
+            if all {
+                if let Some(HudScript::LevelStats(l)) = self.hud(sc) {
+                    l.check_secrets = false;
+                }
+            }
+        }
+        if l.challenge.is_some() {
+            self.set_tmp_text(l.challenge, "NO");
+        }
+        if l.major_assists.is_some() {
+            let t = if st.major_used { "<color=#4C99E6>YES</color>" } else { "NO" };
+            self.set_tmp_text(l.major_assists, t);
+        }
+    }
+
     /// LevelStatsEnabler.Start (a release build, not a custom level)
     fn level_stats_enabler_start(&mut self, sc: u32) {
         let node = self.def.scripts[sc as usize].node;
         let Some(HudScript::LevelStatsEnabler(e)) = self.hud(sc).cloned() else { return };
         if !e.can_always_enable {
             let hide = if e.secret_level < 0 {
-                let lvl = self.level_number();
-                let rank = if lvl != 0 { self.save.rank(lvl) } else { None };
-                lvl == 0 || rank.is_none_or(|r| r.get("levelNumber").i64() != lvl)
+                !self.has_level_rank()
             } else {
                 let m = self.save.general().map_or(0, |g| g.get("secretMissions").array().get(e.secret_level as usize).map_or(0, |v| v.i64()));
                 m < 2
@@ -1214,7 +1512,17 @@ impl Script {
 
 #[cfg(test)]
 mod tests {
-    use super::net_fixed;
+    use super::{net_fixed, stats_time_text};
+
+    #[test]
+    fn stats_time() {
+        assert_eq!(stats_time_text(0.0), "0:00.000");
+        assert_eq!(stats_time_text(5.25), "0:05.250");
+        assert_eq!(stats_time_text(75.5), "1:15.500");
+        assert_eq!(stats_time_text(122.357574), "2:02.358");
+        // the minutes are taken before rounding, like the game
+        assert_eq!(stats_time_text(659.9996), "10:60.000");
+    }
 
     #[test]
     fn fixed_formats() {

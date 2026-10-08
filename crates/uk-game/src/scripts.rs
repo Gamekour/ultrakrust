@@ -31,6 +31,14 @@ pub struct Call {
 }
 
 /// `UltrakillEvent`: object lists + UnityEvents.
+#[derive(Clone, Debug)]
+pub struct GetPlayerPref {
+    pub pref: String,
+    pub value: i64,
+    pub success: Vec<Call>,
+    pub fail: Vec<Call>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct UEvent {
     pub to_activate: Vec<u32>,
@@ -236,14 +244,27 @@ pub struct FinalDoor {
 
 #[derive(Clone, Debug)]
 pub struct HudMessage {
+    /// TMP rich text, `$` line breaks
     pub message: String,
+    pub message2: String,
+    /// actionReference's action id (Some("") when the reference does not resolve)
+    pub action: Option<String>,
+    /// actionReferences (advancedMessage)
+    pub actions: Vec<Option<String>>,
+    pub advanced: bool,
     pub deactivating: bool,
     pub not_one_time: bool,
     pub timed: bool,
     pub timer: f32,
     pub dont_on_trigger: bool,
+    pub silent: bool,
     pub deactivate_on_exit: bool,
-    pub shown: bool,
+    pub deactive_on_disable: bool,
+    pub player_pref: String,
+    pub activated: bool,
+    pub colliderless: bool,
+    /// Destroy(this) (Begone)
+    pub destroyed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -260,13 +281,17 @@ pub enum Script {
     CheckPoint(CheckPoint),
     DeathZone(Box<DeathZone>),
     Teleport(Box<Teleport>),
-    PlayerActivator { activated: bool, only_player: bool },
+    PlayerActivator { activated: bool, only_player: bool, start_timer: bool },
+    /// GetPlayerPref: on Awake, a pref check picks onCheckSuccess or onCheckFail
+    GetPlayerPref(Box<GetPlayerPref>),
     /// The first exit pit's shaft: drops the falling player into the second pit's shaft.
     TeleportFinalPit,
     FinalDoor(FinalDoor),
-    FinalDoorOpener { opened: bool, opening: bool, closed: bool },
+    FinalDoorOpener { opened: bool, opening: bool, closed: bool, start_timer: bool },
     FinalPit(Box<FinalPit>),
     HudMessage(Box<HudMessage>),
+    /// HudMessageReceiver (state in `State::msg`)
+    HudMessageReceiver,
     /// Index into `State::enemies`.
     Enemy(usize),
     WeaponPickUp,
@@ -418,7 +443,13 @@ pub fn parse(def: &SceneDef, idx: usize) -> Script {
             on_teleport: parse_uevent(def, v.get("onTeleportPlayer")),
         })),
         "TeleportFinalPit" => Script::TeleportFinalPit,
-        "PlayerActivator" => Script::PlayerActivator { activated: false, only_player: b("onlyActivatePlayer") },
+        "GetPlayerPref" => Script::GetPlayerPref(Box::new(GetPlayerPref {
+            pref: v.get("pref").str().to_string(),
+            value: v.get("valueToCheckFor").i64(),
+            success: parse_calls(def, v.get("onCheckSuccess")),
+            fail: parse_calls(def, v.get("onCheckFail")),
+        })),
+        "PlayerActivator" => Script::PlayerActivator { activated: false, only_player: b("onlyActivatePlayer"), start_timer: b("startTimer") },
         "FinalDoor" => Script::FinalDoor(FinalDoor {
             doors: scripts(def, v.get("doors")),
             door_light: def.node_ref(v.get("doorLight")),
@@ -427,7 +458,7 @@ pub fn parse(def: &SceneDef, idx: usize) -> Script {
             opened: false,
             about_to_open: false,
         }),
-        "FinalDoorOpener" => Script::FinalDoorOpener { opened: false, opening: false, closed: false },
+        "FinalDoorOpener" => Script::FinalDoorOpener { opened: false, opening: false, closed: false, start_timer: b("startTimer") },
         "FinalPit" => Script::FinalPit(Box::new(FinalPit {
             rankless: b("rankless"),
             second_pit: b("secondPit"),
@@ -436,15 +467,28 @@ pub fn parse(def: &SceneDef, idx: usize) -> Script {
             ..Default::default()
         })),
         "HudMessage" => Script::HudMessage(Box::new(HudMessage {
-            message: clean_rich_text(v.get("message").str()),
+            message: v.get("message").str().to_string(),
+            message2: v.get("message2").str().to_string(),
+            action: {
+                let r = v.get("actionReference");
+                (r.pptr().1 != 0).then(|| def.action_ref(idx as u32, r).unwrap_or_default().to_string())
+            },
+            actions: v.get("actionReferences").array().iter().map(|r| def.action_ref(idx as u32, r).map(str::to_string)).collect(),
+            advanced: b("advancedMessage"),
             deactivating: b("deactivating"),
             not_one_time: b("notOneTime"),
             timed: b("timed"),
             timer: f("timerTime"),
             dont_on_trigger: b("dontActivateOnTriggerEnter"),
+            silent: b("silent"),
             deactivate_on_exit: b("deactiveOnTriggerExit"),
-            shown: false,
+            deactive_on_disable: b("deactiveOnDisable"),
+            player_pref: v.get("playerPref").str().to_string(),
+            activated: false,
+            colliderless: false,
+            destroyed: false,
         })),
+        "HudMessageReceiver" => Script::HudMessageReceiver,
         "WeaponPickUp" => Script::WeaponPickUp,
         "OutOfBoundsTargetSetter" => Script::OobTargetSetter { death_zones: scripts(def, v.get("deathZones")) },
         "OnLevelStart" => Script::OnLevelStart { on_start: parse_uevent(def, v.get("onStart")), activated: false },

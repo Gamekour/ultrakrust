@@ -48,6 +48,8 @@ const BOOL_DEFAULTS: &[(&str, bool)] = &[
 pub struct Prefs {
     map: HashMap<String, Value>,
     local: HashMap<String, Value>,
+    /// Preferences/Binds.json (the player's rebinds)
+    pub binds: crate::input::BindMap,
 }
 
 impl Prefs {
@@ -59,7 +61,7 @@ impl Prefs {
                 .and_then(|s| serde_json::from_str::<HashMap<String, Value>>(&s).ok())
                 .unwrap_or_default()
         };
-        Prefs { map: read("Prefs.json"), local: read("LocalPrefs.json") }
+        Prefs { map: read("Prefs.json"), local: read("LocalPrefs.json"), binds: crate::input::BindMap::load(install) }
     }
 
     fn get(&self, key: &str) -> Option<&Value> {
@@ -83,6 +85,11 @@ impl Prefs {
         self.bool(key, BOOL_DEFAULTS.iter().find(|d| d.0 == key).is_some_and(|d| d.1))
     }
 
+    /// PrefsManager.GetInt(key, fallback): the stored value, else the default table, else `fallback`.
+    pub fn int_or(&self, key: &str, fallback: i32) -> i32 {
+        self.get(key).and_then(Value::as_f64).or_else(|| DEFAULTS.iter().find(|d| d.0 == key).map(|d| d.1)).map_or(fallback, |v| v as i32)
+    }
+
     /// PrefsManager.GetFloat(key, fallback): the stored value, else `fallback`.
     pub fn float_or(&self, key: &str, fallback: f32) -> f32 {
         self.get(key).and_then(Value::as_f64).map_or(fallback, |v| v as f32)
@@ -90,6 +97,10 @@ impl Prefs {
 
     /// Overrides a value for this run (never written back).
     pub fn set(&mut self, key: &str, v: f64) {
+        self.map.insert(key.to_string(), Value::from(v));
+    }
+
+    pub fn set_bool(&mut self, key: &str, v: bool) {
         self.map.insert(key.to_string(), Value::from(v));
     }
 }

@@ -63,7 +63,16 @@ pub fn load(
     let mut db = AssetDb::open(&install).map_err(|e| e.to_string())?;
     let path = AssetDb::bundle_dir(&install).join(format!("campaign_scenes_level{level}.bundle"));
     let def = Arc::new(scenedef::load_scene(&mut db, &path).map_err(|e| e.to_string())?);
-    let mut game = Game::new(def.clone());
+    // the player's own Preferences (read-only); UNITY_PREFS=pixelization=4,dithering=0.5 overrides
+    // keys for this run
+    let mut prefs = uk_assets::prefs::Prefs::load(&install);
+    for kv in std::env::var("UNITY_PREFS").unwrap_or_default().split(',').filter(|s| !s.is_empty()) {
+        if let Some((k, v)) = kv.split_once('=').and_then(|(k, v)| Some((k.trim(), v.trim().parse::<f64>().ok()?))) {
+            prefs.set(k, v);
+        }
+    }
+    let save = uk_assets::save::Save::load(&install, prefs.int("selectedSaveSlot"));
+    let mut game = Game::with_prefs(def.clone(), prefs, save);
     // UnderwaterController.Start: defaultColor = overlay.color with a = 0.3
     if let Some(c) = def.scripts.iter().find(|s| s.class == "UnderwaterController").and_then(|s| {
         let nf = db.file(s.file.as_deref().unwrap_or(&def.scene_file)).ok()?;
@@ -74,16 +83,6 @@ pub fn load(
         game.underwater_default = c;
     }
     info!("underwater default color {:?}", game.underwater_default);
-    // the player's own Preferences (read-only); UNITY_PREFS=pixelization=4,dithering=0.5 overrides
-    // keys for this run
-    let mut prefs = uk_assets::prefs::Prefs::load(&install);
-    for kv in std::env::var("UNITY_PREFS").unwrap_or_default().split(',').filter(|s| !s.is_empty()) {
-        if let Some((k, v)) = kv.split_once('=').and_then(|(k, v)| Some((k.trim(), v.trim().parse::<f64>().ok()?))) {
-            prefs.set(k, v);
-        }
-    }
-    game.save = uk_assets::save::Save::load(&install, prefs.int("selectedSaveSlot"));
-    game.prefs = prefs;
     game.set_ui(uk_assets::ui::load_ui_assets(&mut db, &def));
 
     let mut mat_cache: HashMap<MaterialKey, Handle<StandardMaterial>> = HashMap::new();

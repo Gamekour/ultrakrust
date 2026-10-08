@@ -26,7 +26,8 @@ pub const PORTED: &[(&str, Port)] = &[
     ("TeleportPlayer", Port::Full),
     ("TeleportFinalPit", Port::Full),
     ("PlayerActivator", Port::Full),
-    ("OnLevelStart", Port::Partial("hideFogUntilStart / levelNameOnStart not applied")),
+    ("OnLevelStart", Port::Partial("hideFogUntilStart / levelNameOnStart / music not applied")),
+    ("GetPlayerPref", Port::Full),
     ("PowerUpMeter", Port::Partial("juice meter drives VIGNETTE; no meter UI, endEffect")),
     ("DualWieldPickup", Port::Partial("grants DualWield juice; no duplicated weapon, pickup effect, camera shake")),
     ("DisablePowerUp", Port::Full),
@@ -35,7 +36,8 @@ pub const PORTED: &[(&str, Port)] = &[
     ("FinalDoor", Port::Partial("no animation/sound")),
     ("FinalDoorOpener", Port::Full),
     ("FinalPit", Port::Full),
-    ("HudMessage", Port::Partial("text only")),
+    ("HudMessage", Port::Partial("no message sound; legacy InputManager key names print the input name")),
+    ("HudMessageReceiver", Port::Partial("no message sound")),
     ("WeaponPickUp", Port::Partial("revolver only")),
     ("OutOfBoundsTargetSetter", Port::Full),
     ("UltrakillEvent", Port::Full),
@@ -80,6 +82,9 @@ pub const PORTED: &[(&str, Port)] = &[
     ("HudController", Port::Partial("no fist fill (WeaponCharges.punchStamina), no SetAlwaysOnTop material swap, no HideUI cheat")),
     ("HUDPos", Port::Full),
     ("LevelStatsEnabler", Port::Full),
+    ("StyleHUD", Port::Partial("meter visibility only (comboActive || forceMeterOn); no style points, ranks, freshness")),
+    ("RailcannonMeter", Port::Partial("raicharge is 0 until the railcannon is ported")),
+    ("LevelStats", Port::Partial("challenge always NO (ChallengeManager not ported), style 0 (StyleHUD), no cyber grind wave text")),
 ];
 
 pub fn status(class: &str) -> Option<Port> {

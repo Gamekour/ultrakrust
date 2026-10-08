@@ -229,6 +229,10 @@ pub struct SceneDef {
     pub clips: Vec<Arc<Clip>>,
     /// Canvas / CanvasGroup components, in node order (kept apart from `scripts` so script order is unchanged).
     pub ui_natives: Vec<UiNativeDef>,
+    /// The InputActionAsset the scene's InputActionReferences point at (ULTRAKILL's InputActions).
+    pub input_actions: Option<std::sync::Arc<crate::input::InputActions>>,
+    /// InputActionReference PPtrs (script file, file id, path id) -> m_ActionId.
+    pub action_refs: HashMap<(Option<String>, i32, i64), String>,
 }
 
 impl SceneDef {
@@ -239,6 +243,12 @@ impl SceneDef {
             return None;
         }
         self.obj_to_node.get(&id).copied()
+    }
+
+    /// The action id an InputActionReference field of script `sc` points at.
+    pub fn action_ref(&self, sc: u32, v: &Value) -> Option<&str> {
+        let (f, id) = v.pptr();
+        self.action_refs.get(&(self.scripts[sc as usize].file.clone(), f, id)).map(String::as_str)
     }
 
     pub fn script_ref(&self, v: &Value) -> Option<u32> {
@@ -419,6 +429,44 @@ impl Loader<'_> {
 }
 
 /// Loads the complete scene graph of a level bundle.
+/// Resolves the scripts' InputActionReference fields (top-level fields named `action*`, single or
+/// arrays) and reads the InputActionAsset they belong to.
+fn load_action_refs(ld: &mut Loader, def: &mut SceneDef) {
+    for s in &def.scripts {
+        let Value::Struct(fields) = &s.data else { continue };
+        let from = match &s.file {
+            Some(f) => ld.db.file(f).ok(),
+            None => Some(ld.scene.clone()),
+        };
+        let Some(from) = from else { continue };
+        for (k, v) in fields {
+            if !k.to_ascii_lowercase().starts_with("action") {
+                continue;
+            }
+            let ptrs: Vec<&Value> = match v {
+                Value::Array(a) => a.iter().collect(),
+                v => vec![v],
+            };
+            for p in ptrs {
+                let (f, id) = p.pptr();
+                if id == 0 || def.action_refs.contains_key(&(s.file.clone(), f, id)) {
+                    continue;
+                }
+                let Ok(Some((rf, _, rv))) = ld.db.read_pptr(&from, (f, id)) else { continue };
+                if !rv.has("m_ActionId") {
+                    continue;
+                }
+                def.action_refs.insert((s.file.clone(), f, id), rv.get("m_ActionId").str().to_string());
+                if def.input_actions.is_none() {
+                    if let Ok(Some((_, _, a))) = ld.db.read_pptr(&rf, rv.get("m_Asset").pptr()) {
+                        def.input_actions = Some(std::sync::Arc::new(crate::input::InputActions::read(&a)));
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub fn load_scene(db: &mut AssetDb, bundle: &std::path::Path) -> Result<SceneDef> {
     let files = db.load_bundle_files(bundle)?;
     let scene = files
@@ -475,6 +523,7 @@ pub fn load_scene(db: &mut AssetDb, bundle: &std::path::Path) -> Result<SceneDef
     }
     add_objects(&mut ld, &mut def, &raw_go, &raw_tr, None)?;
     spawn_viewmodel(&mut ld, &mut def);
+    load_action_refs(&mut ld, &mut def);
     def.navmeshes = crate::navmesh::load_scene_navmeshes(ld.db, bundle).unwrap_or_default();
     Ok(def)
 }
@@ -521,6 +570,16 @@ fn add_objects(ld: &mut Loader, def: &mut SceneDef, raw_go: &HashMap<i64, Value>
     tr_ids.sort();
     let mut tr_to_node: HashMap<i64, u32> = HashMap::new();
     let mut node_tr: Vec<i64> = Vec::new();
+    // A player build serializes every RectTransform's m_LocalPosition as 0. For one whose parent is not a
+    // RectTransform, Unity's localPosition.xy is its anchoredPosition (z is kept as serialized).
+    let parent_has_rect = parent.is_some_and(|p| def.nodes[p as usize].rect.is_some());
+    let unity_pos = |rt: &RawTr| -> Vec3 {
+        let p = rt.trs.0;
+        match &rt.rect {
+            Some(r) if raw_tr.get(&rt.father).map_or(!parent_has_rect, |f| f.rect.is_none()) => Vec3::new(r.anchored_pos[0], r.anchored_pos[1], p.z),
+            _ => p,
+        }
+    };
     for &t in &tr_ids {
         let rt = &raw_tr[&t];
         let Some(g) = raw_go.get(&rt.go) else { continue };
@@ -532,7 +591,8 @@ fn add_objects(ld: &mut Loader, def: &mut SceneDef, raw_go: &HashMap<i64, Value>
         node_tr.push(t);
         def.obj_to_node.insert(rt.go, idx);
         def.obj_to_node.insert(t, idx);
-        let (p, q, s) = rt.trs;
+        let (_, q, s) = rt.trs;
+        let p = unity_pos(rt);
         def.nodes.push(NodeDef {
             name: g.get("m_Name").str().to_string(),
             parent: None,
@@ -575,7 +635,7 @@ fn add_objects(ld: &mut Loader, def: &mut SceneDef, raw_go: &HashMap<i64, Value>
     while i < order.len() {
         let n = order[i];
         let rt = &raw_tr[&node_tr[n as usize - base]];
-        let local = Mat4::from_scale_rotation_translation(rt.trs.2, rt.trs.1, rt.trs.0);
+        let local = Mat4::from_scale_rotation_translation(rt.trs.2, rt.trs.1, unity_pos(rt));
         unity_world[n as usize] = match def.nodes[n as usize].parent {
             Some(p) => unity_world[p as usize] * local,
             None => local,

@@ -22,7 +22,12 @@ pub enum Act {
     WaveEnd,
     FinalDoorOpenDoors,
     FinalDoorOpenerGoTime,
-    HideMessage,
+    /// HudMessageReceiver.ShowHudMessage
+    ShowHudMessage,
+    /// HudMessage.Done / HudMessageReceiver.Done
+    HudMessageDone,
+    /// HudMessage.Begone
+    HudMessageBegone,
     /// PlayerActivatorRelay.Activate
     HudRelay,
     /// LevelStatsEnabler.LevelStatsTutorial
@@ -34,13 +39,6 @@ pub struct Invoke {
     pub at: f64,
     pub script: u32,
     pub act: Act,
-}
-
-#[derive(Clone, Debug)]
-pub struct Message {
-    pub text: String,
-    pub owner: Option<u32>,
-    pub until: Option<f64>,
 }
 
 /// Something the frontend may want to show or play.
@@ -61,6 +59,25 @@ pub enum GameEvent {
     PunchHit,
     /// AnimationEvent fired by a clip on the Animator at `node`.
     AnimEvent { node: u32, function: String, string: String, float: f32, int: i32 },
+}
+
+/// StatsManager's run state (with OnLevelStart / PlayerTracker's level-start flags).
+#[derive(Clone, Debug, Default)]
+pub struct Stats {
+    /// StatsManager.seconds / timer
+    pub seconds: f32,
+    pub timer: bool,
+    pub timer_on_once: bool,
+    pub level_started: bool,
+    /// PlayerTracker.levelStarted
+    pub tracker_started: bool,
+    /// secretObjects indices found on an earlier run / this run
+    pub prev_secrets: Vec<usize>,
+    pub new_secrets: Vec<usize>,
+    pub challenge_complete: bool,
+    pub major_used: bool,
+    /// StatsManager.stylePoints (StyleHUD is not ported: 0)
+    pub style_points: i64,
 }
 
 #[derive(Clone)]
@@ -105,7 +122,8 @@ pub struct State {
     pub has_revolver: bool,
     pub enemies: Vec<Enemy>,
     pub projectiles: Vec<Projectile>,
-    pub messages: Vec<Message>,
+    /// HudMessageReceiver
+    pub msg: crate::hudmsg::MsgReceiver,
     /// NewMovement.levelOver: a FinalPit was entered. No damage, death or respawn from here on.
     pub level_complete: bool,
     /// StatsManager.SendInfo: the results (FinalRank) are up.
@@ -121,6 +139,8 @@ pub struct State {
     /// The camera's pitch (rotationX), kept in step by the frontend like `player.yaw_deg`.
     pub view_pitch: f32,
     pub kills: u32,
+    /// StatsManager's timer, secrets and level-start flags
+    pub stats: Stats,
     /// StatsManager.restarts: checkpoint restarts (they cost rank).
     pub restarts: u32,
     pub checkpoint_pos: Option<Vec3>,
@@ -258,6 +278,10 @@ pub struct Game {
     pub save: uk_assets::save::Save,
     /// UI actions this frame, set by the frontend before `update`
     pub hud_input: crate::hud::HudInput,
+    /// The HudMessageReceiver script (MonoSingleton)
+    pub(crate) msg_receiver: Option<u32>,
+    /// The scene's InputActionAsset with the player's Binds.json applied
+    pub input_actions: Option<Arc<uk_assets::input::InputActions>>,
 }
 
 struct WaterDef {
@@ -272,8 +296,20 @@ fn layer_solid(l: u8) -> bool {
 }
 
 impl Game {
+    /// A scene with default Preferences and no save data.
     pub fn new(def: Arc<SceneDef>) -> Self {
+        Self::with_prefs(def, Default::default(), Default::default())
+    }
+
+    /// A scene loaded with the player's Preferences and save slot (Awake reads them).
+    pub fn with_prefs(def: Arc<SceneDef>, prefs: uk_assets::prefs::Prefs, save: uk_assets::save::Save) -> Self {
         let n = def.nodes.len();
+        let msg_receiver = def.scripts.iter().position(|s| s.class == "HudMessageReceiver").map(|i| i as u32);
+        let input_actions = def.input_actions.as_ref().map(|a| {
+            let mut a = (**a).clone();
+            a.apply(&prefs.binds);
+            Arc::new(a)
+        });
         let mut scripts_by_node = vec![Vec::new(); n];
         for (i, s) in def.scripts.iter().enumerate() {
             scripts_by_node[s.node as usize].push(i as u32);
@@ -425,7 +461,7 @@ impl Game {
             has_revolver: false,
             enemies,
             projectiles: Vec::new(),
-            messages: Vec::new(),
+            msg: Default::default(),
             level_complete: false,
             results_shown: false,
             reached_second_pit: false,
@@ -434,6 +470,7 @@ impl Game {
             forced_view: None,
             view_pitch: 0.0,
             kills: 0,
+            stats: Stats::default(),
             restarts: 0,
             checkpoint_pos: None,
             checkpoint_yaw: 0.0,
@@ -469,10 +506,12 @@ impl Game {
             death_ui: DeathUi::from_def(&def),
             ui: None,
             ui_assets: None,
-            prefs: Default::default(),
+            prefs,
             colors: crate::hud::ColorBlind { variation: Vec::new(), hud: [crate::hud::WHITE; 10] },
             sway: crate::hud::Sway::from_def(&def),
-            save: Default::default(),
+            save,
+            msg_receiver,
+            input_actions,
             hud_input: Default::default(),
             gun_panel: def.scripts.iter().find(|s| s.class == "GunControl").map_or(Vec::new(), |s| s.data.get("gunPanel").array().iter().filter_map(|p| def.node_ref(p)).collect()),
         };
@@ -612,7 +651,7 @@ impl Game {
         }
     }
 
-    fn set_script_enabled(&mut self, sc: u32, on: bool) {
+    pub(crate) fn set_script_enabled(&mut self, sc: u32, on: bool) {
         let i = sc as usize;
         if self.s.script_enabled[i] == on {
             return;
@@ -711,7 +750,7 @@ impl Game {
         self.s.invokes.push(Invoke { at: self.s.time + delay as f64, script: sc, act });
     }
 
-    fn cancel_invoke(&mut self, sc: u32, act: Act) {
+    pub(crate) fn cancel_invoke(&mut self, sc: u32, act: Act) {
         self.s.invokes.retain(|i| !(i.script == sc && i.act == act));
     }
 
@@ -742,11 +781,29 @@ impl Game {
                             *opening = true;
                         }
                         self.invoke(sc, Act::FinalDoorOpenerGoTime, 1.0);
+                    } else {
+                        self.final_door_go_time(sc);
                     }
                 }
             }
             Script::Hud(_) => self.hud_awake(sc),
+            Script::GetPlayerPref(_) => self.get_player_pref_awake(sc),
             _ => {}
+        }
+    }
+
+    /// GetPlayerPref.Awake
+    fn get_player_pref_awake(&mut self, sc: u32) {
+        let Script::GetPlayerPref(p) = &self.s.scripts[sc as usize] else { return };
+        let ok = match p.pref.as_str() {
+            "DisCha" => self.save.pp_int("DisCha", 0) == p.value,
+            "ShoUseTut" => self.prefs.flag("hideShotgunPopup"),
+            "MainMenuEncorePopUp" => self.prefs.int_or("MainMenuEncorePopUp", 0) as i64 == p.value,
+            other => self.prefs.int_or(&format!("weapon.{other}"), 1) as i64 == p.value,
+        };
+        let calls = if ok { p.success.clone() } else { p.fail.clone() };
+        for c in &calls {
+            self.run_call(c);
         }
     }
 
@@ -787,6 +844,8 @@ impl Game {
                     if let Some(fd) = self.parent_script(node, |s| matches!(s, Script::FinalDoor(_))) {
                         self.final_door_open(fd);
                         self.invoke(sc, Act::FinalDoorOpenerGoTime, 1.0);
+                    } else {
+                        self.final_door_go_time(sc);
                     }
                 }
             }
@@ -795,6 +854,7 @@ impl Game {
                 enemy::on_enable(self, e);
             }
             Script::Hud(_) => self.hud_enable(sc),
+            Script::HudMessage(_) => self.hud_message_enable(sc),
             _ => {}
         }
     }
@@ -825,7 +885,7 @@ impl Game {
                     }
                 }
             }
-            Script::HudMessage(_) => {}
+            Script::HudMessage(_) => self.hud_message_disable(sc),
             _ => {}
         }
     }
@@ -871,6 +931,8 @@ impl Game {
                     }
                 }
                 Script::Hud(_) => self.hud_start(sc),
+                Script::HudMessage(_) => self.hud_message_start(sc),
+                Script::HudMessageReceiver => self.msg_receiver_start(sc),
                 _ => {}
             }
         }
@@ -977,6 +1039,7 @@ impl Game {
                     (Script::Door(_), "Unlock") => self.door_unlock(s),
                     (Script::FinalDoor(_), "Open") => self.final_door_open(s),
                     (Script::FinalDoor(_), "OpenDoors") => self.final_door_open_doors(s),
+                    (Script::FinalDoorOpener { .. }, "GoTime") => self.final_door_go_time(s),
                     (_, "AbruptChangeLevel") => self.abrupt_change_level(&c.string_arg),
                     _ => {
                         self.unknown_calls.insert(format!("{}.{}", self.def.scripts[s as usize].class, m));
@@ -990,10 +1053,11 @@ impl Game {
         }
     }
 
-    /// StatsManager.SendInfo's ranks for `seconds`: (time rank, kills rank, style rank, total) as
-    /// D/C/B/A/S letters (total also P), from the level's StatsManager thresholds. Style points are
-    /// not ported (0), so style is always D.
-    pub fn final_ranks(&self, seconds: f32) -> (char, char, char, char) {
+    /// StatsManager.SendInfo's ranks: (time rank, kills rank, style rank, total) as D/C/B/A/S
+    /// letters (total also P), from the level's StatsManager thresholds. Style points are not
+    /// ported (0), so style is always D.
+    pub fn final_ranks(&self) -> (char, char, char, char) {
+        let seconds = self.s.stats.seconds;
         let sm = self.def.scripts.iter().find(|s| s.class == "StatsManager");
         let ranks = |f: &str| -> Vec<i64> { sm.map(|s| s.data.get(f).array().iter().map(|v| v.i64()).collect()).unwrap_or_default() };
         let mut score = 0i32;
@@ -1043,6 +1107,8 @@ impl Game {
         if !p.fake_end {
             p.send_timer = 5.0;
         }
+        // StatsManager.StopTimer
+        self.s.stats.timer = false;
         // FinalPit.OnTriggerEnter: PowerUpMeter.juice = 0
         self.s.power_juice = 0.0;
         let pl = &mut self.s.player;
@@ -1625,24 +1691,79 @@ impl Game {
             // ActivateObjects: PlayerActivatorRelay.ResetIndex + Activate
             self.relay_reset_activate();
         }
+        if let Script::PlayerActivator { start_timer: true, .. } = self.s.scripts[sc as usize] {
+            self.stats_start_timer();
+        }
     }
 
-    /// OnLevelStart.Update: once the level has started (StatsManager's timer, i.e. the player
-    /// activated), `onStart` brings in the first rooms.
-    fn level_start_update(&mut self) {
-        if !self.s.player.activated {
+    /// FinalDoorOpener.GoTime
+    fn final_door_go_time(&mut self, sc: u32) {
+        let Script::FinalDoorOpener { opened, opening, start_timer, .. } = &mut self.s.scripts[sc as usize] else { return };
+        if *opened {
             return;
         }
-        for sc in 0..self.s.scripts.len() as u32 {
-            let Script::OnLevelStart { activated: false, .. } = self.s.scripts[sc as usize] else { continue };
-            if !self.script_live(sc) {
-                continue;
-            }
-            let Script::OnLevelStart { on_start, activated } = &mut self.s.scripts[sc as usize] else { continue };
-            *activated = true;
-            let ev = on_start.clone();
-            self.run_uevent(&ev, false);
+        *opening = false;
+        *opened = true;
+        let st = *start_timer;
+        self.start_level(st);
+    }
+
+    /// OnLevelStart.StartLevel on the OnLevelStart singleton (the scene's first one).
+    fn start_level(&mut self, start_timer: bool) {
+        let Some(sc) = self.s.scripts.iter().position(|s| matches!(s, Script::OnLevelStart { .. })) else { return };
+        let Script::OnLevelStart { on_start, activated } = &mut self.s.scripts[sc] else { return };
+        if *activated {
+            return;
         }
+        *activated = true;
+        let ev = on_start.clone();
+        self.player_tracker_level_start();
+        self.run_uevent(&ev, false);
+        self.s.stats.level_started = true;
+        if start_timer {
+            self.stats_start_timer();
+        }
+        // DisableOnLevelStart (FindObjectsOfType, inactive included)
+        let off: Vec<u32> = self.def.scripts.iter().filter(|s| s.class == "DisableOnLevelStart").map(|s| s.node).collect();
+        for n in off {
+            self.set_active(n, false);
+        }
+    }
+
+    /// PlayerTracker.LevelStart (not startAsPlatformer)
+    fn player_tracker_level_start(&mut self) {
+        if self.s.stats.tracker_started {
+            return;
+        }
+        self.s.stats.tracker_started = true;
+        self.start_level(true);
+    }
+
+    /// StatsManager.StartTimer (no PreventTimerStart, major assists off)
+    fn stats_start_timer(&mut self) {
+        self.s.stats.timer = true;
+        if self.s.stats.timer_on_once {
+            return;
+        }
+        self.player_tracker_level_start();
+        self.s.stats.timer_on_once = true;
+    }
+
+    /// StatsManager's Awake secret bookkeeping: secrets already found in the save's RankData for
+    /// this level go to prevSecrets.
+    pub(crate) fn stats_awake(&mut self) {
+        let lvl = self.level_number();
+        let Some(rank) = self.save.rank(lvl).filter(|r| r.get("levelNumber").i64() == lvl) else { return };
+        let found = rank.get("secretsFound").array();
+        let n = self.secret_objects().len();
+        self.s.stats.prev_secrets = (0..n).filter(|&i| found.get(i).is_some_and(|v| v.i64() != 0)).collect();
+        self.s.stats.challenge_complete = rank.get("challenge").i64() != 0;
+    }
+
+    /// StatsManager.secretObjects (the serialized Bonus objects)
+    pub fn secret_objects(&self) -> Vec<Option<u32>> {
+        let sm = self.def.scripts.iter().find(|s| s.class == "StatsManager");
+        sm.map(|s| s.data.get("secretObjects").array().iter().map(|p| self.def.node_ref(p)).collect()).unwrap_or_default()
     }
 
     fn final_door_open(&mut self, sc: u32) {
@@ -1774,35 +1895,6 @@ impl Game {
         let fwd = self.def.nodes[node].world0.transform_vector3(Vec3::NEG_Z).normalize_or_zero();
         self.s.player.pos += fwd * 20.0 + Vec3::Y * 20.0;
         self.s.player.prev_pos = self.s.player.pos;
-    }
-
-    /// HudMessageReceiver.SendHudMessage (automatic timer)
-    pub fn send_hud_message(&mut self, text: &str) {
-        self.s.messages.retain(|m| m.owner.is_some());
-        self.s.messages.push(Message { text: text.to_string(), owner: None, until: Some(self.s.time + 5.0) });
-    }
-
-    fn hud_message(&mut self, sc: u32, enter: bool) {
-        let Script::HudMessage(h) = &mut self.s.scripts[sc as usize] else { return };
-        if enter {
-            if h.dont_on_trigger {
-                return;
-            }
-            if h.deactivating {
-                self.s.messages.clear();
-                return;
-            }
-            if h.shown && !h.not_one_time {
-                return;
-            }
-            h.shown = true;
-            let until = if h.timed { Some(self.s.time + h.timer as f64) } else { None };
-            let text = h.message.clone();
-            self.s.messages.retain(|m| m.owner != Some(sc));
-            self.s.messages.push(Message { text, owner: Some(sc), until });
-        } else if h.deactivate_on_exit {
-            self.s.messages.retain(|m| m.owner != Some(sc));
-        }
     }
 
     // ---------------------------------------------------------------- triggers
@@ -1965,7 +2057,7 @@ impl Game {
                 Script::PlayerActivator { .. } if enter => self.player_activator(sc),
                 Script::FinalPit(_) if enter => self.final_pit_enter(sc),
                 Script::OobTargetSetter { .. } if enter => self.oob_target_setter(sc),
-                Script::HudMessage(_) => self.hud_message(sc, enter),
+                Script::HudMessage(_) => self.hud_message_trigger(sc, enter),
                 Script::DualWieldPickup { .. } if enter => self.dual_wield_pickup(sc),
                 _ => {}
             }
@@ -2093,11 +2185,17 @@ impl Game {
         let snap = self.checkpoint.clone().or_else(|| self.start.clone()).expect("start snapshot");
         // StatsManager lives outside the checkpoint: kills carry over, a checkpoint restart counts
         let (kills, restarts) = (self.s.kills, self.s.restarts + self.checkpoint.is_some() as u32);
+        // StatsManager.Restart: back at a checkpoint the stats carry over and the timer runs;
+        // without one the scene reloads
+        let stats = self.checkpoint.is_some().then(|| Stats { timer: true, ..self.s.stats.clone() });
         // PowerUpMeter and the GunControl-parented DualWields live outside the checkpoint too
         let power = (self.s.power_max, self.s.has_power_up, self.s.dual_wields, self.s.vignette);
         self.s = *snap;
         self.s.kills = kills;
         self.s.restarts = restarts;
+        if let Some(st) = stats {
+            self.s.stats = st;
+        }
         (self.s.power_max, self.s.has_power_up, self.s.dual_wields, self.s.vignette) = power;
         // NewMovement.Respawn: PowerUpMeter.juice = 0 (the next meter update ends the power-up)
         self.s.power_juice = 0.0;
@@ -2131,8 +2229,10 @@ impl Game {
         self.ui = Some(Arc::new(def));
         self.ui_assets = Some(Arc::new(assets));
         self.colors = crate::hud::ColorBlind::build(&self.def, &self.prefs);
+        self.stats_awake();
         // the HUD scripts ran Awake/OnEnable/Start before the UI existed
         self.hud_replay();
+        self.msg_sync_ui();
         self.flush_events();
         if self.start.is_some() {
             self.start = Some(Box::new(self.s.clone()));
@@ -2229,6 +2329,10 @@ impl Game {
     /// Unity Update (once per rendered frame).
     pub fn update(&mut self, input: &Input, dt: f32, now: f64) {
         self.s.time += dt as f64;
+        // StatsManager.Update (GameStateManager.TimerModifier is 1: no WeaponWheel)
+        if self.s.stats.timer {
+            self.s.stats.seconds += dt;
+        }
         // NewMovement.Update fades the hurt flash, dead or alive
         if self.s.hurt_alpha > 0.0 {
             self.s.hurt_alpha -= dt;
@@ -2245,7 +2349,6 @@ impl Game {
             return;
         }
         self.run_starts();
-        self.level_start_update();
         // GunControl: the revolver viewmodel is out once picked up
         if let Some(r) = self.vm_revolver {
             if self.s.active_self[r as usize] != self.s.has_revolver {
@@ -2271,13 +2374,16 @@ impl Game {
                 Act::WaveSpawn => self.wave_spawn(inv.script),
                 Act::WaveEnd => self.wave_end(inv.script),
                 Act::FinalDoorOpenDoors => self.final_door_open_doors(inv.script),
-                Act::FinalDoorOpenerGoTime => {
-                    if let Script::FinalDoorOpener { opened, opening, .. } = &mut self.s.scripts[inv.script as usize] {
-                        *opening = false;
-                        *opened = true;
+                Act::FinalDoorOpenerGoTime => self.final_door_go_time(inv.script),
+                Act::ShowHudMessage => self.show_hud_message(inv.script),
+                Act::HudMessageDone => {
+                    if matches!(self.s.scripts[inv.script as usize], Script::HudMessage(_)) {
+                        self.hud_message_done(inv.script)
+                    } else {
+                        self.msg_done()
                     }
                 }
-                Act::HideMessage => {}
+                Act::HudMessageBegone => self.hud_message_begone(inv.script),
                 Act::HudRelay => self.relay_activate(inv.script),
                 Act::LevelStatsTutorial => self.level_stats_tutorial(),
             }
@@ -2305,10 +2411,14 @@ impl Game {
                         }
                     }
                 }
+                Script::HudMessage(_) => self.hud_message_update(sc),
                 _ => {}
             }
         }
-        self.s.messages.retain(|m| m.until.is_none_or(|u| u > t));
+        // the receiver's ShowText coroutine (stops with its GameObject)
+        if self.msg_receiver.is_some_and(|r| self.s.active[self.def.scripts[r as usize].node as usize]) {
+            self.msg_update();
+        }
         self.sync_world();
         let world = std::mem::take(&mut self.world);
         self.s.player.update(&world, input, dt, now);

@@ -27,7 +27,7 @@ fn find(g: &Game, end: &str) -> Option<u32> {
 
 fn report(g: &Game, t: f64) {
     let ui = g.ui.as_ref().unwrap();
-    let mut line = format!("t={t:.3} hp={} boost={:.2}", g.s.hp, g.s.player.boost_charge);
+    let mut line = format!("t={t:.3} hp={} boost={:.2} secs={:.3} timer={}", g.s.hp, g.s.player.boost_charge, g.s.stats.seconds, g.s.stats.timer);
     for (sc, s) in g.s.scripts.iter().enumerate() {
         let Script::Hud(h) = s else { continue };
         let node = g.def.scripts[sc].node;
@@ -62,15 +62,14 @@ fn main() {
     let install = uk_assets::find_install().expect("install");
     let mut db = AssetDb::open(&install).unwrap();
     let def = Arc::new(scenedef::load_scene(&mut db, &AssetDb::bundle_dir(&install).join(format!("campaign_scenes_{level}.bundle"))).unwrap());
-    let mut g = Game::new(def.clone());
     let mut prefs = uk_assets::prefs::Prefs::load(&install);
     for kv in a.get(2).map(String::as_str).unwrap_or("").split(',').filter(|s| !s.is_empty()) {
         if let Some((k, v)) = kv.split_once('=') {
             prefs.set(k, v.parse::<f64>().unwrap());
         }
     }
-    g.save = uk_assets::save::Save::load(&install, prefs.int("selectedSaveSlot"));
-    g.prefs = prefs;
+    let save = uk_assets::save::Save::load(&install, prefs.int("selectedSaveSlot"));
+    let mut g = Game::with_prefs(def.clone(), prefs, save);
     g.set_ui(ui::load_ui_assets(&mut db, &def));
     let assets = g.ui_assets.clone().unwrap();
     println!("colors hud {:?}", g.colors.hud);
@@ -87,8 +86,18 @@ fn main() {
     let mut t = 0.0;
     let mut was = false;
     let mut since: Option<f64> = None;
+    for s in &g.s.scripts {
+        if let Script::OnLevelStart { on_start, .. } = s {
+            println!("OnLevelStart activates {:?} calls {:?}", on_start.to_activate.iter().map(|&n| (g.def.path(n), g.active(n))).collect::<Vec<_>>(), on_start.on_activate.iter().map(|c| (format!("{:?}", c.target), c.method.clone())).collect::<Vec<_>>());
+        }
+    }
+    let mut started = false;
     for _ in 0..5000 {
         step(&mut g, 1, &mut t);
+        if g.s.stats.level_started && !started {
+            started = true;
+            println!("level started at t={t:.3}: timer={} prev_secrets={:?}", g.s.stats.timer, g.s.stats.prev_secrets);
+        }
         if g.s.player.activated && !was {
             was = true;
             since = Some(t);
@@ -130,6 +139,23 @@ fn main() {
     tab(&mut g, &mut t, false, true, "tab up");
     tab(&mut g, &mut t, true, false, "tab down again (double tap)");
     tab(&mut g, &mut t, false, true, "tab up (kept open)");
+    step(&mut g, 50, &mut t);
+    {
+        let ui = g.ui.as_ref().unwrap();
+        for (sc, s) in g.s.scripts.iter().enumerate() {
+            let Script::Hud(h) = s else { continue };
+            let HudScript::LevelStats(l) = &**h else { continue };
+            let txt = |r: Option<u32>| r.and_then(|r| ui.script_graphic.get(&r)).map(|&gi| g.s.ui.text[gi as usize].clone());
+            println!("LevelStats {} live={} ready={} name={:?} time={:?} timeRank={:?} kills={:?} killsRank={:?} style={:?} styleRank={:?} challenge={:?} major={:?}", g.def.path(g.def.scripts[sc].node), g.active(g.def.scripts[sc].node), l.ready, txt(l.level_name), txt(l.time), txt(l.time_rank), txt(l.kills), txt(l.kills_rank), txt(l.style), txt(l.style_rank), txt(l.challenge), txt(l.major_assists));
+            let sp: Vec<_> = l.secrets.iter().map(|r| r.and_then(|r| ui.script_graphic.get(&r)).map(|&gi| (g.s.ui.sprite[gi as usize], g.active(g.def.scripts[r.unwrap() as usize].node)))).collect();
+            println!("  secrets (sprite, active) {sp:?} filled={:?} prev={:?} secs={:.3}", assets.sprite(sc as u32, "filledSecret"), g.s.stats.prev_secrets, g.s.stats.seconds);
+        }
+        let f = ugui::build_frame(&UiInput { def: &g.def, ui, assets: &assets, state: &g.s.ui, active: &g.s.active, script_enabled: &g.s.script_enabled, screen: [1920.0, 1080.0], dpi: 96.0, world_of: Some(&|n| g.node_world(n)) });
+        for d in f.batches.iter().flat_map(|b| &b.draws).filter(|d| def.path(d.node).contains("Level Stats (1)")) {
+            let (mn, mx) = d.verts.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(a, b), v| (a.min(v.pos), b.max(v.pos)));
+            println!("  draw {} v{} [{:.1},{:.1}]-[{:.1},{:.1}]", def.path(d.node).rsplit_once("Level Stats (1)/").map_or("", |x| x.1), d.verts.len(), mn.x, mn.y, mx.x, mx.y);
+        }
+    }
     tab(&mut g, &mut t, true, false, "tab down (close)");
     tab(&mut g, &mut t, false, true, "tab up");
     // uGUI draws of the HUD
@@ -186,6 +212,17 @@ fn main() {
         g.s.player.prev_pos = g.s.player.pos;
         step(&mut g, 30, &mut t);
         println!("revolver={} gunpanel: {}", g.s.has_revolver, ["GunPanel"].iter().filter_map(|n| find(&g, &format!("GunCanvas/{n}"))).map(|n| g.active(n)).map(|a| a.to_string()).collect::<Vec<_>>().join(","));
+        // 0-1's level start: the title (TitleActivator / Title Sound) activates the Gun Room trigger's FinalDoorOpener
+        let t0 = t;
+        for _ in 0..1500 {
+            step(&mut g, 1, &mut t);
+            if g.s.stats.level_started {
+                break;
+            }
+        }
+        println!("level started {:.3}s after the pickup: timer={} secs={:.3}", t - t0, g.s.stats.timer, g.s.stats.seconds);
+        step(&mut g, 100, &mut t);
+        println!("secs after 100 more frames: {:.4}", g.s.stats.seconds);
     }
     // sway with velocity
     g.s.player.vel = Vec3::new(0.0, 0.0, 30.0);

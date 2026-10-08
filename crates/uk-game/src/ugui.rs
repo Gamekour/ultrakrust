@@ -106,6 +106,67 @@ pub struct GraphicDef {
     pub maskable: bool,
 }
 
+/// uGUI auto layout components (ILayoutElement / ILayoutGroup / ILayoutController)
+#[derive(Clone, Debug)]
+pub enum LayoutComp {
+    Group(LayoutGroupDef),
+    /// ContentSizeFitter: FitMode per axis (0 Unconstrained, 1 MinSize, 2 PreferredSize)
+    SizeFitter([i64; 2]),
+    /// AspectRatioFitter: 0 None, 1 WidthControlsHeight, 2 HeightControlsWidth, 3 FitInParent, 4 EnvelopeParent
+    AspectFitter { mode: i64, ratio: f32 },
+    Element { ignore: bool, min: [f32; 2], pref: [f32; 2], flex: [f32; 2], priority: i32 },
+    /// ILayoutElement (all -1, priority -1), ILayoutGroup, ILayoutController
+    ScrollRect,
+    /// InputField / TMP_InputField: ILayoutElement (preferred size from the text component)
+    InputField { priority: i32 },
+}
+
+#[derive(Clone, Debug)]
+pub enum LayoutKind {
+    Horizontal,
+    Vertical,
+    Grid { corner: i64, axis: i64, cell: [f32; 2], spacing: [f32; 2], constraint: i64, count: i64 },
+}
+
+#[derive(Clone, Debug)]
+pub struct LayoutGroupDef {
+    pub kind: LayoutKind,
+    /// RectOffset (left, right, top, bottom)
+    pub padding: [f32; 4],
+    /// TextAnchor
+    pub align: i64,
+    pub spacing: f32,
+    pub expand: [bool; 2],
+    pub control: [bool; 2],
+    pub scale: [bool; 2],
+    pub reverse: bool,
+}
+
+impl LayoutGroupDef {
+    fn pad(&self, axis: usize) -> f32 {
+        if axis == 0 {
+            self.padding[0] + self.padding[1]
+        } else {
+            self.padding[2] + self.padding[3]
+        }
+    }
+    fn pad_start(&self, axis: usize) -> f32 {
+        if axis == 0 {
+            self.padding[0]
+        } else {
+            self.padding[2]
+        }
+    }
+    /// GetAlignmentOnAxis
+    fn alignment(&self, axis: usize) -> f32 {
+        if axis == 0 {
+            (self.align % 3) as f32 * 0.5
+        } else {
+            (self.align / 3) as f32 * 0.5
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct MaskDef {
     pub script: u32,
@@ -231,6 +292,8 @@ pub struct UiDef {
     pub selectables: Vec<SelectableDef>,
     pub sliders: Vec<SliderDef>,
     pub script_slider: HashMap<u32, u32>,
+    /// script -> auto layout component
+    pub layout: HashMap<u32, LayoutComp>,
     pub node_canvas: HashMap<u32, u32>,
     pub node_group: HashMap<u32, u32>,
     pub node_scaler: HashMap<u32, u32>,
@@ -380,6 +443,67 @@ impl UiDef {
                     }))
                 }
                 "Text" => Some(graphic(GraphicKind::Text)),
+                "HorizontalLayoutGroup" | "VerticalLayoutGroup" | "GridLayoutGroup" => {
+                    let p = d.get("m_Padding");
+                    let b = |f: &str| d.get(f).bool();
+                    let kind = match s.class.as_str() {
+                        "HorizontalLayoutGroup" => LayoutKind::Horizontal,
+                        "VerticalLayoutGroup" => LayoutKind::Vertical,
+                        _ => LayoutKind::Grid {
+                            corner: d.get("m_StartCorner").i64(),
+                            axis: d.get("m_StartAxis").i64(),
+                            cell: vec2(d.get("m_CellSize")),
+                            spacing: vec2(d.get("m_Spacing")),
+                            constraint: d.get("m_Constraint").i64(),
+                            count: d.get("m_ConstraintCount").i64(),
+                        },
+                    };
+                    let grid = matches!(kind, LayoutKind::Grid { .. });
+                    ui.layout.insert(
+                        si,
+                        LayoutComp::Group(LayoutGroupDef {
+                            kind,
+                            padding: ["m_Left", "m_Right", "m_Top", "m_Bottom"].map(|f| p.get(f).i64() as f32),
+                            align: d.get("m_ChildAlignment").i64(),
+                            spacing: if grid { 0.0 } else { d.get("m_Spacing").f32() },
+                            expand: [!grid && b("m_ChildForceExpandWidth"), !grid && b("m_ChildForceExpandHeight")],
+                            control: [!grid && b("m_ChildControlWidth"), !grid && b("m_ChildControlHeight")],
+                            scale: [!grid && b("m_ChildScaleWidth"), !grid && b("m_ChildScaleHeight")],
+                            reverse: !grid && b("m_ReverseArrangement"),
+                        }),
+                    );
+                    None
+                }
+                "ContentSizeFitter" => {
+                    ui.layout.insert(si, LayoutComp::SizeFitter([d.get("m_HorizontalFit").i64(), d.get("m_VerticalFit").i64()]));
+                    None
+                }
+                "AspectRatioFitter" => {
+                    ui.layout.insert(si, LayoutComp::AspectFitter { mode: d.get("m_AspectMode").i64(), ratio: d.get("m_AspectRatio").f32() });
+                    None
+                }
+                "LayoutElement" => {
+                    let f = |k: &str| d.get(k).f32();
+                    ui.layout.insert(
+                        si,
+                        LayoutComp::Element {
+                            ignore: d.get("m_IgnoreLayout").bool(),
+                            min: [f("m_MinWidth"), f("m_MinHeight")],
+                            pref: [f("m_PreferredWidth"), f("m_PreferredHeight")],
+                            flex: [f("m_FlexibleWidth"), f("m_FlexibleHeight")],
+                            priority: d.get("m_LayoutPriority").i64() as i32,
+                        },
+                    );
+                    None
+                }
+                "ScrollRect" => {
+                    ui.layout.insert(si, LayoutComp::ScrollRect);
+                    None
+                }
+                "InputField" | "TMP_InputField" => {
+                    ui.layout.insert(si, LayoutComp::InputField { priority: if s.class == "TMP_InputField" { 1 } else { 0 } });
+                    None
+                }
                 "TextMeshProUGUI" => {
                     let td = TmpDef::from_script(d, assets, si, &mut ui.warnings, &def.path(s.node));
                     let mut g = graphic(GraphicKind::Tmp(Box::new(td.clone())));
@@ -677,6 +801,8 @@ pub struct UiFrame {
     pub node_rects: HashMap<u32, Rect>,
     /// node -> local-to-root matrix (Unity space)
     pub node_to_root: HashMap<u32, Mat4>,
+    /// layout inputs this port does not compute (node, what): read as 0
+    pub layout_unported: Vec<(u32, &'static str)>,
 }
 
 pub struct UiInput<'a> {
@@ -1246,6 +1372,14 @@ struct Layout<'a> {
     driven_fill: HashMap<u32, f32>,
     /// CanvasRenderer colour set by enabled Selectables' instant colour tint
     tint: HashMap<u32, [f32; 4]>,
+    /// RectTransform values written by layout controllers this frame
+    driven: HashMap<u32, RectDef>,
+    /// root canvas node -> rect size
+    root_size: HashMap<u32, Vec2>,
+    /// layout group script -> (rectChildren, [axis][min, preferred, flexible])
+    group_calc: HashMap<u32, (Vec<u32>, [[f32; 3]; 2])>,
+    /// the current root's Canvas.referencePixelsPerUnit
+    layout_ref_ppu: f32,
 }
 
 /// RectTransform world corners (0: bottom-left, 1: top-left, 2: top-right, 3: bottom-right) in root space
@@ -1521,7 +1655,7 @@ impl<'a> Layout<'a> {
     }
 
     fn rect_def(&self, n: u32) -> Option<RectDef> {
-        let r = self.inp.state.rects.get(&n).copied().or(self.inp.def.nodes[n as usize].rect);
+        let r = self.driven.get(&n).or_else(|| self.inp.state.rects.get(&n)).copied().or(self.inp.def.nodes[n as usize].rect);
         match (r, self.driven_anchors.get(&n)) {
             (Some(mut r), Some(&(amin, amax))) => {
                 r.anchor_min = amin;
@@ -1657,6 +1791,10 @@ impl<'a> Layout<'a> {
                 Mat4::from_translation(Vec3::new(pivot.x * w, pivot.y * h, 0.0)) * Mat4::from_scale(Vec3::new(scale, scale, scale)),
             )
         };
+        // LayoutRebuilder (CanvasUpdate.Layout), before the graphics rebuild
+        self.root_size.insert(r, Vec2::new(root_rect.w, root_rect.h));
+        self.layout_ref_ppu = ref_ppu;
+        self.layout_walk(r);
         let rc = RootCtx { root: ci, mode: cd.mode, scale, ref_ppu, pixel_perfect: cd.pixel_perfect, to_screen };
         let bi = self.new_batch(ci, &rc, root_rect);
         self.frame.node_rects.insert(r, root_rect);
@@ -2000,13 +2138,555 @@ impl<'a> Layout<'a> {
     }
 }
 
+/// Mathf.Clamp (min wins when max < min)
+fn mathf_clamp(v: f32, min: f32, max: f32) -> f32 {
+    if v < min {
+        min
+    } else if v > max {
+        max
+    } else {
+        v
+    }
+}
+
+/// uGUI auto layout: LayoutRebuilder, LayoutUtility, LayoutGroup, ContentSizeFitter, AspectRatioFitter.
+/// Unity mutates the RectTransforms when a layout root is dirty; the steady state is recomputed here
+/// every frame from the current (script-set) values, parents before children (the rebuild queue is
+/// sorted by depth).
+impl Layout<'_> {
+    /// Behaviour.isActiveAndEnabled
+    fn comp_on(&self, s: u32) -> bool {
+        self.node_active(self.inp.def.scripts[s as usize].node) && self.script_on(true, s)
+    }
+
+    fn node_scripts(&self, n: u32) -> Vec<u32> {
+        self.scripts_by_node.get(&n).cloned().unwrap_or_default()
+    }
+
+    fn is_group(&self, s: u32) -> bool {
+        matches!(self.inp.ui.layout.get(&s), Some(LayoutComp::Group(_) | LayoutComp::ScrollRect))
+    }
+
+    fn is_controller(&self, s: u32) -> bool {
+        matches!(self.inp.ui.layout.get(&s), Some(LayoutComp::Group(_) | LayoutComp::ScrollRect | LayoutComp::SizeFitter(_) | LayoutComp::AspectFitter { .. }))
+    }
+
+    fn is_element(&self, s: u32) -> bool {
+        let ui = self.inp.ui;
+        match ui.layout.get(&s) {
+            Some(LayoutComp::Group(_) | LayoutComp::ScrollRect | LayoutComp::Element { .. } | LayoutComp::InputField { .. }) => true,
+            Some(_) => false,
+            None => ui.script_graphic.get(&s).is_some_and(|&g| !matches!(ui.graphics[g as usize].kind, GraphicKind::RawImage { .. })),
+        }
+    }
+
+    /// an enabled ILayoutGroup on the node
+    fn has_active_group(&self, n: u32) -> bool {
+        self.node_scripts(n).into_iter().any(|s| self.is_group(s) && self.comp_on(s))
+    }
+
+    fn rect_size(&self, n: u32) -> Vec2 {
+        if let Some(&s) = self.root_size.get(&n) {
+            return s;
+        }
+        let Some(rd) = self.rect_def(n) else { return Vec2::ZERO };
+        let ps = self.inp.def.nodes[n as usize].parent.map_or(Vec2::ZERO, |p| self.rect_size(p));
+        ps * (Vec2::from_array(rd.anchor_max) - Vec2::from_array(rd.anchor_min)) + Vec2::from_array(rd.size_delta)
+    }
+
+    fn write_rect(&mut self, n: u32, f: impl FnOnce(&mut RectDef)) {
+        if let Some(mut r) = self.rect_def(n) {
+            f(&mut r);
+            self.driven.insert(n, r);
+        }
+    }
+
+    /// RectTransform.SetSizeWithCurrentAnchors
+    fn set_size_with_current_anchors(&mut self, n: u32, axis: usize, size: f32) {
+        let ps = self.inp.def.nodes[n as usize].parent.map_or(Vec2::ZERO, |p| self.rect_size(p));
+        self.write_rect(n, |r| r.size_delta[axis] = size - ps[axis] * (r.anchor_max[axis] - r.anchor_min[axis]));
+    }
+
+    /// Image.preferredWidth / preferredHeight
+    fn image_preferred(&self, g: u32, axis: usize) -> f32 {
+        let GraphicKind::Image(im) = &self.inp.ui.graphics[g as usize].kind else { return 0.0 };
+        let Some(sp) = self.inp.state.sprite[g as usize].and_then(|s| self.inp.assets.sprites.get(s as usize)) else { return 0.0 };
+        let ppu = sp.pixels_per_unit / self.layout_ref_ppu * im.ppu_multiplier;
+        let size = if im.ty == 1 || im.ty == 2 {
+            // DataUtility.GetMinSize: border (left + right, bottom + top)
+            if axis == 0 {
+                sp.border[0] + sp.border[2]
+            } else {
+                sp.border[1] + sp.border[3]
+            }
+        } else {
+            sp.rect[2 + axis]
+        };
+        size / ppu
+    }
+
+    /// LayoutUtility.GetLayoutProperty; which: 0 min, 1 preferred, 2 flexible
+    fn layout_property(&mut self, n: u32, axis: usize, which: usize) -> f32 {
+        let ui = self.inp.ui;
+        let mut num = 0.0f32;
+        let mut prio_best = i32::MIN;
+        for s in self.node_scripts(n) {
+            if !self.is_element(s) || !self.comp_on(s) {
+                continue;
+            }
+            let (prio, v) = match ui.layout.get(&s) {
+                Some(LayoutComp::Group(_)) => (0, self.group_calc.get(&s).map_or(0.0, |c| c.1[axis][which])),
+                Some(LayoutComp::ScrollRect) => (-1, -1.0),
+                Some(LayoutComp::Element { min, pref, flex, priority, .. }) => (*priority, [min, pref, flex][which][axis]),
+                Some(LayoutComp::InputField { priority }) => {
+                    if which == 1 {
+                        self.frame.layout_unported.push((n, "InputField preferred size"));
+                    }
+                    (*priority, [0.0, 0.0, -1.0][which])
+                }
+                _ => {
+                    let g = ui.script_graphic[&s];
+                    let pref = match &ui.graphics[g as usize].kind {
+                        GraphicKind::Image(_) if which == 1 => self.image_preferred(g, axis),
+                        GraphicKind::Tmp(_) if which == 1 => {
+                            self.frame.layout_unported.push((n, "TextMeshProUGUI preferred size"));
+                            0.0
+                        }
+                        GraphicKind::Text if which == 1 => {
+                            self.frame.layout_unported.push((n, "Text preferred size"));
+                            0.0
+                        }
+                        _ => 0.0,
+                    };
+                    (0, [0.0, pref, -1.0][which])
+                }
+            };
+            if prio < prio_best || v < 0.0 {
+                continue;
+            }
+            if prio > prio_best {
+                num = v;
+                prio_best = prio;
+            } else if v > num {
+                num = v;
+            }
+        }
+        num
+    }
+
+    fn min_size(&mut self, n: u32, axis: usize) -> f32 {
+        self.layout_property(n, axis, 0)
+    }
+
+    fn preferred_size(&mut self, n: u32, axis: usize) -> f32 {
+        self.layout_property(n, axis, 0).max(self.layout_property(n, axis, 1))
+    }
+
+    fn flexible_size(&mut self, n: u32, axis: usize) -> f32 {
+        self.layout_property(n, axis, 2)
+    }
+
+    /// AspectRatioFitter.UpdateRect (OnEnable / OnRectTransformDimensionsChange), then the layout
+    /// roots (LayoutRebuilder.MarkLayoutForRebuild climbs while the parent has an enabled group)
+    fn layout_walk(&mut self, n: u32) {
+        if !self.node_active(n) {
+            return;
+        }
+        let def = self.inp.def;
+        for s in self.node_scripts(n) {
+            if let Some(&LayoutComp::AspectFitter { mode, ratio }) = self.inp.ui.layout.get(&s) {
+                if self.comp_on(s) {
+                    self.aspect_fit(n, mode, ratio);
+                }
+            }
+        }
+        let has_ctrl = self.node_scripts(n).into_iter().any(|s| self.is_controller(s) && self.comp_on(s));
+        if has_ctrl && !def.nodes[n as usize].parent.is_some_and(|p| self.has_active_group(p)) {
+            self.calc(n, 0);
+            self.control(n, 0);
+            self.calc(n, 1);
+            self.control(n, 1);
+        }
+        for c in def.nodes[n as usize].children.clone() {
+            self.layout_walk(c);
+        }
+    }
+
+    fn aspect_fit(&mut self, n: u32, mode: i64, ratio: f32) {
+        let def = self.inp.def;
+        // Start: IsComponentValidOnObject (not on a screen-space root canvas)
+        if let Some(&c) = self.inp.ui.node_canvas.get(&n) {
+            let cd = &self.inp.ui.canvases[c as usize];
+            if cd.parent.is_none() && cd.mode != RenderMode::World {
+                return;
+            }
+        }
+        let size = self.rect_size(n);
+        match mode {
+            2 => self.set_size_with_current_anchors(n, 0, size.y * ratio),
+            1 => self.set_size_with_current_anchors(n, 1, size.x / ratio),
+            3 | 4 => {
+                // IsAspectModeValid: a parent
+                let Some(p) = def.nodes[n as usize].parent else { return };
+                let ps = self.rect_size(p);
+                let mut sd = Vec2::ZERO;
+                // anchors (0,0)-(1,1): GetSizeDeltaToProduceSize(size, axis) = size - parent size
+                if (ps.y * ratio < ps.x) ^ (mode == 3) {
+                    sd.y = ps.x / ratio - ps.y;
+                } else {
+                    sd.x = ps.y * ratio - ps.x;
+                }
+                self.write_rect(n, |r| {
+                    r.anchor_min = [0.0; 2];
+                    r.anchor_max = [1.0; 2];
+                    r.anchored_pos = [0.0; 2];
+                    r.size_delta = sd.to_array();
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// LayoutRebuilder.PerformLayoutCalculation (children first)
+    fn calc(&mut self, n: u32, axis: usize) {
+        let scripts = self.node_scripts(n);
+        let elems: Vec<u32> = scripts.iter().copied().filter(|&s| self.is_element(s) && self.comp_on(s)).collect();
+        // TryGetComponent(ILayoutGroup) does not check enabled
+        if elems.is_empty() && !scripts.iter().any(|&s| self.is_group(s)) {
+            return;
+        }
+        for c in self.inp.def.nodes[n as usize].children.clone() {
+            if self.inp.def.nodes[c as usize].rect.is_some() {
+                self.calc(c, axis);
+            }
+        }
+        for s in elems {
+            if let Some(LayoutComp::Group(g)) = self.inp.ui.layout.get(&s) {
+                self.group_calc_axis(s, n, g, axis);
+            }
+        }
+    }
+
+    /// LayoutGroup.CalculateLayoutInputHorizontal's rectChildren
+    fn rect_children(&self, n: u32) -> Vec<u32> {
+        let def = self.inp.def;
+        def.nodes[n as usize]
+            .children
+            .iter()
+            .copied()
+            .filter(|&c| def.nodes[c as usize].rect.is_some() && self.node_active(c))
+            .filter(|&c| {
+                // ILayoutIgnorer (LayoutElement, enabled or not)
+                let ign: Vec<bool> = self
+                    .node_scripts(c)
+                    .into_iter()
+                    .filter_map(|s| match self.inp.ui.layout.get(&s) {
+                        Some(LayoutComp::Element { ignore, .. }) => Some(*ignore),
+                        _ => None,
+                    })
+                    .collect();
+                ign.is_empty() || ign.iter().any(|i| !i)
+            })
+            .collect()
+    }
+
+    fn child_scale(&self, c: u32, axis: usize) -> f32 {
+        self.local_trs(c).1[axis]
+    }
+
+    /// HorizontalOrVerticalLayoutGroup.GetChildSizes
+    fn child_sizes(&mut self, c: u32, axis: usize, control: bool, expand: bool) -> (f32, f32, f32) {
+        let (min, pref, mut flex) = if !control {
+            let s = self.rect_def(c).map_or(0.0, |r| r.size_delta[axis]);
+            (s, s, 0.0)
+        } else {
+            (self.min_size(c, axis), self.preferred_size(c, axis), self.flexible_size(c, axis))
+        };
+        if expand {
+            flex = flex.max(1.0);
+        }
+        (min, pref, flex)
+    }
+
+    fn group_calc_axis(&mut self, s: u32, n: u32, g: &LayoutGroupDef, axis: usize) {
+        if axis == 0 {
+            let ch = self.rect_children(n);
+            self.group_calc.insert(s, (ch, [[0.0; 3]; 2]));
+        }
+        let children = self.group_calc.get(&s).map(|c| c.0.clone()).unwrap_or_default();
+        let count = children.len();
+        let totals = match &g.kind {
+            LayoutKind::Grid { cell, spacing, constraint, count: cc, .. } => {
+                if axis == 0 {
+                    let (a, b) = match constraint {
+                        1 => (*cc as f32, *cc as f32),
+                        2 => {
+                            let v = (count as f32 / *cc as f32 - 0.001).ceil();
+                            (v, v)
+                        }
+                        _ => (1.0, (count as f32).sqrt().ceil()),
+                    };
+                    [g.pad(0) + (cell[0] + spacing[0]) * a - spacing[0], g.pad(0) + (cell[0] + spacing[0]) * b - spacing[0], -1.0]
+                } else {
+                    let rows = match constraint {
+                        1 => (count as f32 / *cc as f32 - 0.001).ceil(),
+                        2 => *cc as f32,
+                        _ => {
+                            let width = self.rect_size(n).x;
+                            let cols = (((width - g.pad(0) + spacing[0] + 0.001) / (cell[0] + spacing[0])).floor() as i32).max(1);
+                            (count as f32 / cols as f32).ceil()
+                        }
+                    };
+                    let v = g.pad(1) + (cell[1] + spacing[1]) * rows - spacing[1];
+                    [v, v, -1.0]
+                }
+            }
+            kind => {
+                // CalcAlongAxis
+                let vertical = matches!(kind, LayoutKind::Vertical);
+                let pad = g.pad(axis);
+                let (mut tmin, mut tpref, mut tflex) = (pad, pad, 0.0f32);
+                let along_other = vertical ^ (axis == 1);
+                for &c in &children {
+                    let (mut min, mut pref, mut flex) = self.child_sizes(c, axis, g.control[axis], g.expand[axis]);
+                    if g.scale[axis] {
+                        let sc = self.child_scale(c, axis);
+                        min *= sc;
+                        pref *= sc;
+                        flex *= sc;
+                    }
+                    if along_other {
+                        tmin = tmin.max(min + pad);
+                        tpref = tpref.max(pref + pad);
+                        tflex = tflex.max(flex);
+                    } else {
+                        tmin += min + g.spacing;
+                        tpref += pref + g.spacing;
+                        tflex += flex;
+                    }
+                }
+                if !along_other && count > 0 {
+                    tmin -= g.spacing;
+                    tpref -= g.spacing;
+                }
+                [tmin, tpref.max(tmin), tflex]
+            }
+        };
+        if let Some(c) = self.group_calc.get_mut(&s) {
+            c.1[axis] = totals;
+        }
+    }
+
+    /// LayoutRebuilder.PerformLayoutControl (self controllers first, then the node's children)
+    fn control(&mut self, n: u32, axis: usize) {
+        let ctrls: Vec<u32> = self.node_scripts(n).into_iter().filter(|&s| self.is_controller(s) && self.comp_on(s)).collect();
+        if ctrls.is_empty() {
+            return;
+        }
+        let ui = self.inp.ui;
+        for &s in &ctrls {
+            if let Some(LayoutComp::SizeFitter(fit)) = ui.layout.get(&s) {
+                // HandleSelfFittingAlongAxis
+                match fit[axis] {
+                    1 => {
+                        let v = self.min_size(n, axis);
+                        self.set_size_with_current_anchors(n, axis, v);
+                    }
+                    2 => {
+                        let v = self.preferred_size(n, axis);
+                        self.set_size_with_current_anchors(n, axis, v);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for &s in &ctrls {
+            match ui.layout.get(&s) {
+                Some(LayoutComp::Group(g)) => self.group_set_axis(s, n, g, axis),
+                Some(LayoutComp::ScrollRect) => self.frame.layout_unported.push((n, "ScrollRect.SetLayout")),
+                _ => {}
+            }
+        }
+        for c in self.inp.def.nodes[n as usize].children.clone() {
+            if self.inp.def.nodes[c as usize].rect.is_some() {
+                self.control(c, axis);
+            }
+        }
+    }
+
+    /// SetChildAlongAxisWithScale (size: None keeps sizeDelta)
+    fn set_child_along_axis(&mut self, c: u32, axis: usize, pos: f32, size: Option<f32>, scale: f32) {
+        self.write_rect(c, |r| {
+            r.anchor_min = [0.0, 1.0];
+            r.anchor_max = [0.0, 1.0];
+            if let Some(sz) = size {
+                r.size_delta[axis] = sz;
+            }
+            let sz = r.size_delta[axis];
+            r.anchored_pos[axis] = if axis == 0 { pos + sz * r.pivot[axis] * scale } else { -pos - sz * (1.0 - r.pivot[axis]) * scale };
+        });
+    }
+
+    /// LayoutGroup.GetStartOffset
+    fn start_offset(&self, n: u32, g: &LayoutGroupDef, axis: usize, required: f32) -> f32 {
+        let num = required + g.pad(axis);
+        let num2 = self.rect_size(n)[axis] - num;
+        g.pad_start(axis) + num2 * g.alignment(axis)
+    }
+
+    fn group_set_axis(&mut self, s: u32, n: u32, g: &LayoutGroupDef, axis: usize) {
+        let Some((children, totals)) = self.group_calc.get(&s).cloned() else { return };
+        if let LayoutKind::Grid { corner, axis: start_axis, cell, spacing, constraint, count: cc } = g.kind {
+            self.grid_set_axis(n, g, &children, axis, corner, start_axis, cell, spacing, constraint, cc);
+            return;
+        }
+        // SetChildrenAlongAxis
+        let vertical = matches!(g.kind, LayoutKind::Vertical);
+        let size = self.rect_size(n)[axis];
+        let control = g.control[axis];
+        let use_scale = g.scale[axis];
+        let align = g.alignment(axis);
+        let order: Vec<u32> = if g.reverse { children.iter().rev().copied().collect() } else { children.clone() };
+        if vertical ^ (axis == 1) {
+            let inner = size - g.pad(axis);
+            for c in order {
+                let (min, pref, flex) = self.child_sizes(c, axis, control, g.expand[axis]);
+                let sc = if use_scale { self.child_scale(c, axis) } else { 1.0 };
+                let v = mathf_clamp(inner, min, if flex > 0.0 { size } else { pref });
+                let off = self.start_offset(n, g, axis, v * sc);
+                if control {
+                    self.set_child_along_axis(c, axis, off, Some(v), sc);
+                } else {
+                    let sd = self.rect_def(c).map_or(0.0, |r| r.size_delta[axis]);
+                    self.set_child_along_axis(c, axis, off + (v - sd) * align, None, sc);
+                }
+            }
+            return;
+        }
+        let [tmin, tpref, tflex] = totals[axis];
+        let mut pos = g.pad_start(axis);
+        let mut per_flex = 0.0;
+        let surplus = size - tpref;
+        if surplus > 0.0 {
+            if tflex == 0.0 {
+                pos = self.start_offset(n, g, axis, tpref - g.pad(axis));
+            } else if tflex > 0.0 {
+                per_flex = surplus / tflex;
+            }
+        }
+        let t = if tmin != tpref { ((size - tmin) / (tpref - tmin)).clamp(0.0, 1.0) } else { 0.0 };
+        for c in order {
+            let (min, pref, flex) = self.child_sizes(c, axis, control, g.expand[axis]);
+            let sc = if use_scale { self.child_scale(c, axis) } else { 1.0 };
+            let v = min + (pref - min) * t + flex * per_flex;
+            if control {
+                self.set_child_along_axis(c, axis, pos, Some(v), sc);
+            } else {
+                let sd = self.rect_def(c).map_or(0.0, |r| r.size_delta[axis]);
+                self.set_child_along_axis(c, axis, pos + (v - sd) * align, None, sc);
+            }
+            pos += v * sc + g.spacing;
+        }
+    }
+
+    /// GridLayoutGroup.SetCellsAlongAxis
+    #[allow(clippy::too_many_arguments)]
+    fn grid_set_axis(&mut self, n: u32, g: &LayoutGroupDef, children: &[u32], axis: usize, corner: i64, start_axis: i64, cell: [f32; 2], spacing: [f32; 2], constraint: i64, cc: i64) {
+        if axis == 0 {
+            for &c in children {
+                self.write_rect(c, |r| {
+                    r.anchor_min = [0.0, 1.0];
+                    r.anchor_max = [0.0, 1.0];
+                    r.size_delta = cell;
+                });
+            }
+            return;
+        }
+        let count = children.len() as i64;
+        let size = self.rect_size(n);
+        let (mut cols, mut rows) = (1i64, 1i64);
+        if constraint == 1 {
+            cols = cc;
+            if count > cols {
+                rows = count / cols + (count % cols > 0) as i64;
+            }
+        } else if constraint != 2 {
+            cols = if cell[0] + spacing[0] <= 0.0 { i32::MAX as i64 } else { (((size.x - g.pad(0) + spacing[0] + 0.001) / (cell[0] + spacing[0])).floor() as i64).max(1) };
+            rows = if cell[1] + spacing[1] <= 0.0 { i32::MAX as i64 } else { (((size.y - g.pad(1) + spacing[1] + 0.001) / (cell[1] + spacing[1])).floor() as i64).max(1) };
+        } else {
+            rows = cc;
+            if count > rows {
+                cols = count / rows + (count % rows > 0) as i64;
+            }
+        }
+        let ceil_div = |a: i64, b: i64| (a as f32 / b as f32).ceil() as i64;
+        let (per_line, acols, arows) = if start_axis == 0 {
+            let acols = cols.clamp(1, count.max(1));
+            let arows = if constraint != 2 { rows.clamp(1, ceil_div(count, cols).max(1)) } else { rows.min(count) };
+            (cols, acols, arows)
+        } else {
+            let arows = rows.clamp(1, count.max(1));
+            let acols = if constraint != 1 { cols.clamp(1, ceil_div(count, rows).max(1)) } else { cols.min(count) };
+            (rows, acols, arows)
+        };
+        let req = Vec2::new(acols as f32 * cell[0] + (acols - 1) as f32 * spacing[0], arows as f32 * cell[1] + (arows - 1) as f32 * spacing[1]);
+        let start = Vec2::new(self.start_offset(n, g, 0, req.x), self.start_offset(n, g, 1, req.y));
+        let mut num8 = 0;
+        if count > cc && ceil_div(count, per_line) < cc {
+            num8 = cc - ceil_div(count, per_line);
+            num8 += (num8 as f32 / (per_line as f32 - 1.0)).floor() as i64;
+            if count % per_line == 1 {
+                num8 += 1;
+            }
+        }
+        for (j, &c) in children.iter().enumerate() {
+            let j = j as i64;
+            let (mut x, mut y);
+            if start_axis == 0 {
+                if constraint == 2 && count - j <= num8 {
+                    x = 0;
+                    y = cc - (count - j);
+                } else {
+                    x = j % per_line;
+                    y = j / per_line;
+                }
+            } else if constraint == 1 && count - j <= num8 {
+                x = cc - (count - j);
+                y = 0;
+            } else {
+                x = j / per_line;
+                y = j % per_line;
+            }
+            if corner % 2 == 1 {
+                x = acols - 1 - x;
+            }
+            if corner / 2 == 1 {
+                y = arows - 1 - y;
+            }
+            self.set_child_along_axis(c, 0, start.x + (cell[0] + spacing[0]) * x as f32, Some(cell[0]), 1.0);
+            self.set_child_along_axis(c, 1, start.y + (cell[1] + spacing[1]) * y as f32, Some(cell[1]), 1.0);
+        }
+    }
+}
+
 /// Lays out and meshes every active canvas.
 pub fn build_frame(inp: &UiInput) -> UiFrame {
     let mut scripts_by_node: HashMap<u32, Vec<u32>> = HashMap::new();
     for (i, s) in inp.def.scripts.iter().enumerate() {
         scripts_by_node.entry(s.node).or_default().push(i as u32);
     }
-    let mut l = Layout { inp, frame: UiFrame::default(), scripts_by_node, driven_anchors: HashMap::new(), driven_fill: HashMap::new(), tint: HashMap::new() };
+    let mut l = Layout {
+        inp,
+        frame: UiFrame::default(),
+        scripts_by_node,
+        driven_anchors: HashMap::new(),
+        driven_fill: HashMap::new(),
+        tint: HashMap::new(),
+        driven: HashMap::new(),
+        root_size: HashMap::new(),
+        group_calc: HashMap::new(),
+        layout_ref_ppu: 100.0,
+    };
     l.drive();
     for &r in &inp.ui.roots {
         l.root(r);

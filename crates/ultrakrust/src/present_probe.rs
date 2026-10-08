@@ -67,7 +67,8 @@ fn report(label: &str, img: &Image) {
         }
     }
     let samples = (h.div_ceil(2) * w.div_ceil(2)).max(1);
-    // near-white "ink" in the hint band (bottom 140 px, centered) and the top-left debug corner
+    // near-white "ink" in the hint band (bottom 120..200 px, centre third: clear of the HUD canvases, which
+    // reach x 0.31 bottom-left and from x 0.71 top-right) and the top-left debug corner
     let ink = |x0: usize, x1: usize, y0: usize, y1: usize| {
         let mut c = 0;
         for y in y0.min(h)..y1.min(h) {
@@ -77,7 +78,7 @@ fn report(label: &str, img: &Image) {
         }
         c
     };
-    let hint = ink(w / 6, w - w / 6, h.saturating_sub(200), h.saturating_sub(120));
+    let hint = ink(w / 3, w - w / 3, h.saturating_sub(200), h.saturating_sub(120));
     let corner = ink(0, w / 3, 0, 140);
     info!("present probe {label}: {w}x{h} mean_lum {:.4} lit_frac {:.4} hint_ink {hint} corner_ink {corner}", sum / samples as f64, lit as f64 / samples as f64);
 }

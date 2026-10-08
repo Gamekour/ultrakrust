@@ -618,7 +618,7 @@ fn frame_sim(
         let fire1 = bot.is_some_and(|b| b.fire) || (captured && mouse.just_pressed(MouseButton::Left)) || std::env::var_os("UK_PROBE_CONTINUE").is_some();
         let complete = sim.results_skipped || sim.results_t >= TALLY_STEP * TALLY_LINES;
         if sim.results_t == 0.0 {
-            info!("results up at {:.2}s: ranks {:?}", sim.level_time, sim.game.final_ranks(sim.level_time));
+            info!("results up at {:.2}s: ranks {:?}", sim.game.s.stats.seconds, sim.game.final_ranks());
         }
         if fire1 && !complete {
             sim.results_skipped = true;
@@ -1039,14 +1039,15 @@ fn update_hud(
         state.join(" "),
         g.s.kills,
         alive_enemies,
-        sim.level_time,
+        g.s.stats.seconds,
     );
     s.push_str("WASD SPACE SHIFT CTRL move | LMB fire, hold RMB pierce | F punch/parry | R checkpoint | N noclip\n");
     for (msg, _) in sim.log.iter().rev().take(4) {
         s.push_str(&format!("\n{msg}"));
     }
     text.0 = if *debug_shown { s } else { String::new() };
-    hint.0 = g.s.messages.last().map(|m| m.text.clone()).unwrap_or_default();
+    // the uGUI MessageHud draws the hints; without a UI the debug HUD shows its text
+    hint.0 = if g.ui.is_none() && g.msg_visible() { uk_game::scripts::clean_rich_text(&g.s.msg.shown_text) } else { String::new() };
     banner.0 = if let Some((name, _)) = &sim.load_request {
         format!("LOADING {}", name.to_uppercase())
     } else if g.s.results_shown {
@@ -1127,9 +1128,9 @@ fn update_death_ui(
 /// in the second pit.
 fn results_text(sim: &Sim) -> String {
     let g = &sim.game;
-    let (time, kills, style, total) = g.final_ranks(sim.level_time);
+    let (time, kills, style, total) = g.final_ranks();
     let shown = if sim.results_skipped { TALLY_LINES } else { (sim.results_t / TALLY_STEP).floor().min(TALLY_LINES) };
-    let secs = sim.level_time;
+    let secs = g.s.stats.seconds;
     let lines = [
         format!("TIME  {}:{:06.3}  {time}", (secs / 60.0) as u32, secs % 60.0),
         format!("KILLS  {}  {kills}", g.s.kills),

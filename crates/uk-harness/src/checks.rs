@@ -501,8 +501,12 @@ fn bot_run(def: &Arc<SceneDef>, r: &mut Report) {
     }
 }
 
-/// OnLevelStart: on every campaign level, walking out of the spawn starts the level and its
-/// `onStart` brings in the first rooms (no void past the FirstRoom door).
+/// OnLevelStart: on every campaign level the real start chain runs (FinalDoorOpener.GoTime from
+/// the FirstRoom's door triggers, or PlayerActivator / StatsManager.StartTimer): the player lands,
+/// walks at the FirstRoom's `Cube (1)` trigger, and the level starts with the timer running and
+/// `onStart`'s objects active. Prefs model a returning player (hideShotgunPopup: 0-2's shop
+/// tutorial door is open). 0-1 starts at its title instead: the revolver pickup, then
+/// TitleActivator's delay activates the Gun Room trigger's FinalDoorOpener.
 pub fn first_rooms(install: &Path, filter: Option<&str>, r: &mut Report) {
     let dir = AssetDb::bundle_dir(install);
     let mut levels: Vec<String> = std::fs::read_dir(&dir)
@@ -516,6 +520,8 @@ pub fn first_rooms(install: &Path, filter: Option<&str>, r: &mut Report) {
         .collect();
     levels.sort();
     let mut db = AssetDb::open(install).unwrap();
+    let mut prefs = uk_assets::prefs::Prefs::default();
+    prefs.set_bool("hideShotgunPopup", true);
     let (mut ok, mut with) = (0, 0);
     for l in &levels {
         let Ok(def) = scenedef::load_scene(&mut db, &dir.join(format!("campaign_scenes_level{l}.bundle"))) else { continue };
@@ -530,21 +536,59 @@ pub fn first_rooms(install: &Path, filter: Option<&str>, r: &mut Report) {
             continue;
         }
         with += 1;
-        let mut g = Game::new(def.clone());
+        let mut g = Game::with_prefs(def.clone(), prefs.clone(), Default::default());
+        let find = |p: &str| (0..def.nodes.len() as u32).find(|&n| def.path(n).ends_with(p));
+        let trigger = (0..def.nodes.len() as u32)
+            .find(|&n| def.path(n).ends_with("FirstRoom/Room/Cube (1)") && g.active(n) && def.scripts_on(n).any(|(_, s)| s.class == "ObjectActivator"))
+            .map(|n| def.nodes[n as usize].world0.w_axis.truncate());
+        let pickup = if l == "0-1" { find("3 - Gun Room/RevolverPickUp").map(|n| def.nodes[n as usize].world0.w_axis.truncate()) } else { None };
         let mut t = 0.0;
-        for i in 0..400 {
-            let input = Input { move_axis: bevy_math::Vec2::new(0.0, (i >= 250) as i32 as f32), ..Default::default() };
+        let mut landed: Option<usize> = None;
+        let mut started = None;
+        for i in 0..3000 {
+            let walk = landed.is_some_and(|k| i > k + 30);
+            if walk {
+                if let Some(p) = pickup {
+                    if !g.s.has_revolver {
+                        g.s.player.pos = p + Vec3::Y * 0.5;
+                        g.s.player.prev_pos = g.s.player.pos;
+                    }
+                } else if let Some(c) = trigger {
+                    // forward = (sin yaw, 0, -cos yaw)
+                    let d = c - g.s.player.pos;
+                    g.s.player.yaw_deg = d.x.atan2(-d.z).to_degrees();
+                }
+            }
+            let input = Input { move_axis: bevy_math::Vec2::new(0.0, (walk && pickup.is_none()) as i32 as f32), ..Default::default() };
             g.fixed_update(&input);
             t += FIXED_DT as f64;
             g.update(&input, FIXED_DT, t);
+            g.s.player.events.clear();
+            if landed.is_none() && g.s.player.activated {
+                landed = Some(i);
+            }
+            if g.s.stats.level_started {
+                started = Some(i);
+                break;
+            }
         }
+        // onStart's SetActive calls land this frame; one more tick for the timer to count
+        let input = Input::default();
+        g.fixed_update(&input);
+        t += FIXED_DT as f64;
+        g.update(&input, FIXED_DT, t);
         let on = targets.iter().filter(|&&n| g.active(n)).count();
-        if g.s.player.activated && on == targets.len() {
+        if started.is_some() && g.s.stats.timer && g.s.stats.seconds > 0.0 && on == targets.len() {
             ok += 1;
         } else {
-            r.note(format!("FAIL first_rooms {l}: player activated {}, OnLevelStart targets active {on}/{}", g.s.player.activated, targets.len()));
+            r.note(format!(
+                "FAIL first_rooms {l}: activated at {landed:?}, level started at {started:?}, timer {} ({:.3}s), OnLevelStart targets active {on}/{}",
+                g.s.stats.timer,
+                g.s.stats.seconds,
+                targets.len()
+            ));
         }
     }
     r.higher("first_rooms.levels_ok", ok as f64);
-    r.pass("first_rooms.all", ok == with, format!("{ok}/{with} levels bring in their first rooms at level start"));
+    r.pass("first_rooms.all", ok == with, format!("{ok}/{with} levels start (OnLevelStart onStart, StatsManager timer) through their own start triggers"));
 }
