@@ -79,6 +79,7 @@ pub const PORTED: &[(&str, Port)] = &[
     ("ColorBlindActivator", Port::Full),
     ("HudController", Port::Partial("no fist fill (WeaponCharges.punchStamina), no SetAlwaysOnTop material swap, no HideUI cheat")),
     ("HUDPos", Port::Full),
+    ("LevelStatsEnabler", Port::Full),
 ];
 
 pub fn status(class: &str) -> Option<Port> {
