@@ -1121,6 +1121,7 @@ pub fn frame(game: &uk_game::Game, scene: &SceneData, time: f32, screen: [f32; 2
             script_enabled: &s.script_enabled,
             screen,
             dpi: 96.0,
+            world_of: Some(&|n| game.anim.world_of(n)),
         });
         // a world-space root draws with its node's current (Unity-space) world matrix
         let world = f.batches.iter().map(|b| if b.mode == uk_game::ugui::RenderMode::World { game.anim.world_of(b.root_node) } else { b.to_screen }).collect();
@@ -2324,7 +2325,8 @@ fn prepare_ui(gpu: &mut UnityGpu, scene: &SceneData, frame: &UnityFrame, dev: &R
                     let vals: [f32; 4] = match ch {
                         0 => [vx.pos.x, vx.pos.y, vx.pos.z, 1.0],
                         1 => [0.0, 0.0, -1.0, 0.0],
-                        2 => [1.0, 0.0, 0.0, -1.0],
+                        // TMP_Text's meshes carry tangent (-1, 0, 0, 1); VertexHelper's (1, 0, 0, -1)
+                        2 => if d.tmp { [-1.0, 0.0, 0.0, 1.0] } else { [1.0, 0.0, 0.0, -1.0] },
                         3 => vx.color.map(|c| c as f32 / 255.0),
                         4 => vx.uv0.to_array(),
                         5 => vx.uv1.to_array(),
@@ -2379,7 +2381,7 @@ fn prepare_ui(gpu: &mut UnityGpu, scene: &SceneData, frame: &UnityFrame, dev: &R
                     let size = var.params.constant_buffers.get(*cb).map_or(16, |c| c.size.next_multiple_of(16).max(16)) as usize;
                     let mut bytes = vec![0u8; size];
                     if let Some(cbd) = var.params.constant_buffers.get(*cb) {
-                        fill_ui_cb(&mut bytes, cbd, scene, &m.props, o2w, d.clip.as_ref(), main, c);
+                        fill_ui_cb(&mut bytes, cbd, scene, d.props.as_deref().unwrap_or(&m.props), o2w, d.clip.as_ref(), main, c);
                     }
                     ubufs.push((*binding, dev.create_buffer_with_data(&BufferInitDescriptor { label: Some("unity ui cb"), contents: &bytes, usage: BufferUsages::UNIFORM })));
                 }

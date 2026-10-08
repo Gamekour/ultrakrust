@@ -44,7 +44,7 @@ fn main() {
     }
     let enabled: Vec<bool> = def.scripts.iter().map(|s| s.enabled).collect();
     let state = UiState::new(&uidef);
-    let inp = UiInput { def: &def, ui: &uidef, assets: &assets, state: &state, active: &active, script_enabled: &enabled, screen: [w, h], dpi: 96.0 };
+    let inp = UiInput { def: &def, ui: &uidef, assets: &assets, state: &state, active: &active, script_enabled: &enabled, screen: [w, h], dpi: 96.0, world_of: None };
     let t = std::time::Instant::now();
     let f = ugui::build_frame(&inp);
     println!("frame in {:?}", t.elapsed());
@@ -98,6 +98,24 @@ fn main() {
                 smx.x,
                 smx.y
             );
+            if let (ugui::GraphicKind::Tmp(td), false) = (&g.kind, d.pop) {
+                if let Some((_, m)) = uidef.tmp_cache.lock().unwrap().get(&d.graphic) {
+                    let r = f.node_rects[&d.node];
+                    println!(
+                        "    TMP {:?} size {} -> {} subs {} trunc {} rect [{:.1},{:.1},{:.1},{:.1}] local {:?}",
+                        td.text.chars().take(60).collect::<String>(),
+                        td.font_size,
+                        m.font_size,
+                        m.subs.len(),
+                        m.truncated,
+                        r.x,
+                        r.y,
+                        r.w,
+                        r.h,
+                        m.compound_bounds().map(|(a, b)| [a.x, a.y, b.x, b.y])
+                    );
+                }
+            }
         }
     }
 }

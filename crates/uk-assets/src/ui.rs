@@ -101,6 +101,9 @@ pub struct Glyph {
     pub atlas_index: u32,
 }
 
+/// `glyphs` key of the zero glyph synthesized for missing control characters (its glyph index is 0)
+pub const SYNTH_GLYPH: u32 = u32::MAX;
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TmpCharacter {
     pub glyph: u32,
@@ -150,6 +153,8 @@ pub struct UiMaterial {
     pub path_id: i64,
     /// the shader's (file, path id)
     pub shader: (String, i64),
+    /// `_MainTex` (index into `UiAssets::textures`)
+    pub main_tex: Option<u32>,
 }
 
 /// A legacy `UnityEngine.Font` (dynamic TTF).
@@ -327,7 +332,8 @@ impl Loader<'_> {
             }
             let props = MaterialProps::from_value(&f.read_id(id).ok()?);
             let (sf, sid) = self.db.resolve(&f, props.shader).ok()??;
-            self.out.materials.push(UiMaterial { name: props.name.clone(), props: Arc::new(props), file: f.name.clone(), path_id: id, shader: (sf.name.clone(), sid) });
+            let main_tex = props.textures.get("_MainTex").and_then(|t| self.texture(&f, t.texture));
+            self.out.materials.push(UiMaterial { name: props.name.clone(), props: Arc::new(props), file: f.name.clone(), path_id: id, shader: (sf.name.clone(), sid), main_tex });
             Some(self.out.materials.len() as u32 - 1)
         })();
         self.materials.insert(key, m);
@@ -384,7 +390,7 @@ impl Loader<'_> {
         self.out.fonts.push(TmpFont::default());
         self.fonts.insert(key, Some(idx));
         let fi = v.get("m_FaceInfo");
-        let face = FaceInfo {
+        let mut face = FaceInfo {
             point_size: fi.get("m_PointSize").f32(),
             scale: fi.get("m_Scale").f32(),
             line_height: fi.get("m_LineHeight").f32(),
@@ -424,6 +430,22 @@ impl Loader<'_> {
         let mut characters = HashMap::new();
         for c in v.get("m_CharacterTable").array() {
             characters.insert(c.get("m_Unicode").i64() as u32, TmpCharacter { glyph: c.get("m_GlyphIndex").i64() as u32, scale: c.get("m_Scale").f32() });
+        }
+        // AddSynthesizedCharactersAndFaceMetrics: control characters missing from the table get a
+        // zero glyph (no font face is loaded here, so dynamic fonts take this path too)
+        for u in [3u32, 9, 10, 11, 13, 1564, 8203, 8206, 8207, 8232, 8233, 8288] {
+            characters.entry(u).or_insert(TmpCharacter { glyph: SYNTH_GLYPH, scale: 1.0 });
+        }
+        glyphs.insert(SYNTH_GLYPH, Glyph { scale: 1.0, ..Default::default() });
+        if face.cap_line == 0.0 {
+            if let Some(g) = characters.get(&88).and_then(|c| glyphs.get(&c.glyph)) {
+                face.cap_line = g.bearing_y;
+            }
+        }
+        if face.mean_line == 0.0 {
+            if let Some(g) = characters.get(&120).and_then(|c| glyphs.get(&c.glyph)) {
+                face.mean_line = g.bearing_y;
+            }
         }
         let gv = |r: &Value| {
             let g = r.get("m_GlyphValueRecord");
@@ -552,6 +574,7 @@ pub fn load_ui_assets(db: &mut AssetDb, def: &SceneDef) -> UiAssets {
                 file: f.name.clone(),
                 path_id: 0,
                 shader: (f.name.clone(), UI_DEFAULT_SHADER.1),
+                main_tex: None,
             });
             l.out.default_material = Some(l.out.materials.len() as u32 - 1);
         }

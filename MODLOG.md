@@ -424,3 +424,10 @@ CPU-skinned enemies, 3,393 colliders/569 triggers, 11,758 MonoBehaviours with ty
     - The overlay changes 9.74% of the post output's pixels (bounds [12,12]..[368,405]).
     - The 24 skipped draws are all empty meshes (text not meshed yet). Every material and variant resolves.
   - A zero-sized Texture2D now fails to decode instead of panicking.
+
+- TextMeshProUGUI meshing (`crates/uk-game/src/tmp.rs`, wired through `ugui.rs` and `prepare_ui`):
+  - Literal port of PopulateTextProcessingArray, SetArraySizes, ValidateHtmlTag (the tags the scenes use), GenerateTextMesh (wrap, auto size, Truncate, alignment, uv2) with InsertNewLine / Save / RestoreWordWrappingState, TMP_MaterialManager fallback materials and ShaderUtilities ratios / padding.
+  - Each text's mesh is cached on (text, rect, uv2 scale, color); runtime materials (ratios applied, fallback copies) live in `UiDef::tmp_mats` and reach the shader through `UiDraw::props`. TMP draws use tangent (−1,0,0,1).
+  - TMP's stencil skips MaskableGraphic's own-Mask check; sub meshes add the text's Mask to their depth and draw after the main mesh in reverse order; Cull tests the compound mesh bounds.
+  - `ugui_frame` (0-1, 1600×900): 65 texts in 4-2 build in 5.8 ms (first frame, cached after). VCR OSD Mono advances 14.01 at 24 pt in every label (TIME:/KILLS:/SECRETS: widths 63.34/77.36/105.38); centered titles symmetric (±222.52); "GET 5 KILLS WITH A SINGLE GLASS PANEL" wraps into 3 lines in 316 units. Hash checks: orange 26556144, color 281955, /color 1071884.
+  - Probe (0-1): overlay gpu draws 8 → 24, HUD 9 → 12; skipped empty meshes 24 → 5; no missing material or variant.

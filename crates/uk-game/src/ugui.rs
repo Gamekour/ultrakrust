@@ -10,12 +10,16 @@
 //! with its node's world matrix. No Bevy here: the frontend turns `UiFrame` into draws.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use bevy_math::{Mat4, Quat, Vec2, Vec3, Vec4};
 use uk_assets::scene::to_bevy_point;
 use uk_assets::scenedef::{RectDef, SceneDef};
 use uk_assets::serialized::Value;
+use uk_assets::shader::MaterialProps;
 use uk_assets::ui::UiAssets;
+
+use crate::tmp::{RtMats, TmpDef, TmpMesh};
 
 pub const CLASS_CANVAS: i32 = 223;
 pub const CLASS_CANVAS_GROUP: i32 = 225;
@@ -87,7 +91,7 @@ pub enum GraphicKind {
     Image(ImageDef),
     RawImage { texture: Option<u32>, uv_rect: [f32; 4] },
     Text,
-    Tmp,
+    Tmp(Box<TmpDef>),
 }
 
 #[derive(Clone, Debug)]
@@ -149,6 +153,19 @@ pub struct UiDef {
     /// root canvases, in scene order
     pub roots: Vec<u32>,
     pub warnings: Vec<String>,
+    /// TMP's runtime material instances (shared + fallback materials)
+    pub tmp_mats: Mutex<RtMats>,
+    /// graphic -> (inputs, mesh) of its last TMP mesh
+    pub tmp_cache: Mutex<HashMap<u32, (TmpKey, Arc<TmpMesh>)>>,
+}
+
+/// What a TMP mesh depends on beyond its serialized fields.
+#[derive(Clone, PartialEq, Debug)]
+pub struct TmpKey {
+    text: Option<Arc<str>>,
+    rect: [u32; 4],
+    uv2: u32,
+    color: [u32; 4],
 }
 
 fn color4(v: &Value) -> [f32; 4] {
@@ -241,7 +258,14 @@ impl UiDef {
                     }))
                 }
                 "Text" => Some(graphic(GraphicKind::Text)),
-                "TextMeshProUGUI" => Some(graphic(GraphicKind::Tmp)),
+                "TextMeshProUGUI" => {
+                    let td = TmpDef::from_script(d, assets, si, &mut ui.warnings, &def.path(s.node));
+                    let mut g = graphic(GraphicKind::Tmp(Box::new(td.clone())));
+                    // TMP_Text.color is m_fontColor; materialForRendering is m_sharedMaterial
+                    g.color = color4(d.get("m_fontColor"));
+                    g.material = td.material;
+                    Some(g)
+                }
                 "Mask" => {
                     ui.node_mask.insert(s.node, ui.masks.len() as u32);
                     ui.masks.push(MaskDef { script: si, node: s.node, show_graphic: d.get("m_ShowMaskGraphic").bool() });
@@ -329,6 +353,8 @@ pub struct UiState {
     pub canvas_enabled: Vec<bool>,
     pub group_alpha: Vec<f32>,
     pub group_enabled: Vec<bool>,
+    /// TMP_Text.text set by scripts per graphic (None: the serialized text)
+    pub text: Vec<Option<Arc<str>>>,
 }
 
 impl UiState {
@@ -344,6 +370,7 @@ impl UiState {
             canvas_enabled: ui.canvases.iter().map(|c| c.enabled).collect(),
             group_alpha: ui.groups.iter().map(|g| g.alpha).collect(),
             group_enabled: ui.groups.iter().map(|g| g.enabled).collect(),
+            text: vec![None; ui.graphics.len()],
         }
     }
 }
@@ -442,6 +469,10 @@ pub struct UiDraw {
     pub clip: Option<Clip>,
     /// the Mask's pop instruction (drawn after the mask's children)
     pub pop: bool,
+    /// TMP's runtime material properties (replace the asset material's)
+    pub props: Option<Arc<MaterialProps>>,
+    /// a TextMeshPro mesh (tangent (-1, 0, 0, 1))
+    pub tmp: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -485,6 +516,8 @@ pub struct UiInput<'a> {
     pub screen: [f32; 2],
     /// Screen.dpi (0: unknown)
     pub dpi: f32,
+    /// a node's current world matrix (world-space canvas scale for TMP's uv2)
+    pub world_of: Option<&'a dyn Fn(u32) -> Mat4>,
 }
 
 /// Vertex scratch like VertexHelper.
@@ -1478,6 +1511,46 @@ impl<'a> Layout<'a> {
         }
     }
 
+    /// materialForRendering's stencil: IMaterialModifier components in component order
+    /// (TextMeshProUGUI.GetModifiedMaterial skips MaskableGraphic's own-Mask check)
+    fn material_stencil(&self, g: u32, tmp: bool) -> Option<Stencil> {
+        let ui = self.inp.ui;
+        let gd = &ui.graphics[g as usize];
+        let n = gd.node;
+        let mut stencil = None;
+        let mask = ui.node_mask.get(&n).copied().filter(|_| self.mask_on(n));
+        let mut modifiers: Vec<(u32, bool)> = vec![(gd.script, false)];
+        if let Some(mk) = mask {
+            modifiers.push((ui.masks[mk as usize].script, true));
+        }
+        let order = self.scripts_by_node.get(&n);
+        modifiers.sort_by_key(|(s, _)| order.and_then(|o| o.iter().position(|x| x == s)).unwrap_or(0));
+        for (_, is_mask) in modifiers {
+            if !is_mask {
+                // MaskableGraphic.GetModifiedMaterial
+                let v = if gd.maskable { self.stencil_depth(n, self.root_sort_override_canvas(n)) } else { 0 };
+                if v > 0 && (tmp || mask.is_none()) {
+                    let id = (1 << v) - 1;
+                    stencil = stencil_add(id, OP_KEEP, CMP_EQUAL, 15, id, 0).or(stencil);
+                }
+            } else {
+                // Mask.GetModifiedMaterial
+                let md = &ui.masks[mask.unwrap() as usize];
+                let depth = self.stencil_depth(n, self.root_sort_override_canvas(n));
+                if depth < 8 {
+                    let num = 1i32 << depth;
+                    let cm = if md.show_graphic { 15 } else { 0 };
+                    stencil = if num == 1 {
+                        stencil_add(1, OP_REPLACE, CMP_ALWAYS, cm, 255, 255)
+                    } else {
+                        stencil_add(num | (num - 1), OP_REPLACE, CMP_EQUAL, cm, num - 1, num | (num - 1))
+                    };
+                }
+            }
+        }
+        stencil
+    }
+
     /// Emits the graphic's draw; returns a copy (for the Mask pop instruction).
     fn graphic(&mut self, g: u32, m: Mat4, rect: Rect, rc: &RootCtx, bi: usize) -> Option<UiDraw> {
         let inp = self.inp;
@@ -1485,6 +1558,9 @@ impl<'a> Layout<'a> {
         let gd = &ui.graphics[g as usize];
         let n = gd.node;
         let st = inp.state;
+        if let GraphicKind::Tmp(td) = &gd.kind {
+            return self.tmp_graphic(g, td, m, rect, rc, bi);
+        }
         let color = color32(st.color[g as usize]);
         let adj = self.pixel_adjusted_rect(rect, &m, rc);
         self.frame.graphic_rects.insert(g, self.canvas_rect_of(n).unwrap_or(rect));
@@ -1532,8 +1608,8 @@ impl<'a> Layout<'a> {
                 vh.add_tri(0, 1, 2);
                 vh.add_tri(2, 3, 0);
             }
-            // TODO(ugui): Text / TextMeshProUGUI meshes
-            GraphicKind::Text | GraphicKind::Tmp => {}
+            // TODO(ugui): legacy Text meshes
+            GraphicKind::Text | GraphicKind::Tmp(_) => {}
         }
         // IMeshModifier components in order
         if let Some(effects) = ui.node_effects.get(&n) {
@@ -1544,38 +1620,7 @@ impl<'a> Layout<'a> {
                 }
             }
         }
-        // materialForRendering: IMaterialModifier components in component order
-        let mut stencil = None;
-        let mask = ui.node_mask.get(&n).copied().filter(|_| self.mask_on(n));
-        let mut modifiers: Vec<(u32, bool)> = vec![(gd.script, false)];
-        if let Some(mk) = mask {
-            modifiers.push((ui.masks[mk as usize].script, true));
-        }
-        let order = self.scripts_by_node.get(&n);
-        modifiers.sort_by_key(|(s, _)| order.and_then(|o| o.iter().position(|x| x == s)).unwrap_or(0));
-        for (_, is_mask) in modifiers {
-            if !is_mask {
-                // MaskableGraphic.GetModifiedMaterial
-                let v = if gd.maskable { self.stencil_depth(n, self.root_sort_override_canvas(n)) } else { 0 };
-                if v > 0 && mask.is_none() {
-                    let id = (1 << v) - 1;
-                    stencil = stencil_add(id, OP_KEEP, CMP_EQUAL, 15, id, 0).or(stencil);
-                }
-            } else {
-                // Mask.GetModifiedMaterial
-                let md = &ui.masks[mask.unwrap() as usize];
-                let depth = self.stencil_depth(n, self.root_sort_override_canvas(n));
-                if depth < 8 {
-                    let num = 1i32 << depth;
-                    let cm = if md.show_graphic { 15 } else { 0 };
-                    stencil = if num == 1 {
-                        stencil_add(1, OP_REPLACE, CMP_ALWAYS, cm, 255, 255)
-                    } else {
-                        stencil_add(num | (num - 1), OP_REPLACE, CMP_EQUAL, cm, num - 1, num | (num - 1))
-                    };
-                }
-            }
-        }
+        let stencil = self.material_stencil(g, false);
         // RectMask2D clip + cull
         let mut clip = None;
         if gd.maskable {
@@ -1611,9 +1656,109 @@ impl<'a> Layout<'a> {
             stencil: stencil.unwrap_or_default(),
             clip,
             pop: false,
+            props: None,
+            tmp: false,
         };
         self.frame.batches[bi].draws.push(d.clone());
         Some(d)
+    }
+
+    /// TextMeshProUGUI: its mesh, then its TMP_SubMeshUI children's (last first, as they are
+    /// created as children and the main mesh's sub objects sort before the text's own children).
+    fn tmp_graphic(&mut self, g: u32, td: &TmpDef, m: Mat4, rect: Rect, rc: &RootCtx, bi: usize) -> Option<UiDraw> {
+        let inp = self.inp;
+        let ui = inp.ui;
+        let gd = &ui.graphics[g as usize];
+        let n = gd.node;
+        let st = inp.state;
+        self.frame.graphic_rects.insert(g, self.canvas_rect_of(n).unwrap_or(rect));
+        // uv2.y *= lossyScale.y (/ scaleFactor on overlay canvases, whose root is scaled by it)
+        let ly = m.y_axis.truncate().length();
+        let root_node = ui.canvases[rc.root as usize].node;
+        let root_lossy = || inp.world_of.map_or(1.0, |f| f(root_node).y_axis.truncate().length());
+        let uv2 = match rc.mode {
+            RenderMode::Overlay => ly,
+            RenderMode::Camera => {
+                if ui.canvases[rc.root as usize].camera.is_some() {
+                    root_lossy() * ly
+                } else {
+                    1.0
+                }
+            }
+            RenderMode::World => root_lossy() * ly,
+        };
+        let text = st.text.get(g as usize).cloned().flatten();
+        let color = st.color[g as usize];
+        let key = TmpKey { text: text.clone(), rect: [rect.x, rect.y, rect.w, rect.h].map(f32::to_bits), uv2: uv2.to_bits(), color: color.map(f32::to_bits) };
+        let cached = ui.tmp_cache.lock().unwrap().get(&g).filter(|(k, _)| *k == key).map(|(_, m)| m.clone());
+        let mesh = match cached {
+            Some(mesh) => mesh,
+            None => {
+                let mut rt = ui.tmp_mats.lock().unwrap();
+                let tin = crate::tmp::TmpInput { def: td, assets: inp.assets, text: text.as_deref(), color, rect: [rect.x, rect.y, rect.w, rect.h], uv2_scale: uv2 };
+                let mesh = Arc::new(crate::tmp::generate(&tin, &mut rt));
+                drop(rt);
+                ui.tmp_cache.lock().unwrap().insert(g, (key, mesh.clone()));
+                mesh
+            }
+        };
+        let stencil = self.material_stencil(g, true);
+        // TMP_SubMeshUI.GetModifiedMaterial: its stencil depth counts the text's own Mask
+        let sub_stencil = if gd.maskable {
+            let v = self.stencil_depth(n, self.root_sort_override_canvas(n)) + self.mask_on(n) as i32;
+            if v > 0 {
+                let id = (1 << v) - 1;
+                stencil_add(id, OP_KEEP, CMP_EQUAL, 15, id, 0)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        // RectMask2D clip; TextMeshProUGUI.Cull tests the compound mesh bounds
+        let mut clip = None;
+        if gd.maskable {
+            if let Some(rm) = self.rect_mask_for(n) {
+                let (cr, valid) = self.perform_clipping(rm, rc);
+                if let Some((mn, mx)) = mesh.compound_bounds() {
+                    let ratio = Vec2::new(m.x_axis.truncate().length(), m.y_axis.truncate().length());
+                    let pos = m.w_axis.truncate().truncate();
+                    let r = Rect { x: pos.x + mn.x * ratio.x, y: pos.y + mn.y * ratio.y, w: (mx.x - mn.x) * ratio.x, h: (mx.y - mn.y) * ratio.y };
+                    if r.w != 0.0 && r.h != 0.0 && (!valid || !cr.overlaps(&r)) {
+                        return None;
+                    }
+                }
+                let sf = ui.rect_masks[rm as usize].softness;
+                clip = Some(Clip { rect: [cr.x, cr.y, cr.xmax(), cr.ymax()], softness: [sf[0] as f32, sf[1] as f32] });
+            }
+        }
+        let crc = st.cr_color[g as usize];
+        let alpha = self.group_alpha(n);
+        let tint = [crc[0], crc[1], crc[2], crc[3] * alpha];
+        let rts = ui.tmp_mats.lock().unwrap();
+        let draw_of = |sub: Option<&crate::tmp::TmpSub>, stencil: Option<Stencil>| {
+            let (mut verts, idx, material, texture, props) = match sub {
+                Some(s) => {
+                    let r = &rts.list[s.rt as usize];
+                    (s.verts.clone(), s.idx.clone(), Some(r.base), r.tex, Some(r.props.clone()))
+                }
+                None => (Vec::new(), Vec::new(), gd.material.or(inp.assets.default_material), None, None),
+            };
+            for v in &mut verts {
+                v.pos = m.transform_point3(v.pos);
+                for k in 0..4 {
+                    v.color[k] = (v.color[k] as f32 * tint[k]).round().clamp(0.0, 255.0) as u8;
+                }
+            }
+            UiDraw { node: n, graphic: g, verts, idx, material, texture, stencil: stencil.unwrap_or_default(), clip, pop: false, props, tmp: true }
+        };
+        let main = draw_of(mesh.subs.first(), stencil);
+        let subs: Vec<UiDraw> = mesh.subs.iter().skip(1).rev().map(|s| draw_of(Some(s), sub_stencil)).collect();
+        drop(rts);
+        let draws = &mut self.frame.batches[bi].draws;
+        draws.push(main.clone());
+        draws.extend(subs);
+        Some(main)
     }
 }
 

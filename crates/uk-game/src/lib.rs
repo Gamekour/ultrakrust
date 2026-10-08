@@ -10,6 +10,7 @@ pub mod game;
 pub mod nav;
 pub mod parity;
 pub mod scripts;
+pub mod tmp;
 pub mod ugui;
 
 pub use game::{Game, GameEvent};

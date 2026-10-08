@@ -95,7 +95,7 @@ pub const NATIVE: &[(i32, &str, f64)] = &[
     (208, "NavMeshObstacle", 0.0),
     (238, "NavMeshData", 0.8),  // tiles + off-mesh links decoded and queried; area costs/masks not applied
     (224, "RectTransform", 0.8), // anchors, pivots, scaler; no layout groups/fitters
-    (222, "CanvasRenderer", 0.7), // meshes drawn with the game's UI shaders, stencil, clip rect; no text
+    (222, "CanvasRenderer", 0.75), // meshes drawn with the game's UI shaders, stencil, clip rect; TMP text, no legacy Text
     (223, "Canvas", 0.7), // overlay + world modes, sorting, override sorting; camera mode drawn as overlay
     (225, "CanvasGroup", 0.8), // alpha; interactable/blocksRaycasts unused (no EventSystem)
     (20, "Camera", 0.3),
