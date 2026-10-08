@@ -541,14 +541,17 @@ fn add_light(cx: &mut Ctx, l: &gltf::khr_lights_punctual::Light, node: u32) {
 }
 
 /// Incremental 3D convex hull, outward-facing triangles. None when the points are (nearly) flat.
-pub(crate) fn convex_hull(tris: &[[Vec3; 3]]) -> Option<Vec<[Vec3; 3]>> {
+pub fn convex_hull(tris: &[[Vec3; 3]]) -> Option<Vec<[Vec3; 3]>> {
     let mut seen = HashMap::new();
     let pts: Vec<Vec3> = tris.iter().flatten().filter(|p| seen.insert(((p.x * 1e4) as i64, (p.y * 1e4) as i64, (p.z * 1e4) as i64), ()).is_none()).copied().collect();
     if pts.len() < 4 {
         return None;
     }
     let (lo, hi) = pts.iter().fold((Vec3::MAX, Vec3::MIN), |(l, h), p| (l.min(*p), h.max(*p)));
-    let eps = (hi - lo).max_element() * 1e-5;
+    // work around the centre: far from the origin, f32 spacing exceeds the tolerance and faces fold
+    let centre = (lo + hi) * 0.5;
+    let pts: Vec<Vec3> = pts.iter().map(|p| *p - centre).collect();
+    let eps = (hi - lo).max_element() * 1e-4;
     let far = |f: &dyn Fn(Vec3) -> f32| (0..pts.len()).max_by(|&a, &b| f(pts[a]).total_cmp(&f(pts[b]))).unwrap();
     let a = 0;
     let b = far(&|p| p.distance(pts[a]));
@@ -569,20 +572,25 @@ pub(crate) fn convex_hull(tris: &[[Vec3; 3]]) -> Option<Vec<[Vec3; 3]>> {
         }
     };
     let mut faces: Vec<[usize; 3]> = [[a, b, c], [a, b, d], [a, c, d], [b, c, d]].into_iter().map(orient).collect();
-    for p in 0..pts.len() {
-        if [a, b, c, d].contains(&p) {
-            continue;
-        }
-        let vis = |f: &[usize; 3]| {
-            let n = (pts[f[1]] - pts[f[0]]).cross(pts[f[2]] - pts[f[0]]).normalize_or_zero();
-            n.dot(pts[p] - pts[f[0]]) > eps
-        };
-        let (visible, rest): (Vec<[usize; 3]>, Vec<[usize; 3]>) = faces.iter().partition(|f| vis(f));
-        if visible.is_empty() {
-            continue;
-        }
-        // a Vec, not a set: the face order must not change between loads (determinism)
-        let edges: Vec<(usize, usize)> = visible.iter().flat_map(|f| [(f[0], f[1]), (f[1], f[2]), (f[2], f[0])]).collect();
+    let above = |f: &[usize; 3], p: Vec3| {
+        let n = (pts[f[1]] - pts[f[0]]).cross(pts[f[2]] - pts[f[0]]).normalize_or_zero();
+        n.dot(p - pts[f[0]])
+    };
+    // quickhull order: always add the point farthest outside, and drop points once they're inside
+    let mut outside: Vec<usize> = (0..pts.len()).filter(|p| ![a, b, c, d].contains(p)).collect();
+    loop {
+        let mut best: Option<(f32, usize)> = None;
+        outside.retain(|&p| {
+            let h = faces.iter().map(|f| above(f, pts[p])).fold(f32::MIN, f32::max);
+            if h > eps && best.is_none_or(|(bh, _)| h > bh) {
+                best = Some((h, p));
+            }
+            h > eps
+        });
+        let Some((_, p)) = best else { break };
+        let (visible, rest): (Vec<[usize; 3]>, Vec<[usize; 3]>) = faces.iter().partition(|f| above(f, pts[p]) > eps);
+        // ordered set: the face order must not change between loads
+        let edges: std::collections::BTreeSet<(usize, usize)> = visible.iter().flat_map(|f| [(f[0], f[1]), (f[1], f[2]), (f[2], f[0])]).collect();
         faces = rest;
         for &(u, v) in &edges {
             if !edges.contains(&(v, u)) {
@@ -590,7 +598,7 @@ pub(crate) fn convex_hull(tris: &[[Vec3; 3]]) -> Option<Vec<[Vec3; 3]>> {
             }
         }
     }
-    Some(faces.iter().map(|f| f.map(|i| pts[i])).collect())
+    Some(faces.iter().map(|f| f.map(|i| pts[i] + centre)).collect())
 }
 
 #[cfg(test)]
