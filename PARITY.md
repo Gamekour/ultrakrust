@@ -177,6 +177,5 @@ it is fixed, and moves to MODLOG.md when it is. Missing features from the same n
 | Rendering | Outdoor light bleeds into the start area | start areas (level not noted) |
 | Weapons | The Piercer charge-up effect is always on and doesn't follow the charge | revolver |
 | UI | A debug overlay shows at level end | level end |
-| UI | A speed overlay shows; ULTRAKILL doesn't show one by default | always |
 | UI | The level indicator at the level start shows the wrong level | level start |
 | Particles / FX | Some surfaces destroy hit particles almost at once | surfaces not noted |

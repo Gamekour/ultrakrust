@@ -57,6 +57,7 @@ fn report(g: &Game, t: f64) {
                 line += &format!(" | XH {name} fill={:.3} a={:.2} on={}", g.s.ui.fill[gi], g.s.ui.color[gi][3], on as u8);
             }
             HudScript::FadeOutBars(f) if live => line += &format!(" | FO {name} t={:.2}", f.fade_out_time),
+            HudScript::Speedometer => line += &format!(" | Speedometer {name} active={}", g.active(node)),
             _ => {}
         }
     }
@@ -186,6 +187,14 @@ fn main() {
             }
             println!("  {} {} v{} col{:?} [{:.3},{:.3}]-[{:.3},{:.3}]", def.path(d.node).rsplit_once("HUD/").map_or(def.path(d.node).as_str(), |x| x.1), def.scripts[gr.script as usize].class, d.verts.len(), d.verts.first().map(|v| v.color), mn.x, mn.y, mx.x, mx.y);
         }
+    }
+    // PlayerActivatorRelay turns SpeedometerPanel on; its Speedometer.OnEnable decides if it stays
+    if let Some(sp) = find(&g, "/SpeedometerPanel") {
+        g.set_active(sp, true);
+        step(&mut g, 2, &mut t);
+        let f = frame(&g);
+        let draws = f.batches.iter().flat_map(|b| &b.draws).filter(|d| def.path(d.node).contains("SpeedometerPanel")).count();
+        println!("SpeedometerPanel after relay: active={} draws={draws} pref speedometer={}", g.active(sp), g.prefs.int("speedometer"));
     }
     // damage
     g.hurt_player(75, false);

@@ -86,6 +86,7 @@ pub const PORTED: &[(&str, Port)] = &[
     ("HudOpenEffect", Port::Full),
     ("HealthBar", Port::Partial("NewMovement.antiHp (hard damage) not ported: always 0")),
     ("StaminaMeter", Port::Partial("no flash sound")),
+    ("Speedometer", Port::Partial("OnEnable only (hidden unless the speedometer pref is on); the readout is not ported")),
     ("ColorBlindGet", Port::Full),
     ("ColorBlindSettings", Port::Partial("HUD and variation colours; enemy colours unused")),
     ("ColorBlindSetter", Port::Partial("prefs applied at load (ColorBlindActivator.Start); no options menu")),

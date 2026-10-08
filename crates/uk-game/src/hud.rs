@@ -296,6 +296,9 @@ pub enum HudScript {
     Crosshair(Box<Crosshair>),
     FadeOutBars(Box<FadeOutBars>),
     SliderFill(Box<SliderFill>),
+    /// Speedometer: only OnEnable (shown when the `speedometer` pref is above 0, its default 0
+    /// hiding it); the readout itself (FixedUpdate) isn't ported
+    Speedometer,
 }
 
 /// Crosshair (Image refs are script indices; circles are sprite indices, filled in at set_ui).
@@ -511,6 +514,7 @@ pub fn parse(def: &SceneDef, idx: usize) -> Option<HudScript> {
             chuds: v.get("chuds").array().iter().map(|p| def.script_ref(p)).collect(),
             circles: Vec::new(),
         })),
+        "Speedometer" => HudScript::Speedometer,
         "FadeOutBars" => HudScript::FadeOutBars(Box::new(FadeOutBars { fade_out: false, fade_out_time: v.get("fadeOutTime").f32() })),
         "SliderToFillAmount" => HudScript::SliderFill(Box::new(SliderFill {
             target: def.script_ref(v.get("targetSlider")),
@@ -675,6 +679,10 @@ impl Game {
             Some(HudScript::Pos(_)) => self.hud_pos_check(sc),
             Some(HudScript::Railcannon(_)) => self.railcannon_check_status(sc),
             Some(HudScript::SliderFill(f)) => f.last_invisible = !f.is_invisible,
+            Some(HudScript::Speedometer) => {
+                let on = self.prefs.int("speedometer") > 0;
+                self.set_active(self.def.scripts[sc as usize].node, on);
+            }
             _ => {}
         }
     }

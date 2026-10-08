@@ -632,3 +632,8 @@ CPU-skinned enemies, 3,393 colliders/569 triggers, 11,758 MonoBehaviours with ty
   - `skybox: "none"`, `sky_color`, `fog: false`: no skybox, clear flags 2 with (0.1, 0.2, 0.3, 1), fog 100000..200000.
   - Errors: two `-env`s, an unknown skybox, `fog_min` 300 > `fog_max` 100, a 2-number colour and an unknown property each warn, and the bad values are ignored.
 - The renderer's startup report (`ultrakrust --map ... --exit-after 6`) draws each skybox shader type: LustSky (Skybox/Panoramic, 1000 px), GreedSky (ULTRAKILL/Skybox/Panoramic, 1024), FraudCity_SkyMat_Night (ULTRAKILL/Skybox/Skybox, 6-face cube 512), BlackNoFog (ULTRAKILL/Master, 64), Default-Skybox (Skybox/Procedural); `"none"`: no sky draw, clear (0.1, 0.2, 0.3).
+
+## 2026-10-08 — Speedometer hidden by default
+- Playtest bug (PARITY §7): a speed readout showed above the bottom-left status bar. It was the HUD's SpeedometerPanel: PlayerActivatorRelay turns it on, and its `Speedometer` script wasn't ported, so it stayed on.
+- Ported `Speedometer.OnEnable` (`hud.rs`): the object stays active only when the `speedometer` pref is above 0 (default 0; the user's prefs don't set it). The readout itself (FixedUpdate) is not ported.
+- `hud_probe` now turns SpeedometerPanel on as the relay does: with the user's prefs it goes inactive with 0 draws; with `speedometer=1` it stays active with 2 draws.
