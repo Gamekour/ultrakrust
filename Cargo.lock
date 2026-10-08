@@ -5176,6 +5176,7 @@ version = "0.1.0"
 dependencies = [
  "ab_glyph",
  "bevy_math",
+ "gltf",
  "lz4_flex",
  "lzma-rs",
  "naga",

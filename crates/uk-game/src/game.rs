@@ -1822,6 +1822,15 @@ impl Game {
         }
     }
 
+    /// A custom map (`--map`) has no PlayerActivator trigger: the player starts activated, the
+    /// way 0-1's does on entering it (ActivateObjects, StartTimer), and the level starts.
+    pub fn start_custom_map(&mut self) {
+        self.s.player.activated = true;
+        self.relay_reset_activate();
+        self.start_level(true);
+        self.stats_start_timer();
+    }
+
     /// FinalDoorOpener.GoTime
     fn final_door_go_time(&mut self, sc: u32) {
         let Script::FinalDoorOpener { opened, opening, start_timer, .. } = &mut self.s.scripts[sc as usize] else { return };

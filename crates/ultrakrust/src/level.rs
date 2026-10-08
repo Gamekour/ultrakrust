@@ -61,8 +61,20 @@ pub fn load(
     let t0 = std::time::Instant::now();
     let install = uk_assets::find_install().ok_or("ULTRAKILL install not found (set ULTRAKILL_DIR)")?;
     let mut db = AssetDb::open(&install).map_err(|e| e.to_string())?;
-    let path = AssetDb::bundle_dir(&install).join(format!("campaign_scenes_level{level}.bundle"));
-    let def = Arc::new(scenedef::load_scene(&mut db, &path).map_err(|e| e.to_string())?);
+    // "map:<file.gltf|glb>": a custom map on top of 0-1's player and managers
+    let custom = level.strip_prefix("map:");
+    let base = custom.map_or(level, |_| "0-1");
+    let path = AssetDb::bundle_dir(&install).join(format!("campaign_scenes_level{base}.bundle"));
+    let mut def = scenedef::load_scene(&mut db, &path).map_err(|e| e.to_string())?;
+    if let Some(map) = custom {
+        let (d, report) = uk_assets::gltf_map::custom_scene(&mut db, def, std::path::Path::new(map)).map_err(|e| e.to_string())?;
+        info!("custom map {map}: {} nodes, {} renderers ({} tris), {} colliders, {} lights", report.nodes, report.renderers, report.tris, report.colliders, report.lights);
+        for w in &report.warnings {
+            warn!("custom map: {w}");
+        }
+        def = d;
+    }
+    let def = Arc::new(def);
     // the player's own Preferences (read-only); UNITY_PREFS=pixelization=4,dithering=0.5 overrides
     // keys for this run
     let mut prefs = uk_assets::prefs::Prefs::load(&install);
@@ -84,6 +96,9 @@ pub fn load(
     }
     info!("underwater default color {:?}", game.underwater_default);
     game.set_ui(uk_assets::ui::load_ui_assets(&mut db, &def));
+    if custom.is_some() {
+        game.start_custom_map();
+    }
 
     let mut mat_cache: HashMap<MaterialKey, Handle<StandardMaterial>> = HashMap::new();
     let mut tex_cache: HashMap<(String, i64), Option<(Handle<Image>, bool)>> = HashMap::new();

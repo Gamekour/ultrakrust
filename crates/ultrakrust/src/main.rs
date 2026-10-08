@@ -155,7 +155,9 @@ fn setup(
     let args: Vec<String> = std::env::args().collect();
     // ULTRAKILL's own shaders by default; `--legacy-render` keeps the old Bevy-PBR stand-in
     let unity_shaders = !args.iter().any(|a| a == "--legacy-render");
-    let level_arg = args.iter().position(|a| a == "--level").and_then(|i| args.get(i + 1)).cloned();
+    // `--map <file.glb>`: a custom glTF map (Godot import suffixes, see uk_assets::gltf_map)
+    let map_arg = args.iter().position(|a| a == "--map").and_then(|i| args.get(i + 1)).map(|m| format!("map:{m}"));
+    let level_arg = map_arg.or_else(|| args.iter().position(|a| a == "--level").and_then(|i| args.get(i + 1)).cloned());
     let want_level = !args.iter().any(|a| a == "--sandbox");
     let all_weapons = args.iter().any(|a| a == "--all-weapons");
     let tour_dir = args.iter().position(|a| a == "--tour").and_then(|i| args.get(i + 1)).map(std::path::PathBuf::from);

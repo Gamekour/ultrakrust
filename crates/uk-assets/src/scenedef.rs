@@ -346,6 +346,150 @@ pub struct SceneDef {
 }
 
 impl SceneDef {
+    /// Drops every node `keep` rejects (and its subtree) with everything attached to it, remapping
+    /// node / collider / script / particle-system indices. Baked navmeshes are cleared.
+    pub fn retain_nodes(&mut self, keep: impl Fn(u32) -> bool) {
+        let n = self.nodes.len();
+        let mut kept = vec![false; n];
+        // parents come before children in load order isn't guaranteed: walk ancestors
+        for i in 0..n {
+            let mut k = keep(i as u32);
+            let mut p = self.nodes[i].parent;
+            while k {
+                let Some(q) = p else { break };
+                k = keep(q);
+                p = self.nodes[q as usize].parent;
+            }
+            kept[i] = k;
+        }
+        let mut map = vec![None; n];
+        let mut c = 0u32;
+        for i in 0..n {
+            if kept[i] {
+                map[i] = Some(c);
+                c += 1;
+            }
+        }
+        let m = |x: u32| map[x as usize];
+        let nodes = std::mem::take(&mut self.nodes);
+        self.nodes = nodes
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| kept[*i])
+            .map(|(_, mut nd)| {
+                nd.parent = nd.parent.and_then(m);
+                nd.children = nd.children.iter().filter_map(|&c| m(c)).collect();
+                nd
+            })
+            .collect();
+        self.renderers.retain(|r| kept[r.node as usize]);
+        for r in &mut self.renderers {
+            r.node = m(r.node).unwrap();
+            if let Some(s) = &r.skin {
+                r.skin = Some(Arc::new(SkinDef { mesh: s.mesh.clone(), bones: s.bones.iter().map(|b| b.and_then(m)).collect() }));
+            }
+        }
+        let remap_list = |len: usize, keep: &dyn Fn(usize) -> bool| {
+            let mut out = vec![None; len];
+            let mut c = 0u32;
+            for (i, o) in out.iter_mut().enumerate() {
+                if keep(i) {
+                    *o = Some(c);
+                    c += 1;
+                }
+            }
+            out
+        };
+        let cmap = remap_list(self.colliders.len(), &|i| kept[self.colliders[i].node as usize]);
+        self.colliders.retain(|x| kept[x.node as usize]);
+        for x in &mut self.colliders {
+            x.node = m(x.node).unwrap();
+        }
+        self.comp_to_collider = self.comp_to_collider.iter().filter_map(|(&k, &v)| Some((k, cmap[v as usize]?))).collect();
+        let smap = remap_list(self.scripts.len(), &|i| kept[self.scripts[i].node as usize]);
+        self.scripts.retain(|x| kept[x.node as usize]);
+        for x in &mut self.scripts {
+            x.node = m(x.node).unwrap();
+        }
+        self.comp_to_script = self.comp_to_script.iter().filter_map(|(&k, &v)| Some((k, smap[v as usize]?))).collect();
+        self.script_prefabs = std::mem::take(&mut self.script_prefabs).into_iter().filter_map(|((s, f), v)| Some(((smap[s as usize]?, f), v))).collect();
+        self.script_nested = std::mem::take(&mut self.script_nested).into_iter().filter_map(|((s, f), v)| Some(((smap[s as usize]?, f), v))).collect();
+        self.obj_to_node = self.obj_to_node.iter().filter_map(|(&k, &v)| Some((k, m(v)?))).collect();
+        self.rigidbodies = self.rigidbodies.iter().filter_map(|&v| m(v)).collect();
+        self.dynamic_rigidbodies = self.dynamic_rigidbodies.iter().filter_map(|&v| m(v)).collect();
+        self.nav_agents.retain(|x| kept[x.node as usize]);
+        for x in &mut self.nav_agents {
+            x.node = m(x.node).unwrap();
+        }
+        self.navmeshes.clear();
+        self.lights.retain(|x| kept[x.node as usize]);
+        for x in &mut self.lights {
+            x.node = m(x.node).unwrap();
+        }
+        self.animators.retain(|x| kept[x.node as usize]);
+        for x in &mut self.animators {
+            x.node = m(x.node).unwrap();
+        }
+        self.ui_natives.retain(|x| kept[x.node as usize]);
+        for x in &mut self.ui_natives {
+            x.node = m(x.node).unwrap();
+        }
+        self.surface_meshes.retain(|x| kept[x.node as usize]);
+        for x in &mut self.surface_meshes {
+            x.node = m(x.node).unwrap();
+        }
+        let pmap = remap_list(self.particle_systems.len(), &|i| kept[self.particle_systems[i].node as usize]);
+        self.particle_systems.retain(|x| kept[x.node as usize]);
+        for x in &mut self.particle_systems {
+            x.node = m(x.node).unwrap();
+            x.shape_node = x.shape_node.and_then(m);
+            x.planes = x.planes.iter().filter_map(|&p| m(p)).collect();
+        }
+        self.comp_to_particle = self.comp_to_particle.iter().filter_map(|(&k, &v)| Some((k, pmap[v as usize]?))).collect();
+    }
+
+    /// Applies a rigid world-space transform to `root`'s subtree and everything baked under it,
+    /// moving the root's local transform (roots only: the parent's frame is identity). Everything
+    /// here is Bevy space, local_* included.
+    pub fn move_root(&mut self, root: u32, d: Mat4) {
+        let under: Vec<bool> = (0..self.nodes.len() as u32).map(|n| self.is_descendant(n, root)).collect();
+        let (_, dr, _) = d.to_scale_rotation_translation();
+        for (i, nd) in self.nodes.iter_mut().enumerate() {
+            if under[i] {
+                nd.world0 = d * nd.world0;
+            }
+        }
+        let w = self.nodes[root as usize].world0;
+        let (_, r, t) = w.to_scale_rotation_translation();
+        self.nodes[root as usize].local_pos = t;
+        self.nodes[root as usize].local_rot = r;
+        let pt = |p: Vec3| d.transform_point3(p);
+        for r in self.renderers.iter_mut().filter(|r| under[r.node as usize]) {
+            for p in &mut r.batch.positions {
+                *p = pt(Vec3::from(*p)).into();
+            }
+            for nm in &mut r.batch.normals {
+                *nm = (dr * Vec3::from(*nm)).into();
+            }
+        }
+        for c in self.colliders.iter_mut().filter(|c| under[c.node as usize]) {
+            match &mut c.shape {
+                ShapeDef::Box { center, rot, .. } => {
+                    *center = pt(*center);
+                    *rot = dr * *rot;
+                }
+                ShapeDef::Sphere { center, .. } => *center = pt(*center),
+                ShapeDef::Capsule { a, b, .. } => {
+                    *a = pt(*a);
+                    *b = pt(*b);
+                }
+                ShapeDef::Mesh(t) => t.iter_mut().flatten().for_each(|p| *p = pt(*p)),
+            }
+        }
+        for s in self.surface_meshes.iter_mut().filter(|s| under[s.node as usize]) {
+            s.tris.iter_mut().flatten().for_each(|p| *p = pt(*p));
+        }
+    }
     /// Node referenced by a PPtr to a GameObject or any component in the scene file.
     pub fn node_ref(&self, v: &Value) -> Option<u32> {
         let (f, id) = v.pptr();

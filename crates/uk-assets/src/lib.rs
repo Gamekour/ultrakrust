@@ -7,6 +7,7 @@ pub mod anim;
 pub mod bundle;
 mod common_strings;
 pub mod db;
+pub mod gltf_map;
 pub mod input;
 pub mod mesh;
 pub mod prefs;
