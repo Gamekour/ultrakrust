@@ -3,8 +3,9 @@
 //! approximation of Unity's NavMeshAgent (no navmesh yet).
 
 use crate::game::{Game, GameEvent};
+use crate::particles::{look_rotation, to_unity, unity_euler, GoreType, FLIP};
 use crate::scripts::Script;
-use bevy_math::{Affine3A, Quat, Vec3};
+use bevy_math::{Affine3A, Mat4, Quat, Vec3};
 use uk_assets::scenedef::{tags, SceneDef, ShapeDef};
 use uk_core::collide::{BoxCollider, Capsule, Shape, Triangle};
 use uk_core::consts::{FIXED_DT, GRAVITY};
@@ -32,6 +33,17 @@ pub enum HitZone {
 pub struct Hitbox {
     pub shape: ShapeDef,
     pub zone: HitZone,
+    /// the collider (index into `SceneDef::colliders`) and its GameObject
+    pub collider: u32,
+    pub node: u32,
+}
+
+/// The GameObject a hit landed on (DamageData.hitTarget).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HitTarget {
+    pub zone: HitZone,
+    pub node: u32,
+    pub collider: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -90,6 +102,12 @@ pub struct Enemy {
     pub was_grounded: bool,
     /// seconds off the ground (step-down flicker is not a fall)
     pub air_t: f32,
+    /// Enemy.thickLimbs: blood spawns at the hit collider's closest point to the player
+    pub thick_limbs: bool,
+    /// the starting health (MaliciousFace.maxHealth)
+    pub max_health: f32,
+    /// level time of death (GoLimp invokes StopHealing after 1 s, except on Mindflayers)
+    pub died_at: Option<f64>,
 }
 
 /// NavMeshAgent settings in world units.
@@ -135,6 +153,10 @@ impl Enemy {
             Kind::Other
         };
         let eid = &def.scripts[eid_script as usize].data;
+        let thick_limbs = def
+            .scripts_on(node)
+            .find(|(_, s)| s.class == "Enemy" || s.class == "SpiderBody")
+            .is_some_and(|(_, s)| s.data.get("thickLimbs").bool());
         let health = def
             .scripts_on(node)
             .find(|(_, s)| s.class == "Enemy" || s.class == "SpiderBody" || s.class == "MaliciousFace")
@@ -150,7 +172,7 @@ impl Enemy {
         let mut center_y = 1.0;
         let mut hitboxes = Vec::new();
         let mut bite_damage = 30;
-        for (_, c) in def.colliders.iter().enumerate() {
+        for (ci, c) in def.colliders.iter().enumerate() {
             if !nodes.contains(&c.node) {
                 continue;
             }
@@ -178,7 +200,7 @@ impl Enemy {
                 tags::LIMB | tags::END_LIMB => HitZone::Limb,
                 _ => HitZone::Body,
             };
-            hitboxes.push(Hitbox { shape: c.shape.clone(), zone });
+            hitboxes.push(Hitbox { shape: c.shape.clone(), zone, collider: ci as u32, node: c.node });
         }
         for (_, s) in def.scripts.iter().enumerate().filter(|(_, s)| s.class == "SwingCheck2" && nodes.contains(&s.node)) {
             bite_damage = s.data.get("damage").i64() as i32;
@@ -238,6 +260,9 @@ impl Enemy {
             damaging: false,
             was_grounded: true,
             air_t: 0.0,
+            thick_limbs,
+            max_health: health,
+            died_at: None,
         })
     }
 
@@ -256,13 +281,32 @@ impl Enemy {
         self.pos + Vec3::Y * self.center_y
     }
 
-    /// Ray against this enemy's hitboxes (world space). Returns (distance, zone).
-    pub fn raycast(&self, o: Vec3, d: Vec3, max: f32) -> Option<(f32, HitZone)> {
+    /// Can weapons hit it: alive, or a Malicious Face corpse (its colliders stay).
+    pub fn hittable(&self) -> bool {
+        self.alive || (self.kind == Kind::MaliciousFace && (self.corpse_falling || self.corpse_landed))
+    }
+
+    /// The root GameObject as the hit target (projectiles, the punch's sphere fallback).
+    pub fn root_target(&self, def: &SceneDef) -> HitTarget {
+        let zone = match def.nodes[self.node as usize].tag {
+            tags::HEAD => HitZone::Head,
+            tags::LIMB | tags::END_LIMB => HitZone::Limb,
+            _ => HitZone::Body,
+        };
+        HitTarget { zone, node: self.node, collider: self.hitboxes.iter().find(|h| h.node == self.node).map(|h| h.collider) }
+    }
+
+    /// Ray against this enemy's hitboxes (world space). Returns (distance, target).
+    pub fn raycast(&self, o: Vec3, d: Vec3, max: f32) -> Option<(f32, HitTarget)> {
         let inv = self.delta().inverse();
         let lo = inv.transform_point3(o);
         let ld = inv.transform_vector3(d);
-        let mut best: Option<(f32, HitZone)> = None;
+        let mut best: Option<(f32, HitTarget)> = None;
         for h in &self.hitboxes {
+            // a landed Malicious Face corpse has lost its root SphereCollider
+            if !self.alive && self.corpse_landed && h.node == self.node {
+                continue;
+            }
             let t = match &h.shape {
                 ShapeDef::Box { center, half, rot } => {
                     // a ray starting inside still counts (point blank)
@@ -275,7 +319,7 @@ impl Enemy {
             };
             if let Some(t) = t {
                 if best.is_none_or(|b| t < b.0 || (t - b.0 < 0.05 && h.zone == HitZone::Head)) {
-                    best = Some((t, h.zone));
+                    best = Some((t, HitTarget { zone: h.zone, node: h.node, collider: Some(h.collider) }));
                 }
             }
         }
@@ -520,7 +564,8 @@ pub fn fixed_update(g: &mut Game) {
         for e in 0..g.s.enemies.len() {
             let en = &g.s.enemies[e];
             if en.alive && g.s.active[en.node as usize] && en.center().distance(pos) < en.radius + 1.0 {
-                damage_enemy(g, e, 5.0, HitZone::Body, pos);
+                let target = g.s.enemies[e].root_target(&g.def);
+                damage_enemy(g, e, 5.0, target, pos, "projectile");
                 remove.push(pi);
                 break;
             }
@@ -877,38 +922,186 @@ fn pseudo_rand(x: f32) -> f32 {
 }
 
 
-pub fn damage_enemy(g: &mut Game, e: usize, base: f32, zone: HitZone, hit_pos: Vec3) {
-    let en = &mut g.s.enemies[e];
-    if !en.alive {
+/// Enemy.GetHurt (Standard difficulty, critMultiplier 1) with the blood it spawns
+/// (HandleBloodSelection, ProcessBloodEffects) and the Malicious Face's OnDamage.
+/// `hit_pos` is the world-space (Bevy) hit point, `hitter` DamageData.hitter.
+pub fn damage_enemy(g: &mut Game, e: usize, base: f32, target: HitTarget, hit_pos: Vec3, hitter: &str) {
+    let en = &g.s.enemies[e];
+    if !en.hittable() {
         return;
     }
     let mut m = base;
-    // Enemy.GetHurt: zombies take x1.5 in the air
-    if matches!(en.kind, Kind::Filth | Kind::Stray) && !en.grounded {
+    // zombies take x1.5 in the air
+    if matches!(en.kind, Kind::Filth | Kind::Stray) && !en.grounded && hitter != "fire" {
         m *= 1.5;
     }
-    let limb = match zone {
+    // knockback
+    let push = (en.center() - g.s.player.pos).normalize_or_zero();
+    if en.alive {
+        g.s.enemies[e].vel += Vec3::new(push.x, 0.3, push.z) * 4.0 * base;
+    }
+    // MaliciousFace.OnDamage -> HandleSpiderDamage (cancels the hit on a corpse)
+    if g.s.enemies[e].kind == Kind::MaliciousFace && malicious_face_on_damage(g, e, target, m, hitter) {
+        return;
+    }
+    let limb = match target.zone {
         HitZone::Head => 1.0,
         HitZone::Limb => 0.5,
         HitZone::Body => 0.0,
     };
     let crit = 1.0;
     let dmg = m + m * limb * crit;
+    let en = &mut g.s.enemies[e];
     en.health -= dmg;
-    // knockback
-    let push = (en.center() - g.s.player.pos).normalize_or_zero();
-    en.vel += Vec3::new(push.x, 0.3, push.z) * 4.0 * base;
-    let pos = en.center();
-    let head = zone == HitZone::Head;
     let dead = en.health <= 0.0;
-    g.events.push(GameEvent::EnemyHit { pos: hit_pos, damage: dmg, head });
-    // Blood within reach heals (Bloodsplatter: 3 per hit, 10 for big splashes)
-    if pos.distance(g.s.player.pos) < 9.0 {
-        g.heal_player(if dead || head { 10 } else { 3 });
-    }
+    let gore = blood_selection(g, e, target, dmg, hitter);
+    g.events.push(GameEvent::EnemyHit { pos: hit_pos, damage: dmg, head: target.zone == HitZone::Head });
     if dead {
         kill_enemy(g, e);
     }
+    if let Some(gi) = gore {
+        process_blood_effects(g, e, gi, target, hitter);
+    }
+}
+
+/// Enemy.HandleBloodSelection (`health` is after the subtraction). eid.underwater, sandified and
+/// blessed are not tracked for enemies, so the gore is always the plain kind.
+fn blood_selection(g: &mut Game, e: usize, target: HitTarget, damage: f32, hitter: &str) -> Option<usize> {
+    if hitter == "fire" || damage <= 0.0 {
+        return None;
+    }
+    let tag = g.def.nodes[target.node as usize].tag;
+    let flag = damage >= 1.0 || g.s.enemies[e].health <= 0.0;
+    let explosion = hitter == "explosion";
+    let got = if (tag == tags::HEAD && flag) || hitter == "hammer" || hitter == "heavypunch" {
+        GoreType::Head
+    } else if (explosion && tag == tags::END_LIMB) || (flag && !explosion) {
+        if tag == tags::BODY { GoreType::Body } else { GoreType::Limb }
+    } else if !explosion {
+        GoreType::Small
+    } else {
+        return None;
+    };
+    g.get_gore(got, false, false)
+}
+
+/// `target.transform.position` (Unity space).
+fn target_position(g: &Game, target: HitTarget) -> Vec3 {
+    g.node_world_now(target.node).w_axis.truncate()
+}
+
+/// Enemy.noheal: StopHealing runs 1 s after GoLimp (every enemy here; Mindflayers are exempt).
+fn noheal(g: &Game, e: usize) -> bool {
+    g.s.enemies[e].died_at.is_some_and(|t| g.s.time >= t + 1.0)
+}
+
+/// Enemy.ProcessBloodEffects.
+fn process_blood_effects(g: &mut Game, e: usize, gi: usize, target: HitTarget, hitter: &str) {
+    let en = &g.s.enemies[e];
+    // IsMachine() || IsSpider() with thickLimbs: the closest point of the hit collider to the
+    // player (no machines are ported; the Malicious Face is a spider)
+    let mut at = None;
+    if en.kind == Kind::MaliciousFace && en.thick_limbs {
+        if let Some(ci) = target.collider {
+            let c = &g.def.colliders[ci as usize];
+            // the collider's current pose relative to its load pose (Bevy space)
+            let xf = FLIP * g.node_world_now(c.node) * FLIP * g.def.nodes[c.node as usize].world0.inverse();
+            let p = xf.inverse().transform_point3(g.s.player.pos);
+            at = Some(to_unity(xf.transform_point3(crate::game::shape_closest_point(&c.shape, p))));
+        }
+    }
+    let at = at.unwrap_or_else(|| target_position(g, target));
+    let noheal = noheal(g, e);
+    let fx = &mut g.fx.effects[gi];
+    fx.pos = at;
+    if hitter == "drill" {
+        fx.scale *= 2.0;
+    }
+    let Some(sp) = fx.splatter.as_mut() else { return };
+    if hitter == "shotgun" || hitter == "shotgunzone" || hitter == "explosion" {
+        // (its 50% particle-collision toggle changes nothing: the collision module is not simulated)
+        sp.hp = 3;
+    } else if hitter == "nail" {
+        sp.hp = 1;
+    }
+    if !noheal {
+        sp.ready = true;
+    }
+}
+
+/// MaliciousFace.HandleSpiderDamage. Returns true when the hit is cancelled (a corpse).
+fn malicious_face_on_damage(g: &mut Game, e: usize, target: HitTarget, damage: f32, hitter: &str) -> bool {
+    let (node, health, max_health, alive) = {
+        let en = &g.s.enemies[e];
+        (en.node, en.health, en.max_health, en.alive)
+    };
+    let at = target_position(g, target);
+    // Instantiate(bsm.GetGore(Small)): the pooled original activates (and plays) where it was
+    // left; the copy goes to the hit target
+    let small = |g: &mut Game| -> Option<usize> {
+        let orig = g.get_gore(GoreType::Small, false, false)?;
+        let c = g.fx_clone(orig);
+        let fx = &mut g.fx.effects[c];
+        fx.pos = at;
+        if hitter == "drill" {
+            fx.scale *= 2.0;
+        }
+        Some(c)
+    };
+    if !alive {
+        if hitter != "fire" {
+            if let Some(c) = small(g) {
+                if let Some(sp) = g.fx.effects[c].splatter.as_mut() {
+                    if damage >= 1.0 {
+                        sp.hp = 30;
+                    }
+                    if health > 0.0 {
+                        sp.ready = true;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+    let script = g.def.scripts_on(node).find(|(_, s)| s.class == "MaliciousFace").map(|(i, _)| i);
+    let prefab = |g: &Game, field: &str| script.and_then(|s| g.def.script_prefabs.get(&(s, field.to_string())).copied());
+    if hitter != "fire" {
+        if let Some(c) = small(g) {
+            if let Some(sp) = g.fx.effects[c].splatter.as_mut() {
+                if health > 0.0 {
+                    sp.ready = true;
+                }
+                if hitter == "nail" {
+                    sp.hp = 3;
+                } else if damage >= 1.0 {
+                    sp.hp = 30;
+                }
+            }
+            if g.fx.gore_on {
+                g.fx_play(c);
+            }
+        }
+        if hitter != "shotgun" && hitter != "drill" && g.active(node) {
+            if let Some(p) = prefab(g, "dripBlood") {
+                // Instantiate at the hit target, parent to the face, LookAt(face), Rotate(180, 180, 180)
+                let face = g.node_world_now(node);
+                let rot = look_rotation(face.w_axis.truncate() - at) * unity_euler(Vec3::splat(180.0));
+                let d = g.fx_instantiate(p, at, rot);
+                let scale = g.fx.effects[d].scale;
+                g.fx.effects[d].attach = Some((node, face.inverse() * Mat4::from_scale_rotation_translation(scale, rot, at)));
+                if g.fx.gore_on {
+                    g.fx_play(d);
+                }
+            }
+        }
+    }
+    if health >= max_health / 2.0 && health - damage < max_health / 2.0 {
+        if let Some(p) = prefab(g, "woundedParticle") {
+            let pos = g.node_world_now(node).w_axis.truncate();
+            g.fx_instantiate(p, pos, Quat::IDENTITY);
+        }
+    }
+    false
 }
 
 pub fn kill_enemy(g: &mut Game, e: usize) {
@@ -918,6 +1111,7 @@ pub fn kill_enemy(g: &mut Game, e: usize) {
     }
     en.alive = false;
     en.attacking = false;
+    en.died_at = Some(g.s.time);
     let (node, aod, pos) = (en.node, en.activate_on_death.clone(), en.center());
     g.s.kills += 1;
     g.events.push(GameEvent::EnemyKilled { pos });
@@ -953,9 +1147,9 @@ impl Game {
         let max = 1000.0;
         let env = self.world.raycast(eye, dir, max);
         let env_t = env.map(|h| h.distance).unwrap_or(max);
-        let mut hits: Vec<(f32, usize, HitZone)> = Vec::new();
+        let mut hits: Vec<(f32, usize, HitTarget)> = Vec::new();
         for (i, en) in self.s.enemies.iter().enumerate() {
-            if !en.alive || !self.s.active[en.node as usize] || en.spawn_t > 0.0 {
+            if !en.hittable() || !self.s.active[en.node as usize] || en.spawn_t > 0.0 {
                 continue;
             }
             if let Some((t, z)) = en.raycast(eye, dir, env_t) {
@@ -967,12 +1161,12 @@ impl Game {
         let mut end = eye + dir * env_t;
         if pierce {
             for (t, i, z) in hits {
-                damage_enemy(self, i, damage, z, eye + dir * t);
+                damage_enemy(self, i, damage, z, eye + dir * t, "revolver");
             }
             self.hit_environment(env, damage);
         } else if let Some(&(t, i, z)) = hits.first() {
             end = eye + dir * t;
-            damage_enemy(self, i, damage, z, end);
+            damage_enemy(self, i, damage, z, end, "revolver");
         } else {
             self.hit_environment(env, damage);
         }
@@ -1042,15 +1236,15 @@ impl Game {
             self.events.push(GameEvent::PunchHit);
             return;
         }
-        let mut best: Option<(f32, usize, HitZone)> = None;
+        let mut best: Option<(f32, usize, HitTarget)> = None;
         for (i, en) in self.s.enemies.iter().enumerate() {
-            if !en.alive || !self.s.active[en.node as usize] || en.spawn_t > 0.0 {
+            if !en.hittable() || !self.s.active[en.node as usize] || en.spawn_t > 0.0 {
                 continue;
             }
             let hit = en.raycast(eye, dir, 4.0).or_else(|| {
                 let c = en.center();
                 let t = (c - eye).dot(dir).clamp(0.0, 4.0);
-                ((eye + dir * t).distance(c) < 1.0 + en.radius).then_some((t, HitZone::Body))
+                ((eye + dir * t).distance(c) < 1.0 + en.radius).then_some((t, en.root_target(&self.def)))
             });
             if let Some((t, z)) = hit {
                 if best.is_none_or(|b| t < b.0) {
@@ -1059,7 +1253,7 @@ impl Game {
             }
         }
         if let Some((t, i, z)) = best {
-            damage_enemy(self, i, 1.0, z, eye + dir * t);
+            damage_enemy(self, i, 1.0, z, eye + dir * t, "punch");
             self.events.push(GameEvent::PunchHit);
             return;
         }

@@ -249,6 +249,8 @@ pub struct Game {
     scripts_by_node: Vec<Vec<u32>>,
     pub unknown_calls: std::collections::BTreeSet<String>,
     pub anim: crate::anim::Anim,
+    /// live particle effects and the gore pools
+    pub fx: crate::particles::Fx,
     /// Viewmodel roots GunSetter / FistControl instantiated (layer 13): the revolver shows once owned.
     pub vm_revolver: Option<u32>,
     /// StatsManager.fr: the FinalRank results panel, hidden in Start and shown by SendInfo
@@ -538,6 +540,7 @@ impl Game {
             scripts_by_node,
             unknown_calls: Default::default(),
             anim,
+            fx: Default::default(),
             vm_revolver: def.scripts.iter().find(|s| s.class == "Revolver" && s.file.is_some()).map(|s| s.node),
             final_rank: def.scripts.iter().find(|s| s.class == "FinalRank").map(|s| s.node),
             vm_rigs: (None, None),
@@ -622,6 +625,7 @@ impl Game {
         g.run_starts();
         g.sync_world();
         enemy::bind_rigs(&mut g);
+        g.fx_init();
         g.start = Some(Box::new(g.s.clone()));
         g
     }
@@ -1981,7 +1985,37 @@ impl Game {
 
     // ---------------------------------------------------------------- triggers
 
-    fn trigger_contains(&self, ci: u32, cap: &Capsule) -> bool {
+    /// Every collider of a Water object whose GameObject is active and collider enabled.
+    pub(crate) fn waters_colliders(&self) -> Vec<u32> {
+        self.waters
+            .iter()
+            .flat_map(|w| w.colliders.iter().copied())
+            .filter(|&ci| self.s.active[self.def.colliders[ci as usize].node as usize] && self.s.collider_enabled[ci as usize])
+            .collect()
+    }
+
+    /// Collider.ClosestPointOnBounds: `p` clamped to the collider's current world AABB.
+    pub(crate) fn collider_bounds_closest(&self, ci: u32, p: Vec3) -> Vec3 {
+        let c = &self.def.colliders[ci as usize];
+        let pts: Vec<Vec3> = match &c.shape {
+            ShapeDef::Box { center, half, rot } => (0..8)
+                .map(|k| *center + *rot * (*half * Vec3::new(if k & 1 == 0 { -1.0 } else { 1.0 }, if k & 2 == 0 { -1.0 } else { 1.0 }, if k & 4 == 0 { -1.0 } else { 1.0 })))
+                .collect(),
+            ShapeDef::Sphere { center, radius } => vec![*center - Vec3::splat(*radius), *center + Vec3::splat(*radius)],
+            ShapeDef::Capsule { a, b, radius } => vec![*a - Vec3::splat(*radius), *a + Vec3::splat(*radius), *b - Vec3::splat(*radius), *b + Vec3::splat(*radius)],
+            ShapeDef::Mesh(tris) => tris.iter().flatten().copied().collect(),
+        };
+        let xf = self.node_mover[c.node as usize].map_or(Affine3A::IDENTITY, |m| self.mover_delta(m));
+        let (mut lo, mut hi) = (Vec3::MAX, Vec3::MIN);
+        for q in pts {
+            let q = xf.transform_point3(q);
+            lo = lo.min(q);
+            hi = hi.max(q);
+        }
+        p.clamp(lo, hi)
+    }
+
+    pub(crate) fn trigger_contains(&self, ci: u32, cap: &Capsule) -> bool {
         let c = &self.def.colliders[ci as usize];
         let (a, b) = match self.node_mover[c.node as usize] {
             Some(m) => {
@@ -2438,6 +2472,7 @@ impl Game {
             }
         }
         enemy::fixed_update(self);
+        self.fx_fixed_update();
     }
 
     /// Unity Update (once per rendered frame).
@@ -2549,6 +2584,7 @@ impl Game {
         let ev0 = self.events.len();
         crate::anim::update(self, dt);
         enemy::anim_events(self, ev0);
+        self.fx_update(dt);
     }
 
     /// Weapons: the real game unlocks them from save progress (GunSetter); here picking up
@@ -2593,7 +2629,7 @@ pub(crate) fn view_quat(yaw: f32, pitch: f32) -> Quat {
 }
 
 /// Collider.ClosestPoint for a collider definition (load pose): the point itself when inside.
-fn shape_closest_point(shape: &ShapeDef, p: Vec3) -> Vec3 {
+pub(crate) fn shape_closest_point(shape: &ShapeDef, p: Vec3) -> Vec3 {
     match shape {
         ShapeDef::Box { center, half, rot } => BoxCollider { center: *center, half: *half, rot: *rot, slippery: false }.closest_point(p),
         ShapeDef::Sphere { center, radius } => *center + (p - *center).clamp_length_max(*radius),

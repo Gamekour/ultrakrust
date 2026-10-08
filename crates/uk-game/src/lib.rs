@@ -11,6 +11,7 @@ pub mod hud;
 pub mod hudmsg;
 pub mod nav;
 pub mod parity;
+pub mod particles;
 pub mod scripts;
 pub mod tmp;
 pub mod ugui;

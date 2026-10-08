@@ -12,6 +12,7 @@ pub mod mesh;
 pub mod prefs;
 pub mod navmesh;
 pub mod nrbf;
+pub mod particles;
 pub mod reader;
 pub mod save;
 pub mod scene;

@@ -59,6 +59,12 @@ pub const PORTED: &[(&str, Port)] = &[
     ("MaliciousFace", Port::Partial("see SpiderBody")),
     ("Projectile", Port::Partial("basic straight projectile")),
     ("SwingCheck2", Port::DataOnly),
+    // hit effects (particles.rs)
+    ("BloodsplatterManager", Port::Partial("pools + GetGore; no underwater/sand/blessed gore (eid flags not tracked), no bloodstain decals")),
+    ("Bloodsplatter", Port::Partial("play on enable, heal sphere, repool when stopped; particle collisions only counted (no stains, no sound)")),
+    ("BloodUnderwaterChecker", Port::Full),
+    ("RemoveOnTime", Port::Full),
+    ("PortalAwareParticleSystem", Port::Partial("environment raycast kill; no portals")),
     // uGUI (ugui.rs, tmp.rs)
     ("Image", Port::Partial("Simple/Sliced/Tiled/Filled; useSpriteMesh drawn as a quad; no layout element sizes")),
     ("RawImage", Port::Full),
@@ -117,7 +123,8 @@ pub const NATIVE: &[(i32, &str, f64)] = &[
     (108, "Light", 0.05),
     (157, "LightmapSettings", 0.0),
     (104, "RenderSettings", 0.1),
-    (198, "ParticleSystem", 0.0),
+    (198, "ParticleSystem", 0.4), // runtime effect prefabs: initial/shape/emission/colour/size/rotation/velocity/trail; no collision, noise, sub-emitters, texture sheet; scene-placed systems not run
+    (199, "ParticleSystemRenderer", 0.4), // billboard mode only, view alignment, size clamp; sortingFudge ignored
     (96, "TrailRenderer", 0.0),
     (120, "LineRenderer", 0.05),
     (212, "SpriteRenderer", 0.0),

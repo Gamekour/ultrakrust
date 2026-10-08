@@ -100,6 +100,7 @@ pub struct DrawState {
 
 pub const STENCIL_OFF: [u8; 6] = [255, 255, 0, 0, 0, 8];
 
+#[derive(Clone)]
 pub struct Draw {
     pub node: u32,
     pub enabled: bool,
@@ -120,6 +121,8 @@ pub struct Draw {
     pub hud: bool,
     /// RenderSettings' skybox: a sphere around the camera, drawn first behind everything.
     pub sky: bool,
+    /// A particle slot: world-space geometry rebuilt every frame (`UnityFrame::particles`).
+    pub particle: bool,
 }
 
 pub struct SkinDraw {
@@ -161,6 +164,29 @@ pub struct SceneData {
     pub outline: Option<OutlineDef>,
     pub prefs: GraphicsPrefs,
     pub ui: Option<UiScene>,
+    /// particle / trail material -> its draw slots (one ParticleSystemRenderer each per frame)
+    pub particle_slots: HashMap<(String, i64), Vec<usize>>,
+}
+
+/// Draw slots per particle material: the most renderers using one material drawn separately in a
+/// frame (more share the last slot).
+const PARTICLE_SLOTS: usize = 64;
+
+/// One ParticleSystemRenderer's geometry this frame (Unity space), expanded against the camera in
+/// prepare.
+#[derive(Clone, Default)]
+pub struct ParticleDraw {
+    pub slot: usize,
+    /// the renderer's bounds centre (transparent sorting, culling) and radius
+    pub center: Vec3,
+    pub radius: f32,
+    /// ParticleSystemRenderer min / maxParticleSize (fractions of the viewport height)
+    pub min_size: f32,
+    pub max_size: f32,
+    /// billboards: position, size, rotation (radians), color
+    pub quads: Vec<(Vec3, f32, f32, [f32; 4])>,
+    /// trails, head first: position, width, color, u
+    pub strips: Vec<Vec<(Vec3, f32, [f32; 4], f32)>>,
 }
 
 /// The shader globals GraphicsSettings / PostProcessV2_Handler derive from the player's prefs.
@@ -284,6 +310,8 @@ pub struct UnityFrame {
     pub noise: Option<f32>,
     /// the HUD Camera's current world matrix (Bevy space; NewMovement's HUD sway moves it)
     pub hud_cam: Option<Mat4>,
+    /// this frame's particle and trail geometry per slot
+    pub particles: Arc<Vec<ParticleDraw>>,
 }
 
 impl UnityFrame {
@@ -573,9 +601,41 @@ pub fn build(
     let simplifiers: HashMap<u32, bool> =
         def.scripts.iter().filter(|s| s.class == "EnemySimplifier" && s.enabled).map(|s| (s.node, s.data.get("neverOutlineAndRemoveSimplifier").i64() != 0)).collect();
     let mut simplified: HashMap<(String, i64, bool), Arc<MaterialProps>> = HashMap::new();
-    for (ri, r) in def.renderers.iter().chain(sky_def.iter()).enumerate() {
-        let sky = ri == def.renderers.len();
-        if r.batch.indices.is_empty() || (!sky && skip_node(r.node)) {
+    // every particle / trail material the effect prefabs use: a template draw (a quad fixing the
+    // vertex layout), copied into PARTICLE_SLOTS slots below
+    let mut particle_keys: Vec<uk_assets::scene::MaterialKey> = Vec::new();
+    for pf in &def.particle_prefabs {
+        for r in pf.nodes.iter().filter_map(|n| n.renderer.as_ref()) {
+            for k in r.materials.iter().flatten() {
+                if !particle_keys.iter().any(|q| q.file == k.file && q.path_id == k.path_id) {
+                    particle_keys.push(k.clone());
+                }
+            }
+        }
+    }
+    let particle_defs: Vec<uk_assets::scenedef::RenderDef> = particle_keys
+        .iter()
+        .map(|k| uk_assets::scenedef::RenderDef {
+            node: 0,
+            material: Some(k.clone()),
+            batch: uk_assets::scene::Batch {
+                positions: vec![[0.0; 3]; 4],
+                normals: vec![[0.0, 0.0, 1.0]; 4],
+                uvs: vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+                colors: vec![[1.0; 4]; 4],
+                indices: vec![0, 1, 2, 0, 2, 3],
+                src: vec![0, 1, 2, 3],
+            },
+            enabled: false,
+            skin: None,
+        })
+        .collect();
+    let first_particle = def.renderers.len() + sky_def.is_some() as usize;
+    let mut particle_slots: HashMap<(String, i64), Vec<usize>> = HashMap::new();
+    for (ri, r) in def.renderers.iter().chain(sky_def.iter()).chain(particle_defs.iter()).enumerate() {
+        let sky = ri == def.renderers.len() && sky_def.is_some();
+        let particle = ri >= first_particle;
+        if r.batch.indices.is_empty() || (!sky && !particle && skip_node(r.node)) {
             continue;
         }
         let Some(key) = &r.material else { continue };
@@ -769,9 +829,15 @@ pub fn build(
             // animated limbs leave the bind-pose bounds
             radius: (hi - lo).length() * if skin.is_some() { 1.0 } else { 0.5 } + if skin.is_some() { 1.0 } else { 0.0 },
             skin,
-            hud: !sky && def.nodes[r.node as usize].layer == uk_assets::scenedef::VIEWMODEL_LAYER,
+            hud: !sky && !particle && def.nodes[r.node as usize].layer == uk_assets::scenedef::VIEWMODEL_LAYER,
             sky,
+            particle,
         });
+        if particle {
+            let t = draws.len() - 1;
+            let slots: Vec<usize> = (0..PARTICLE_SLOTS).map(|k| if k == 0 { t } else { draws.push(draws[t].clone()); draws.len() - 1 }).collect();
+            particle_slots.insert((key.file.clone(), key.path_id), slots);
+        }
     }
     // the final composite: GameController's PostProcessV2_Handler names the material and dither texture
     let post = (|| {
@@ -974,7 +1040,7 @@ pub fn build(
     sk.sort_by(|a, b| b.1.cmp(&a.1));
     let enemy_draws: Vec<&Draw> = draws.iter().filter(|d| simplifiers.contains_key(&d.node)).collect();
     let summary = format!(
-        "unity shaders: post-process {}, outline {}, sky {} (camera {:?}), enemy simplifiers {} on {} draws ({} write SV_Target1: {:?}), {} variants, {}/{} renderers drawn, {} textures, {} lights; skipped: {:?}; ui: {}",
+        "unity shaders: post-process {}, outline {}, sky {} (camera {:?}), enemy simplifiers {} on {} draws ({} write SV_Target1: {:?}), {} variants, {}/{} renderers drawn, {} textures, {} lights; skipped: {:?}; ui: {}; particle materials {}/{}: {:?}",
         post.as_ref().map_or("missing".to_string(), |p| {
             let n = p.variants.iter().flatten().count();
             let tex: Vec<String> = p.textures.iter().map(|(n, t)| format!("{n} {}x{}", textures[*t as usize].width, textures[*t as usize].height)).collect();
@@ -1003,7 +1069,13 @@ pub fn build(
             u.mats.iter().flatten().map(|m| m.variants.iter().flatten().count()).sum::<usize>(),
             u.mats.iter().zip(&u.assets.materials).filter_map(|(m, a)| m.as_ref().map(|m| (a.name.as_str(), m.state[0].ztest, m.state[0].src, m.state[0].dst, m.state[0].zwrite))).collect::<Vec<_>>(),
             ui_skipped
-        ))
+        )),
+        particle_slots.len(),
+        particle_keys.len(),
+        particle_slots.values().map(|v| {
+            let d = &draws[v[0]];
+            (d.material.name.as_str(), variants[d.variant as usize].label.as_str(), d.queue, d.state.src, d.state.dst, d.state.zwrite, d.state.cull, variants[d.variant as usize].inputs.clone())
+        }).collect::<Vec<_>>()
     );
     let scene = SceneData {
         generation,
@@ -1021,6 +1093,7 @@ pub fn build(
         outline,
         prefs,
         ui,
+        particle_slots,
     };
     (scene, summary)
 }
@@ -1075,13 +1148,101 @@ pub fn skin_rest_error(game: &uk_game::Game, scene: &SceneData) -> (usize, f32) 
 }
 
 /// Per-frame state from the game: what is visible, where movers have moved things, lights.
+/// The live effects' ParticleSystemRenderers: billboards (render mode 0) and trails, in world
+/// space, each renderer in its own slot of its material.
+fn particle_draws(game: &uk_game::Game, scene: &SceneData) -> Vec<ParticleDraw> {
+    let mut out: Vec<ParticleDraw> = Vec::new();
+    let mut used: HashMap<(String, i64), usize> = HashMap::new();
+    let mut slot_of = |out: &mut Vec<ParticleDraw>, key: &uk_assets::scene::MaterialKey, r: &uk_assets::particles::ParticleRendererDef| -> Option<usize> {
+        let slots = scene.particle_slots.get(&(key.file.clone(), key.path_id))?;
+        let n = used.entry((key.file.clone(), key.path_id)).or_default();
+        let slot = slots[(*n).min(slots.len() - 1)];
+        *n += 1;
+        Some(out.iter().position(|d| d.slot == slot).unwrap_or_else(|| {
+            out.push(ParticleDraw { slot, min_size: r.min_particle_size, max_size: r.max_particle_size, ..Default::default() });
+            out.len() - 1
+        }))
+    };
+    for e in game.fx.effects.iter().filter(|e| !e.destroyed && e.active) {
+        let pf = &game.def.particle_prefabs[e.prefab as usize];
+        for sys in &e.systems {
+            if sys.particles.is_empty() || !e.node_active_in_hierarchy(pf, sys.node) {
+                continue;
+            }
+            let Some(r) = pf.nodes[sys.node as usize].renderer.as_ref().filter(|r| r.enabled && r.render_mode == 0) else { continue };
+            let def = &sys.def;
+            let scale = sys.sim_to_world.x_axis.truncate().length();
+            let mut quads = Vec::with_capacity(sys.particles.len());
+            let mut strips = Vec::new();
+            for p in &sys.particles {
+                let pos = sys.sim_to_world.transform_point3(p.pos);
+                let size = p.size(def) * scale;
+                let color = p.color(def);
+                quads.push((pos, size, p.rot, color));
+                let (Some(tr), Some(td)) = (&p.trail, &def.trail) else { continue };
+                // head (the particle) first, then the recorded points newest to oldest
+                let pts: Vec<Vec3> = std::iter::once(pos).chain(tr.points.iter().rev().map(|(q, _)| sys.sim_to_world.transform_point3(*q))).collect();
+                let mut along = vec![0.0f32; pts.len()];
+                for k in 1..pts.len() {
+                    along[k] = along[k - 1] + pts[k].distance(pts[k - 1]);
+                }
+                let total = along.last().copied().unwrap_or(0.0);
+                if pts.len() < 2 || total <= 1e-5 {
+                    continue;
+                }
+                let life = td.color_over_lifetime.eval(p.age / p.lifetime, p.rand[0]);
+                let base = uk_game::particles::mul4(if td.inherit_particle_color { color } else { [1.0; 4] }, life);
+                strips.push(
+                    pts.iter()
+                        .zip(&along)
+                        .map(|(q, a)| {
+                            let u = a / total;
+                            let w = td.width_over_trail.eval(u, p.rand[0]) * if td.size_affects_width { size } else { 1.0 };
+                            (*q, w, uk_game::particles::mul4(base, td.color_over_trail.eval(u, p.rand[0])), u)
+                        })
+                        .collect::<Vec<_>>(),
+                );
+            }
+            if let Some(Some(k)) = r.materials.first() {
+                if let Some(i) = slot_of(&mut out, k, r) {
+                    out[i].quads.extend(quads);
+                }
+            }
+            if let (Some(Some(k)), false) = (r.materials.get(1), strips.is_empty()) {
+                if let Some(i) = slot_of(&mut out, k, r) {
+                    out[i].strips.extend(strips);
+                }
+            }
+        }
+    }
+    for d in &mut out {
+        let (mut lo, mut hi, mut big) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN), 0.0f32);
+        for &(p, s, _, _) in &d.quads {
+            (lo, hi, big) = (lo.min(p), hi.max(p), big.max(s));
+        }
+        for &(p, w, _, _) in d.strips.iter().flatten() {
+            (lo, hi, big) = (lo.min(p), hi.max(p), big.max(w));
+        }
+        d.center = (lo + hi) * 0.5;
+        d.radius = (hi - lo).length() * 0.5 + big;
+    }
+    out
+}
+
 pub fn frame(game: &uk_game::Game, scene: &SceneData, time: f32, screen: [f32; 2]) -> UnityFrame {
     let m = Mat4::from_scale(Vec3::new(1.0, 1.0, -1.0));
-    let visible: Vec<bool> = scene.draws.iter().map(|d| d.sky || (d.enabled && game.active(d.node))).collect();
+    let particles = particle_draws(game, scene);
+    let mut visible: Vec<bool> = scene.draws.iter().map(|d| d.sky || (d.enabled && game.active(d.node))).collect();
+    for p in &particles {
+        visible[p.slot] = true;
+    }
     let object_to_world = scene
         .draws
         .iter()
         .map(|d| {
+            if d.particle {
+                return Mat4::IDENTITY;
+            }
             let mover = match game.node_mover[d.node as usize] {
                 Some(mv) => m * Mat4::from(game.mover_delta(mv)) * m,
                 None => Mat4::IDENTITY,
@@ -1156,6 +1317,7 @@ pub fn frame(game: &uk_game::Game, scene: &SceneData, time: f32, screen: [f32; 2
         vignette: s.vignette,
         noise: s.screen_noise,
         hud_cam: scene.hud_cam.and(game.sway).map(|sw| game.node_world_bevy(sw.hud_cam)),
+        particles: Arc::new(particles),
     }
 }
 
@@ -1196,6 +1358,8 @@ struct UnityGpu {
     light_key: u64,
     /// Draws inside the view frustum this frame.
     in_view: Vec<bool>,
+    /// this frame's particle slots: bounds centre and radius (Unity space)
+    centers: HashMap<usize, (Vec3, f32)>,
     /// One uniform buffer for every draw's constant buffers (256-byte aligned slices) and its CPU copy.
     ubo: Option<Buffer>,
     staging: Vec<u8>,
@@ -1543,6 +1707,23 @@ struct FrameCtx {
 
 /// Unity's legacy vertex lights for one renderer: up to 8, directional first, then by brightness
 /// at the renderer's bounds (Unity's exact importance ordering is engine-internal).
+/// One vertex in a variant's input layout (Unity channels: 0 position, 1 normal, 2 tangent,
+/// 3 color, 4+ texcoords).
+fn push_vertex(out: &mut Vec<u8>, inputs: &[(u32, u32, u32)], p: Vec3, n: Vec3, c: [f32; 4], uv: [f32; 2]) {
+    for &(_, ch, k) in inputs {
+        let v: [f32; 4] = match ch {
+            0 => [p.x, p.y, p.z, 1.0],
+            1 => [n.x, n.y, n.z, 0.0],
+            2 => [1.0, 0.0, 0.0, 1.0],
+            3 => c,
+            _ => [uv[0], uv[1], 0.0, 0.0],
+        };
+        for x in v.iter().take(k as usize) {
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+    }
+}
+
 fn vertex_lights(scene: &SceneData, frame: &UnityFrame, d: &Draw, v: Mat4) -> [[[f32; 4]; 8]; 4] {
     light_block(scene, frame, &pick_lights(scene, frame, d), v)
 }
@@ -1868,7 +2049,7 @@ fn prepare(
             }
             let bg1 = dev.create_bind_group("unity g1", &l1, &e1);
             let vbuf = dev.create_buffer_with_data(&BufferInitDescriptor { label: Some("unity vb"), contents: &d.vertices, usage: BufferUsages::VERTEX | BufferUsages::COPY_DST });
-            let ibuf = dev.create_buffer_with_data(&BufferInitDescriptor { label: Some("unity ib"), contents: bytemuck::cast_slice(&d.indices), usage: BufferUsages::INDEX });
+            let ibuf = dev.create_buffer_with_data(&BufferInitDescriptor { label: Some("unity ib"), contents: bytemuck::cast_slice(&d.indices), usage: BufferUsages::INDEX | BufferUsages::COPY_DST });
             let key = (d.variant, d.state, !d.hud);
             let pipeline = *gpu.pipelines.entry(key).or_insert_with(|| cache.queue_render_pipeline(pipeline_descriptor(var, layouts, d.state, !d.hud)));
             draws.push(Some(GpuDraw { vbuf, ibuf, count: d.indices.len() as u32, ubufs: ubufs.clone(), bg0, bg1, pipeline }));
@@ -2074,6 +2255,60 @@ fn prepare(
         near,
         size,
     };
+    // particles: camera-facing quads and trail strips, built for this camera
+    gpu.centers.clear();
+    {
+        let iv = ctx.v.inverse();
+        let (right, up, back) = (iv.x_axis.truncate().normalize(), iv.y_axis.truncate().normalize(), iv.z_axis.truncate().normalize());
+        let (mut vb, mut ib) = (Vec::new(), Vec::new());
+        for pd in frame.particles.iter() {
+            let Some(Some(g)) = gpu.draws.get_mut(pd.slot) else { continue };
+            let inputs = &scene.variants[scene.draws[pd.slot].variant as usize].inputs;
+            vb.clear();
+            ib.clear();
+            let mut n = 0u32;
+            for &(p, size, rot, col) in &pd.quads {
+                // ParticleSystemRenderer min/maxParticleSize: fractions of the viewport height
+                let depth = -ctx.v.transform_point3(p).z;
+                let h = 2.0 * depth.max(0.0) / fy;
+                let size = if h > 0.0 { size.clamp(pd.min_size * h, pd.max_size * h) } else { size };
+                let (sn, cs) = (-rot).sin_cos();
+                for (x, y, u, v) in [(-0.5f32, -0.5f32, 0.0f32, 0.0f32), (0.5, -0.5, 1.0, 0.0), (0.5, 0.5, 1.0, 1.0), (-0.5, 0.5, 0.0, 1.0)] {
+                    let q = p + (right * (x * cs - y * sn) + up * (x * sn + y * cs)) * size;
+                    push_vertex(&mut vb, inputs, q, back, col, [u, v]);
+                }
+                ib.extend_from_slice(&[n, n + 1, n + 2, n, n + 2, n + 3]);
+                n += 4;
+            }
+            for strip in &pd.strips {
+                for (k, &(q, w, col, u)) in strip.iter().enumerate() {
+                    let a = strip[k.saturating_sub(1)].0;
+                    let b = strip[(k + 1).min(strip.len() - 1)].0;
+                    let side = (b - a).cross(ctx.cam_pos - q).normalize_or_zero() * (w * 0.5);
+                    push_vertex(&mut vb, inputs, q - side, back, col, [u, 0.0]);
+                    push_vertex(&mut vb, inputs, q + side, back, col, [u, 1.0]);
+                    if k > 0 {
+                        let o = n + 2 * k as u32;
+                        ib.extend_from_slice(&[o - 2, o - 1, o + 1, o - 2, o + 1, o]);
+                    }
+                }
+                n += 2 * strip.len() as u32;
+            }
+            if vb.len() as u64 > g.vbuf.size() {
+                g.vbuf = dev.create_buffer(&BufferDescriptor { label: Some("unity particle vb"), size: (vb.len() as u64).next_power_of_two(), usage: BufferUsages::VERTEX | BufferUsages::COPY_DST, mapped_at_creation: false });
+            }
+            let ib_bytes: &[u8] = bytemuck::cast_slice(&ib);
+            if ib_bytes.len() as u64 > g.ibuf.size() {
+                g.ibuf = dev.create_buffer(&BufferDescriptor { label: Some("unity particle ib"), size: (ib_bytes.len() as u64).next_power_of_two(), usage: BufferUsages::INDEX | BufferUsages::COPY_DST, mapped_at_creation: false });
+            }
+            if !vb.is_empty() {
+                queue.write_buffer(&g.vbuf, 0, &vb);
+                queue.write_buffer(&g.ibuf, 0, ib_bytes);
+            }
+            g.count = ib.len() as u32;
+            gpu.centers.insert(pd.slot, (pd.center, pd.radius));
+        }
+    }
     // HUD Camera: the viewmodel animates in its load-time world space, so its camera stays there too
     let hud_ctx = scene.hud_cam.map(|(w, fov)| {
         let w = frame.hud_cam.unwrap_or(w);
@@ -2099,6 +2334,14 @@ fn prepare(
             }
         }
         info!("unity hud series f{fno}: visible draws {shown} vertices on screen {inside}/{total}");
+    }
+    if std::env::var_os("UNITY_FRAME_STATS").is_some() && fno == 240 {
+        let slots: Vec<String> = frame
+            .particles
+            .iter()
+            .map(|p| format!("{}#{} in view {} quads {} strips {} count {}", scene.draws[p.slot].material.name, p.slot, gpu.in_view[p.slot], p.quads.len(), p.strips.len(), gpu.draws[p.slot].as_ref().map_or(0, |g| g.count)))
+            .collect();
+        info!("unity particle stats: {} slots {slots:?}", slots.len());
     }
     if std::env::var_os("UNITY_FRAME_STATS").is_some() && fno == 240 {
         // numeric view of what the shaders get: frustum coverage and the nearest draw's lights
@@ -2210,8 +2453,12 @@ fn prepare(
         if sky_only {
             return false;
         }
-        let c = frame.object_to_world.get(di).map_or(d.center, |o| o.transform_point3(d.center));
-        planes.iter().all(|p| p.truncate().dot(c) + p.w >= -d.radius)
+        let (c, r) = match gpu.centers.get(&di) {
+            Some(&cr) => cr,
+            None if d.particle => return false,
+            None => (frame.object_to_world.get(di).map_or(d.center, |o| o.transform_point3(d.center)), d.radius),
+        };
+        planes.iter().all(|p| p.truncate().dot(c) + p.w >= -r)
     }));
     // fill visible draws into the CPU copy, then upload each contiguous run with one write
     let mut staging = std::mem::take(&mut gpu.staging);
@@ -2709,7 +2956,7 @@ fn draw(
             .filter(|&i| gpu.draws[i].is_some() && scene.draws[i].hud == hud && gpu.in_view.get(i).copied().unwrap_or(false))
             .map(|i| {
                 let d = &scene.draws[i];
-                let dist = d.center.distance(eye);
+                let dist = gpu.centers.get(&i).map_or(d.center, |c| c.0).distance(eye);
                 (d.queue, if d.queue >= 2500 { -dist } else { dist }, i)
             })
             .collect();
@@ -3006,6 +3253,18 @@ fn frame_stats(gpu: Res<UnityGpu>, dev: Res<RenderDevice>, scene: Res<UnityScene
         sum[2] as f64 / n,
         distinct.len()
     );
+    // blood: red-dominant pixels
+    let mut red = 0u64;
+    for y in 0..size.y {
+        for x in 0..size.x {
+            let i = (y * *row + x * 4) as usize;
+            let (r, g, b) = (data[i] as u32, data[i + 1] as u32, data[i + 2] as u32);
+            if r > 48 && r > 2 * g && r > 2 * b {
+                red += 1;
+            }
+        }
+    }
+    info!("unity blood pixels: {red} ({:.2}%)", 100.0 * red as f64 / n);
     // PostProcessV2 output against the scene it read: mean |post - scene| as stored and with rows
     // flipped (orientation check), and its distinct colors (dither + quantization). The post output
     // is screen-sized; each pixel is compared with the scene pixel it covers (pixelization)

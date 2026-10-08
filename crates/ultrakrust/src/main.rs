@@ -777,6 +777,20 @@ fn apply_view(
             p.fov = 75f32.to_radians();
         }
     }
+    // UNITY_PROBE_GORE: from frame 200, BS Head / BS Body splashes 3 m in front of the camera every 10
+    // frames, for the particle stats and the blood pixels of the frame-240 read-back
+    if std::env::var_os("UNITY_PROBE_GORE").is_some() {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if (200..240).contains(&n) && n % 10 == 0 {
+            let at = cam.0.translation + cam.0.rotation * Vec3::NEG_Z * 3.0;
+            let got = if n % 20 == 0 { uk_game::particles::GoreType::Head } else { uk_game::particles::GoreType::Body };
+            if let Some(i) = sim.game.get_gore(got, false, false) {
+                sim.game.fx.effects[i].pos = Vec3::new(at.x, at.y, -at.z);
+                info!("gore probe: frame {n} {got:?} at {at:.2?}");
+            }
+        }
+    }
     // UNITY_PROBE_HURT=frame:damage: hurt the player once at that frame, for the post hurt/death stats
     if let Some((at, dmg)) = std::env::var("UNITY_PROBE_HURT").ok().and_then(|v| {
         let (a, d) = v.split_once(':')?;

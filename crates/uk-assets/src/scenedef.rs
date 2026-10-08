@@ -41,6 +41,7 @@ const CLASS_ANIMATOR_OVERRIDE_CONTROLLER: i32 = 221;
 pub mod tags {
     pub const UNTAGGED: u32 = 0;
     pub const PLAYER: u32 = 6;
+    pub const BODY: u32 = 20001;
     pub const FLOOR: u32 = 20007;
     pub const LIMB: u32 = 20009;
     pub const HEAD: u32 = 20010;
@@ -252,6 +253,11 @@ pub struct SceneDef {
     pub input_actions: Option<std::sync::Arc<crate::input::InputActions>>,
     /// InputActionReference PPtrs (script file, file id, path id) -> m_ActionId.
     pub action_refs: HashMap<(Option<String>, i32, i64), String>,
+    /// Effect prefabs scripts spawn at runtime (BloodsplatterManager's pools, MaliciousFace's
+    /// dripBlood, ...), loaded outside the node graph.
+    pub particle_prefabs: Vec<Arc<crate::particles::ParticlePrefab>>,
+    /// (script, field) -> index into `particle_prefabs`
+    pub script_prefabs: HashMap<(u32, String), u32>,
 }
 
 impl SceneDef {
@@ -447,7 +453,47 @@ impl Loader<'_> {
     }
 }
 
-/// Loads the complete scene graph of a level bundle.
+/// The prefab fields of effect-spawning scripts: BloodsplatterManager.InitPools pools these
+/// (the bloodstain / gib fields aside), MaliciousFace instantiates dripBlood on hits and
+/// woundedParticle at half health.
+const EFFECT_PREFABS: &[(&str, &[&str])] = &[
+    ("BloodsplatterManager", &["head", "limb", "body", "small", "smallest", "splatter", "underwater", "sand"]),
+    ("MaliciousFace", &["dripBlood", "woundedParticle"]),
+];
+
+fn load_effect_prefabs(ld: &mut Loader, def: &mut SceneDef) {
+    let mut loaded: HashMap<(String, i64), u32> = HashMap::new();
+    for si in 0..def.scripts.len() {
+        let Some((_, fields)) = EFFECT_PREFABS.iter().find(|(c, _)| *c == def.scripts[si].class) else { continue };
+        let from = match &def.scripts[si].file {
+            Some(f) => ld.db.file(f).ok(),
+            None => Some(ld.scene.clone()),
+        };
+        let Some(from) = from else { continue };
+        for &field in *fields {
+            let p = def.scripts[si].data.get(field).pptr();
+            let Ok(Some((f, go))) = ld.db.resolve(&from, p) else { continue };
+            let key = (f.name.clone(), go);
+            let idx = match loaded.get(&key) {
+                Some(&i) => i,
+                None => match crate::particles::load_prefab(ld.db, &f, go) {
+                    Ok(pf) => {
+                        def.particle_prefabs.push(Arc::new(pf));
+                        let i = def.particle_prefabs.len() as u32 - 1;
+                        loaded.insert(key, i);
+                        i
+                    }
+                    Err(e) => {
+                        def.warnings.push(format!("{}.{field}: {e}", def.scripts[si].class));
+                        continue;
+                    }
+                },
+            };
+            def.script_prefabs.insert((si as u32, field.to_string()), idx);
+        }
+    }
+}
+
 /// Resolves the scripts' InputActionReference fields (top-level fields named `action*`, single or
 /// arrays) and reads the InputActionAsset they belong to.
 fn load_action_refs(ld: &mut Loader, def: &mut SceneDef) {
@@ -486,6 +532,7 @@ fn load_action_refs(ld: &mut Loader, def: &mut SceneDef) {
     }
 }
 
+/// Loads the complete scene graph of a level bundle.
 pub fn load_scene(db: &mut AssetDb, bundle: &std::path::Path) -> Result<SceneDef> {
     let files = db.load_bundle_files(bundle)?;
     let scene = files
@@ -543,6 +590,7 @@ pub fn load_scene(db: &mut AssetDb, bundle: &std::path::Path) -> Result<SceneDef
     add_objects(&mut ld, &mut def, &raw_go, &raw_tr, None)?;
     spawn_viewmodel(&mut ld, &mut def);
     load_action_refs(&mut ld, &mut def);
+    load_effect_prefabs(&mut ld, &mut def);
     def.navmeshes = crate::navmesh::load_scene_navmeshes(ld.db, bundle).unwrap_or_default();
     Ok(def)
 }
