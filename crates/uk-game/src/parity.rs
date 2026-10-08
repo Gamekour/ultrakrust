@@ -17,7 +17,8 @@ pub const PORTED: &[(&str, Port)] = &[
     ("Door", Port::Partial("Normal door type only; no sounds")),
     ("DoorController", Port::Full),
     ("DoorOpener", Port::Full),
-    ("ActivateArena", Port::Full),
+    ("ActivateArena", Port::Partial("forEnemy (Enemy-tagged trigger) arenas never activate")),
+    ("ArenaStatus", Port::Full),
     ("ActivateNextWave", Port::Full),
     ("Breakable", Port::Partial("no debris/particles/sound")),
     ("Glass", Port::Partial("no shards/sound")),
@@ -54,7 +55,7 @@ pub const PORTED: &[(&str, Port)] = &[
     ("Zombie", Port::Partial("navmesh pursuit (TrackTick); no anim, no agent avoidance")),
     ("ZombieMelee", Port::Partial("no anim timing")),
     ("ZombieProjectiles", Port::Partial("no anim timing")),
-    ("SpiderBody", Port::Partial("Malicious Face: no anim, no enraged phase visuals")),
+    ("SpiderBody", Port::Partial("Malicious Face: no anim, no enraged phase visuals, no head pitch (SetFollowHeadRotation), no BreakCorpse")),
     ("MaliciousFace", Port::Partial("see SpiderBody")),
     ("Projectile", Port::Partial("basic straight projectile")),
     ("SwingCheck2", Port::DataOnly),
@@ -84,6 +85,9 @@ pub const PORTED: &[(&str, Port)] = &[
     ("LevelStatsEnabler", Port::Full),
     ("StyleHUD", Port::Partial("meter visibility only (comboActive || forceMeterOn); no style points, ranks, freshness")),
     ("RailcannonMeter", Port::Partial("raicharge is 0 until the railcannon is ported")),
+    ("Crosshair", Port::Partial("crossHairColor 0's invertMaterial is not swapped in; no options menu (prefs at load)")),
+    ("FadeOutBars", Port::Full),
+    ("SliderToFillAmount", Port::Full),
     ("LevelStats", Port::Partial("challenge always NO (ChallengeManager not ported), style 0 (StyleHUD), no cyber grind wave text")),
 ];
 

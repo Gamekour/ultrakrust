@@ -866,7 +866,8 @@ impl Game {
                 }
             }
             Script::Arena(a) => {
-                if !a.activated && a.activate_on_enable {
+                // OnEnable
+                if !a.activated && a.activate_on_enable && self.arena_status_reached(sc) == Some(true) {
                     self.arena_activate(sc);
                 }
             }
@@ -1072,6 +1073,11 @@ impl Game {
                     }
                     (Script::PlayerActivator { .. }, "Activate") => self.player_activator(s),
                     (Script::Arena(_), "Activate") => self.arena_activate(s),
+                    (Script::ArenaStatus { .. }, "SetStatus") => self.s.scripts[s as usize] = Script::ArenaStatus { status: c.int_arg },
+                    (Script::ArenaStatus { status }, "AddToStatus") => {
+                        let status = status + c.int_arg;
+                        self.s.scripts[s as usize] = Script::ArenaStatus { status }
+                    }
                     (Script::Breakable(_), "Break") => self.breakable_break(s, 99999.0),
                     (Script::Glass(_), "Shatter") => self.glass_shatter(s),
                     (Script::Door(_), "Open") => self.door_open(s, false, false),
@@ -1540,6 +1546,40 @@ impl Game {
     }
 
     // ---------------------------------------------------------------- arenas & waves
+
+    /// ActivateArena's waitForStatus gate: no wait, or the parent ArenaStatus has reached it
+    /// (None: it waits but has no ArenaStatus). Looks the ArenaStatus up like OnEnable and
+    /// OnTriggerEnter do (GetComponentInParent), keeping it for Update.
+    fn arena_status_reached(&mut self, sc: u32) -> Option<bool> {
+        let Script::Arena(a) = &self.s.scripts[sc as usize] else { return None };
+        let wait = a.wait_for_status;
+        if wait <= 0 {
+            return Some(true);
+        }
+        let astat = match a.astat {
+            Some(s) => Some(s),
+            None => self.parent_script(self.def.scripts[sc as usize].node, |s| matches!(s, Script::ArenaStatus { .. })),
+        };
+        if let Script::Arena(a) = &mut self.s.scripts[sc as usize] {
+            a.astat = astat;
+        }
+        let Script::ArenaStatus { status } = self.s.scripts[astat? as usize] else { return None };
+        Some(status >= wait)
+    }
+
+    /// ActivateArena.Update: a player who entered too early (or activateOnEnable) activates it
+    /// once the ArenaStatus reaches waitForStatus.
+    fn arena_update(&mut self, sc: u32) {
+        let Script::Arena(a) = &self.s.scripts[sc as usize] else { return };
+        if a.activated || a.destroyed || !(a.player_in || a.activate_on_enable) {
+            return;
+        }
+        let Some(astat) = a.astat else { return };
+        let wait = a.wait_for_status;
+        if matches!(self.s.scripts[astat as usize], Script::ArenaStatus { status } if status >= wait) {
+            self.arena_activate(sc);
+        }
+    }
 
     fn arena_activate(&mut self, sc: u32) {
         let Script::Arena(a) = &mut self.s.scripts[sc as usize] else { return };
@@ -2088,8 +2128,22 @@ impl Game {
                     }
                 }
                 Script::Arena(a) => {
-                    if enter && !a.for_enemy && !a.activated {
-                        self.arena_activate(sc);
+                    // OnTriggerEnter / OnTriggerExit (forEnemy arenas count enemies, not ported)
+                    if a.for_enemy || a.activated {
+                        continue;
+                    }
+                    if !enter {
+                        a.player_in = false;
+                        continue;
+                    }
+                    match self.arena_status_reached(sc) {
+                        None => {}
+                        Some(false) => {
+                            if let Script::Arena(a) = &mut self.s.scripts[sc as usize] {
+                                a.player_in = true;
+                            }
+                        }
+                        Some(true) => self.arena_activate(sc),
                     }
                 }
                 Script::CheckPoint(_) if enter => self.checkpoint_activate(sc),
@@ -2136,14 +2190,20 @@ impl Game {
             self.world.set_group_transform(g, d);
         }
         // enemy colliders: a dead enemy's root collider is destroyed (Enemy.HandleStandardDeath) and its
-        // corpse is not ported
+        // corpse is not ported, except the Malicious Face's: its root goes to layer 11 while it falls,
+        // and landing destroys its SphereCollider and SpiderBodyTrigger
         let b = &mut self.s.player.bodies;
         for (e, en) in self.s.enemies.iter().enumerate() {
             b.world.set_group_transform(e + 1, en.delta());
         }
         for &(ci, e) in &self.body_owners {
             let c = &self.def.colliders[ci as usize];
-            b.world.owner_enabled[ci as usize] = self.s.enemies[e].alive && self.s.active[c.node as usize] && self.s.collider_enabled[ci as usize];
+            let en = &self.s.enemies[e];
+            let corpse = en.corpse_falling || en.corpse_landed;
+            let root = c.node == en.node;
+            let present = en.alive || (corpse && !(en.corpse_landed && (root || c.trigger)));
+            b.world.owner_enabled[ci as usize] = present && self.s.active[c.node as usize] && self.s.collider_enabled[ci as usize];
+            b.layer[ci as usize] = if corpse && root { 11 } else { c.layer };
         }
     }
 
@@ -2466,6 +2526,7 @@ impl Game {
                     }
                 }
                 Script::HudMessage(_) => self.hud_message_update(sc),
+                Script::Arena(_) => self.arena_update(sc),
                 _ => {}
             }
         }

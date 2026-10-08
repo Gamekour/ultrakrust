@@ -293,6 +293,37 @@ pub enum HudScript {
     /// StyleHUD: only the meter's visibility (no style points are scored, so comboActive stays false)
     Style { force_meter_on: bool },
     Railcannon(Box<RailcannonMeter>),
+    Crosshair(Box<Crosshair>),
+    FadeOutBars(Box<FadeOutBars>),
+    SliderFill(Box<SliderFill>),
+}
+
+/// Crosshair (Image refs are script indices; circles are sprite indices, filled in at set_ui).
+#[derive(Clone, Debug)]
+pub struct Crosshair {
+    pub altchs: Vec<Option<u32>>,
+    pub chuds: Vec<Option<u32>>,
+    pub circles: Vec<Option<u32>>,
+}
+
+/// FadeOutBars: the crosshair HUD bars fade out `fadeOutTime` seconds after their last change.
+#[derive(Clone, Debug)]
+pub struct FadeOutBars {
+    pub fade_out: bool,
+    pub fade_out_time: f32,
+}
+
+/// SliderToFillAmount: an Image's fillAmount (and colour) follows a Slider.
+#[derive(Clone, Debug)]
+pub struct SliderFill {
+    /// Slider script
+    pub target: Option<u32>,
+    pub max_fill: f32,
+    pub copy_color: bool,
+    /// FadeOutBars script (FadeOutBars.Start assigns it to every SliderToFillAmount below it)
+    pub mama: Option<u32>,
+    pub is_invisible: bool,
+    pub last_invisible: bool,
 }
 
 /// RailcannonMeter (Image refs are script indices). WeaponCharges.raicharge is 0 until the railcannon is ported.
@@ -475,6 +506,20 @@ pub fn parse(def: &SceneDef, idx: usize) -> Option<HudScript> {
             has_flashed: false,
         })),
         "StyleHUD" => HudScript::Style { force_meter_on: b("forceMeterOn") },
+        "Crosshair" => HudScript::Crosshair(Box::new(Crosshair {
+            altchs: v.get("altchs").array().iter().map(|p| def.script_ref(p)).collect(),
+            chuds: v.get("chuds").array().iter().map(|p| def.script_ref(p)).collect(),
+            circles: Vec::new(),
+        })),
+        "FadeOutBars" => HudScript::FadeOutBars(Box::new(FadeOutBars { fade_out: false, fade_out_time: v.get("fadeOutTime").f32() })),
+        "SliderToFillAmount" => HudScript::SliderFill(Box::new(SliderFill {
+            target: def.script_ref(v.get("targetSlider")),
+            max_fill: v.get("maxFill").f32(),
+            copy_color: b("copyColor"),
+            mama: def.script_ref(v.get("mama")),
+            is_invisible: false,
+            last_invisible: false,
+        })),
         _ => return None,
     })
 }
@@ -629,6 +674,7 @@ impl Game {
             Some(HudScript::ColorGet { .. }) => self.color_get_update(sc),
             Some(HudScript::Pos(_)) => self.hud_pos_check(sc),
             Some(HudScript::Railcannon(_)) => self.railcannon_check_status(sc),
+            Some(HudScript::SliderFill(f)) => f.last_invisible = !f.is_invisible,
             _ => {}
         }
     }
@@ -681,6 +727,8 @@ impl Game {
             Some(HudScript::LevelStatsEnabler(_)) => self.level_stats_enabler_start(sc),
             Some(HudScript::LevelStats(_)) => self.level_stats_start(sc),
             Some(HudScript::Railcannon(_)) => self.railcannon_check_status(sc),
+            Some(HudScript::Crosshair(_)) => self.crosshair_check(sc),
+            Some(HudScript::FadeOutBars(_)) => self.fade_out_bars_start(sc),
             _ => {}
         }
     }
@@ -701,6 +749,13 @@ impl Game {
                 Some(HudScript::LevelStatsEnabler(_)) => self.level_stats_enabler_update(sc, dt),
                 Some(HudScript::LevelStats(l)) if l.ready => self.level_stats_check(sc),
                 Some(HudScript::Railcannon(_)) => self.railcannon_update(sc, dt),
+                Some(HudScript::FadeOutBars(f)) => {
+                    // Time.unscaledDeltaTime (the port has no timescale changes on the HUD)
+                    if f.fade_out {
+                        f.fade_out_time = move_towards(f.fade_out_time, 0.0, dt);
+                    }
+                }
+                Some(HudScript::SliderFill(_)) => self.slider_fill_update(sc),
                 Some(&mut HudScript::Style { force_meter_on }) => {
                     // StyleHUD.UpdateMeter: styleHud (child 0) is shown while comboActive || forceMeterOn
                     let node = self.def.scripts[sc as usize].node;
@@ -876,6 +931,159 @@ impl Game {
             }
             if x == 0.0 && y == 0.0 {
                 self.set_active(node, false);
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- Crosshair
+
+    /// Crosshair.CheckCrossHair (HideUI is never active; the invertMaterial of crossHairColor 0 is
+    /// not swapped in: the Image keeps its serialized material).
+    fn crosshair_check(&mut self, sc: u32) {
+        let Some(ui) = self.ui_def() else { return };
+        let Some(HudScript::Crosshair(c)) = self.hud(sc) else { return };
+        let mut c = c.clone();
+        if c.circles.is_empty() {
+            if let Some(a) = self.ui_assets.clone() {
+                let n = self.def.scripts[sc as usize].data.get("circles").array().len();
+                c.circles = (0..n).map(|i| a.sprite(sc, &format!("circles/{i}"))).collect();
+                if let Some(HudScript::Crosshair(cc)) = self.hud(sc) {
+                    cc.circles.clone_from(&c.circles);
+                }
+            }
+        }
+        let node = self.def.scripts[sc as usize].node;
+        let main = ui.node_graphic.get(&node).copied();
+        let main_script = main.map(|g| ui.graphics[g as usize].script);
+        let set = |g: &mut Game, s: Option<u32>, on: bool| {
+            if let Some(s) = s {
+                g.s.script_enabled[s as usize] = on;
+            }
+        };
+        let (main_on, alt_on) = match self.prefs.int("crossHair") {
+            0 => (Some(false), Some(false)),
+            1 => (Some(true), Some(false)),
+            2 => (Some(true), Some(true)),
+            _ => (None, None),
+        };
+        if let Some(on) = main_on {
+            set(self, main_script, on);
+        }
+        if let Some(on) = alt_on {
+            for &a in &c.altchs {
+                set(self, a, on);
+            }
+        }
+        let color = match self.prefs.int("crossHairColor") {
+            2 => [0.5, 0.5, 0.5, 1.0],
+            3 => [0.0, 0.0, 0.0, 1.0],
+            4 => [1.0, 0.0, 0.0, 1.0],
+            5 => [0.0, 1.0, 0.0, 1.0],
+            6 => [0.0, 0.0, 1.0, 1.0],
+            7 => [0.0, 1.0, 1.0, 1.0],
+            8 => [1.0, 0.92156863, 0.015686275, 1.0],
+            9 => [1.0, 0.0, 1.0, 1.0],
+            _ => WHITE,
+        };
+        if let Some(g) = main {
+            self.set_graphic_color(g, color);
+        }
+        for &a in &c.altchs {
+            if let Some(g) = a.and_then(|a| self.graphic_of_script(&ui, a)) {
+                self.set_graphic_color(g, color);
+            }
+        }
+        let hud = self.prefs.int("crossHairHud");
+        for &ch in &c.chuds {
+            set(self, ch, hud != 0);
+            if hud != 0 {
+                if let Some(g) = ch.and_then(|a| self.graphic_of_script(&ui, a)) {
+                    self.s.ui.sprite[g as usize] = c.circles.get(hud as usize - 1).copied().flatten();
+                }
+            }
+        }
+    }
+
+    /// FadeOutBars.Start: CheckState, then every SliderToFillAmount below gets it as `mama`.
+    fn fade_out_bars_start(&mut self, sc: u32) {
+        self.fade_out_bars_reset(sc, true);
+        let node = self.def.scripts[sc as usize].node;
+        // GetComponentsInChildren: active objects only
+        let mut sub = vec![node];
+        let mut i = 0;
+        while i < sub.len() {
+            let n = sub[i];
+            sub.extend(self.def.nodes[n as usize].children.iter().copied().filter(|&c| self.s.active[c as usize]));
+            i += 1;
+        }
+        for n in sub {
+            let ids: Vec<u32> = self.def.scripts_on(n).map(|(i, _)| i).collect();
+            for i in ids {
+                if let Some(HudScript::SliderFill(f)) = self.hud(i) {
+                    f.mama = Some(sc);
+                }
+            }
+        }
+    }
+
+    /// FadeOutBars.CheckState (`check`) / ResetTimer (HideUI is never active).
+    fn fade_out_bars_reset(&mut self, sc: u32, check: bool) {
+        let fade = self.prefs.flag("crossHairHudFade");
+        let off = self.prefs.int("crossHairHud") == 0;
+        if let Some(HudScript::FadeOutBars(f)) = self.hud(sc) {
+            if check {
+                f.fade_out = fade;
+            }
+            f.fade_out_time = if off { 0.0 } else { 2.0 };
+        }
+    }
+
+    /// SliderToFillAmount.Update
+    fn slider_fill_update(&mut self, sc: u32) {
+        let Some(ui) = self.ui_def() else { return };
+        let node = self.def.scripts[sc as usize].node;
+        let Some(&img) = ui.node_graphic.get(&node) else { return };
+        let Some(HudScript::SliderFill(f)) = self.hud(sc) else { return };
+        let f = f.clone();
+        let a = self.s.ui.color[img as usize][3];
+        // Mathf.Approximately(a, 0)
+        let invisible = a.abs() < 8.0 * f32::MIN_POSITIVE;
+        let mut last = f.last_invisible;
+        if invisible != last {
+            self.s.script_enabled[ui.graphics[img as usize].script as usize] = !invisible;
+            last = invisible;
+        }
+        if let Some(HudScript::SliderFill(ff)) = self.hud(sc) {
+            ff.is_invisible = invisible;
+            ff.last_invisible = last;
+        }
+        let Some(si) = f.target.and_then(|t| ui.script_slider.get(&t).copied()) else { return };
+        let sl = &ui.sliders[si as usize];
+        let num = (self.s.ui.slider[si as usize] - sl.min) / (sl.max - sl.min) * f.max_fill;
+        if num != self.s.ui.fill[img as usize] {
+            // Image.fillAmount clamps to 0..1
+            self.s.ui.fill[img as usize] = num.clamp(0.0, 1.0);
+            if let Some(m) = f.mama {
+                self.fade_out_bars_reset(m, false);
+            }
+        }
+        if f.copy_color {
+            // targetSlider.targetGraphic.color
+            let target = ui.selectables.iter().find(|s| s.script == sl.script).and_then(|s| s.target);
+            if let Some(t) = target {
+                let c = self.s.ui.color[t as usize];
+                if c != self.s.ui.color[img as usize] {
+                    self.s.ui.color[img as usize] = c;
+                }
+            }
+        }
+        if let Some(m) = f.mama {
+            if let Some(HudScript::FadeOutBars(fo)) = self.hud(m) {
+                let num2 = fo.fade_out_time.min(1.0);
+                let c = &mut self.s.ui.color[img as usize];
+                if num2 != c[3] {
+                    c[3] = num2;
+                }
             }
         }
     }

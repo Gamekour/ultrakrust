@@ -50,6 +50,13 @@ fn report(g: &Game, t: f64) {
                 let fl = st.flash.map(|b| g.s.ui.color[b as usize][3]);
                 line += &format!(" | ST {name} s={:.3} v={v:?} full={} bar={bar:?} flash={fl:?} text={txt:?}", st.stamina, st.full);
             }
+            HudScript::SliderFill(_) if g.active(node) => {
+                // crosshair rings: fill, alpha, Image.enabled
+                let gi = ui.node_graphic[&node] as usize;
+                let on = g.s.script_enabled[ui.graphics[gi].script as usize];
+                line += &format!(" | XH {name} fill={:.3} a={:.2} on={}", g.s.ui.fill[gi], g.s.ui.color[gi][3], on as u8);
+            }
+            HudScript::FadeOutBars(f) if live => line += &format!(" | FO {name} t={:.2}", f.fade_out_time),
             _ => {}
         }
     }
@@ -223,6 +230,58 @@ fn main() {
         println!("level started {:.3}s after the pickup: timer={} secs={:.3}", t - t0, g.s.stats.timer, g.s.stats.seconds);
         step(&mut g, 100, &mut t);
         println!("secs after 100 more frames: {:.4}", g.s.stats.seconds);
+        // crosshair rings (Crosshair Filler is on now): fill follows the sliders, FadeOutBars fades
+        // them 2 s after the last change
+        let xh = |g: &Game, label: &str| {
+            let ui = g.ui.as_ref().unwrap();
+            let mut l = format!("XH {label}: pos {:?} proj {} boost {:.1} sl {} slow {} act {} dead {} hp {}", g.s.player.pos, g.s.projectiles.len(), g.s.player.boost_charge, g.s.player.sliding, g.s.player.slow_mode, g.s.player.activated, g.s.dead, g.s.hp);
+            for (sc, s) in g.s.scripts.iter().enumerate() {
+                let Script::Hud(h) = s else { continue };
+                let node = g.def.scripts[sc].node;
+                match &**h {
+                    HudScript::SliderFill(f) => {
+                        let gi = ui.node_graphic[&node] as usize;
+                        let on = g.s.script_enabled[ui.graphics[gi].script as usize];
+                        let sv = f.target.and_then(|t| ui.script_slider.get(&t)).map(|&i| g.s.ui.slider[i as usize]);
+                        l += &format!(" {}{}={:.3}/a{:.2}/{}/sl{:?}", if g.active(node) { "" } else { "(inactive)" }, g.def.path(node), g.s.ui.fill[gi], g.s.ui.color[gi][3], on as u8, sv);
+                    }
+                    HudScript::FadeOutBars(f) => l += &format!(" {}.t={:.2}", g.def.nodes[node as usize].name, f.fade_out_time),
+                    HudScript::Crosshair(c) => {
+                        let chud: Vec<_> = c.chuds.iter().map(|s| s.and_then(|s| ui.script_graphic.get(&s)).map(|&gi| (g.s.ui.sprite[gi as usize], g.s.script_enabled[ui.graphics[gi as usize].script as usize] as u8))).collect();
+                        l += &format!(" chuds(sprite,on)={chud:?}");
+                    }
+                    _ => {}
+                }
+            }
+            println!("{l}");
+        };
+        // the Gun Room filth (re-activated by the room's arena) would kill the player mid-test
+        let calm = |g: &mut Game, frames: usize, t: &mut f64| {
+            for _ in 0..frames {
+                for k in 0..g.s.enemies.len() {
+                    let n = g.s.enemies[k].node;
+                    if g.s.active[n as usize] {
+                        g.set_active(n, false);
+                    }
+                }
+                step(g, 1, t);
+            }
+        };
+        calm(&mut g, 1, &mut t);
+        g.s.hp = 100;
+        xh(&g, "settled");
+        calm(&mut g, 375, &mut t);
+        xh(&g, "+3 s");
+        g.hurt_player(40, false);
+        for (i, n) in [1, 62, 62, 125, 125, 125].iter().enumerate() {
+            calm(&mut g, *n, &mut t);
+            xh(&g, &format!("hurt 40 +{i}"));
+        }
+        g.s.player.boost_charge -= 100.0;
+        for (i, n) in [1, 62, 125, 250, 375].iter().enumerate() {
+            step(&mut g, *n, &mut t);
+            xh(&g, &format!("boost -100 +{i}"));
+        }
     }
     // sway with velocity
     g.s.player.vel = Vec3::new(0.0, 0.0, 30.0);

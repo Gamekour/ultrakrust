@@ -5,7 +5,8 @@ fn main() {
     let q = std::env::args().nth(1).expect("path substring");
     let install = uk_assets::find_install().unwrap();
     let mut db = AssetDb::open(&install).unwrap();
-    let path = AssetDb::bundle_dir(&install).join("campaign_scenes_level0-1.bundle");
+    let level = std::env::args().nth(2).unwrap_or("level0-1".into());
+    let path = AssetDb::bundle_dir(&install).join(format!("campaign_scenes_{level}.bundle"));
     let def = Arc::new(scenedef::load_scene(&mut db, &path).unwrap());
     for n in 0..def.nodes.len() as u32 {
         let p = def.path(n);

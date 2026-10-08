@@ -91,9 +91,14 @@ struct HpBar;
 struct HpText;
 #[derive(Component)]
 struct PierceBar;
-/// NewMovement.screenHud: hidden while dead
+/// The placeholder HUD (bars, "+" crosshair): only without the game's uGUI, or with the F3 overlay
 #[derive(Component)]
 struct HudRoot;
+#[derive(Component)]
+struct PlaceholderCrosshair;
+/// F3: the developer overlay (debug text, placeholder HUD, banners) - not part of ULTRAKILL's HUD
+#[derive(Resource, Default)]
+struct DebugOverlay(bool);
 /// DeathSequence.deathScreen (the BlackScreen Image)
 #[derive(Component)]
 struct DeathBlack;
@@ -130,6 +135,7 @@ fn main() {
         .insert_resource(ClearColor(Color::srgb(0.02, 0.02, 0.03)))
         .insert_resource(GlobalAmbientLight { brightness: 350.0, ..default() })
         .init_resource::<level::LevelView>()
+        .init_resource::<DebugOverlay>()
         .add_plugins(unity_render::UnityRenderPlugin)
         .add_systems(Startup, setup)
         .add_systems(Last, exit_after)
@@ -293,6 +299,7 @@ fn setup(
         Node { position_type: PositionType::Absolute, top: px(10), left: px(12), ..default() },
     ));
     commands.spawn((
+        PlaceholderCrosshair,
         Text::new("+"),
         TextFont { font_size: FontSize::Px(28.0), ..default() },
         Node { position_type: PositionType::Absolute, left: percent(50), top: percent(50), margin: UiRect { left: px(-8), top: px(-18), ..default() }, ..default() },
@@ -993,7 +1000,7 @@ fn update_hud(
     sim: Res<Sim>,
     diag: Res<Time<Real>>,
     keys: Res<ButtonInput<KeyCode>>,
-    mut debug_shown: Local<bool>,
+    mut debug: ResMut<DebugOverlay>,
     mut text: Single<&mut Text, (With<HudText>, Without<HintText>, Without<BannerText>, Without<HpText>)>,
     mut hint: Single<&mut Text, (With<HintText>, Without<HudText>, Without<BannerText>, Without<HpText>)>,
     mut banner: Single<&mut Text, (With<BannerText>, Without<HudText>, Without<HintText>, Without<HpText>)>,
@@ -1006,7 +1013,7 @@ fn update_hud(
     let p = &g.s.player;
     // the developer overlay (not part of ULTRAKILL's HUD) is off until F3
     if keys.just_pressed(KeyCode::F3) {
-        *debug_shown = !*debug_shown;
+        debug.0 = !debug.0;
     }
     let mut state = Vec::new();
     if p.gc.on_ground {
@@ -1045,13 +1052,16 @@ fn update_hud(
     for (msg, _) in sim.log.iter().rev().take(4) {
         s.push_str(&format!("\n{msg}"));
     }
-    text.0 = if *debug_shown { s } else { String::new() };
+    text.0 = if debug.0 { s } else { String::new() };
     // the uGUI MessageHud draws the hints; without a UI the debug HUD shows its text
     hint.0 = if g.ui.is_none() && g.msg_visible() { uk_game::scripts::clean_rich_text(&g.s.msg.shown_text) } else { String::new() };
-    banner.0 = if let Some((name, _)) = &sim.load_request {
-        format!("LOADING {}", name.to_uppercase())
-    } else if g.s.results_shown {
+    // the results stand in for FinalRank's texts (not ported yet); the other banners are debug
+    banner.0 = if g.s.results_shown {
         results_text(&sim)
+    } else if !debug.0 {
+        String::new()
+    } else if let Some((name, _)) = &sim.load_request {
+        format!("LOADING {}", name.to_uppercase())
     } else if g.s.level_complete && !g.s.rankless_continue {
         "LEVEL COMPLETE".into()
     } else {
@@ -1075,7 +1085,9 @@ fn update_death_ui(
     sim: Res<Sim>,
     window: Single<&Window>,
     mut cache: Local<(usize, usize, u32)>,
-    mut hud: Single<&mut Node, (With<HudRoot>, Without<DeathBlack>, Without<DeathLog>)>,
+    debug: Res<DebugOverlay>,
+    mut hud: Single<&mut Node, (With<HudRoot>, Without<DeathBlack>, Without<DeathLog>, Without<PlaceholderCrosshair>)>,
+    mut cross: Single<&mut Node, (With<PlaceholderCrosshair>, Without<HudRoot>, Without<DeathBlack>, Without<DeathLog>)>,
     mut black: Single<(&mut Node, &mut BackgroundColor), (With<DeathBlack>, Without<HudRoot>, Without<DeathLog>)>,
     mut you_died: Single<(&mut Text, &mut TextFont, &mut TextColor), With<DeathYouDied>>,
     mut log: Single<(Entity, &mut Node, &mut GlobalZIndex), (With<DeathLog>, Without<HudRoot>, Without<DeathBlack>)>,
@@ -1086,7 +1098,9 @@ fn update_death_ui(
     let g = &sim.game;
     let u = &g.death_ui;
     let scale = ((window.width() / 1280.0) * (window.height() / 720.0)).sqrt();
-    hud.display = if g.s.dead { Display::None } else { Display::Flex };
+    let placeholder = debug.0 || g.ui.is_none();
+    hud.display = if g.s.dead || !placeholder { Display::None } else { Display::Flex };
+    cross.display = if placeholder { Display::Flex } else { Display::None };
     black.0.display = if g.s.death_screen { Display::Flex } else { Display::None };
     let c = |c: [f32; 4]| Color::srgba(c[0], c[1], c[2], c[3]);
     black.1.0 = c(u.black);

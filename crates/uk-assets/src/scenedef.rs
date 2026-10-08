@@ -32,6 +32,7 @@ const CLASS_RENDER_SETTINGS: i32 = 104;
 const CLASS_CAMERA: i32 = 20;
 const CLASS_ANIMATOR: i32 = 95;
 const CLASS_CANVAS: i32 = 223;
+const CLASS_NAV_MESH_AGENT: i32 = 195;
 const CLASS_CANVAS_GROUP: i32 = 225;
 const CLASS_ANIMATOR_CONTROLLER: i32 = 91;
 const CLASS_ANIMATOR_OVERRIDE_CONTROLLER: i32 = 221;
@@ -40,6 +41,7 @@ const CLASS_ANIMATOR_OVERRIDE_CONTROLLER: i32 = 221;
 pub mod tags {
     pub const UNTAGGED: u32 = 0;
     pub const PLAYER: u32 = 6;
+    pub const FLOOR: u32 = 20007;
     pub const LIMB: u32 = 20009;
     pub const HEAD: u32 = 20010;
     pub const END_LIMB: u32 = 20011;
@@ -83,6 +85,22 @@ pub struct RectDef {
     pub anchored_pos: [f32; 2],
     pub size_delta: [f32; 2],
     pub pivot: [f32; 2],
+}
+
+/// NavMeshAgent (class 195).
+#[derive(Clone, Debug)]
+pub struct NavAgentDef {
+    pub node: u32,
+    pub enabled: bool,
+    pub base_offset: f32,
+    pub speed: f32,
+    pub acceleration: f32,
+    pub angular_speed: f32,
+    pub stopping_distance: f32,
+    pub radius: f32,
+    pub height: f32,
+    pub auto_braking: bool,
+    pub path_id: i64,
 }
 
 /// A native (non-MonoBehaviour) UI component: Canvas (223) or CanvasGroup (225), raw serialized data.
@@ -215,6 +233,7 @@ pub struct SceneDef {
     pub comp_to_collider: HashMap<i64, u32>,
     /// Nodes that carry a Rigidbody.
     pub rigidbodies: std::collections::HashSet<u32>,
+    pub nav_agents: Vec<NavAgentDef>,
     pub warnings: Vec<String>,
     /// Baked navmeshes (one per agent type / surface).
     pub navmeshes: Vec<crate::navmesh::NavMeshData>,
@@ -771,6 +790,23 @@ fn add_objects(ld: &mut Loader, def: &mut SceneDef, raw_go: &HashMap<i64, Value>
                 CLASS_RIGIDBODY => {
                     def.obj_to_node.insert(id, node);
                     def.rigidbodies.insert(node);
+                }
+                CLASS_NAV_MESH_AGENT => {
+                    def.obj_to_node.insert(id, node);
+                    let Ok(v) = file.read(o) else { continue };
+                    def.nav_agents.push(NavAgentDef {
+                        node,
+                        enabled: v.get("m_Enabled").bool(),
+                        base_offset: v.get("m_BaseOffset").f32(),
+                        speed: v.get("m_Speed").f32(),
+                        acceleration: v.get("m_Acceleration").f32(),
+                        angular_speed: v.get("m_AngularSpeed").f32(),
+                        stopping_distance: v.get("m_StoppingDistance").f32(),
+                        radius: v.get("m_Radius").f32(),
+                        height: v.get("m_Height").f32(),
+                        auto_braking: v.get("m_AutoBraking").bool(),
+                        path_id: id,
+                    });
                 }
                 CLASS_LIGHT => {
                     def.obj_to_node.insert(id, node);

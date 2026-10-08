@@ -161,6 +161,11 @@ pub struct Arena {
     pub enemies: Vec<u32>,
     pub activate_on_enable: bool,
     pub for_enemy: bool,
+    /// the ArenaStatus (GetComponentInParent, looked up on enable / trigger enter) must reach this
+    pub wait_for_status: i64,
+    pub astat: Option<u32>,
+    /// the player entered while the status was too low: Update activates once it is reached
+    pub player_in: bool,
     pub activated: bool,
     pub current: usize,
     pub destroyed: bool,
@@ -275,6 +280,8 @@ pub enum Script {
     DoorController(DoorController),
     DoorOpener { door: Option<u32>, one_time: bool, done: bool },
     Arena(Arena),
+    /// ArenaStatus.currentStatus (SetStatus / AddToStatus; ItemPlaceZone's skull altars move it)
+    ArenaStatus { status: i64 },
     Wave(Wave),
     Breakable(Box<Breakable>),
     Glass(Box<Glass>),
@@ -387,10 +394,14 @@ pub fn parse(def: &SceneDef, idx: usize) -> Script {
             enemies: nodes(def, v.get("enemies")),
             activate_on_enable: b("activateOnEnable"),
             for_enemy: b("forEnemy"),
+            wait_for_status: v.get("waitForStatus").i64(),
+            astat: None,
+            player_in: false,
             activated: false,
             current: 0,
             destroyed: false,
         }),
+        "ArenaStatus" => Script::ArenaStatus { status: v.get("currentStatus").i64() },
         "ActivateNextWave" => Script::Wave(Wave {
             last_wave: b("lastWave"),
             enemy_count: v.get("enemyCount").i64() as i32,

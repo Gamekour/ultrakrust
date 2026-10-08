@@ -48,6 +48,33 @@ fn main() {
         for l in bot.log.drain(..) {
             println!("{l}");
         }
+        // PEN=1: the player's capsule inside an enemy collider its layer collides with
+        if std::env::var("PEN").is_ok() {
+            use uk_core::player::{INVINCIBLE_LAYER_COLLIDES, PLAYER_LAYER_COLLIDES};
+            let p = &g.s.player;
+            let b = &p.bodies;
+            let cap = p.capsule();
+            let mask = if p.invincible_layer { INVINCIBLE_LAYER_COLLIDES } else { PLAYER_LAYER_COLLIDES };
+            for (e, en) in g.s.enemies.iter().enumerate() {
+                if !en.alive || !g.active(en.node) {
+                    continue;
+                }
+                let grp = &b.world.groups[e + 1];
+                let inv = grp.xf.inverse();
+                let (a, c) = (inv.transform_point3(cap.a), inv.transform_point3(cap.b));
+                for (i, sh) in grp.shapes.iter().enumerate() {
+                    let o = grp.owners[i] as usize;
+                    if b.trigger[o] || mask & (1 << b.layer[o]) == 0 || !b.enabled(o as u32) {
+                        continue;
+                    }
+                    let (x, y) = sh.closest_to_segment(a, c);
+                    let gap = x.distance(y) - cap.radius;
+                    if gap < -0.05 {
+                        println!("  {t:7.2} PEN {:?} {} collider {o} layer {} gap {gap:.3} player {:.2?} dashing {}", en.kind, def.path(en.node), b.layer[o], p.pos, p.invincible_layer);
+                    }
+                }
+            }
+        }
         if let Ok(w) = std::env::var("TRACE") {
             let v: Vec<f64> = w.split(',').map(|x| x.parse().unwrap()).collect();
             if t >= v[0] && t <= v[1] && (t * 2.0).fract() < 0.01 {

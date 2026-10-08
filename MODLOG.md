@@ -485,3 +485,22 @@ CPU-skinned enemies, 3,393 colliders/569 triggers, 11,758 MonoBehaviours with ty
   - WallCheck: layer-11 non-trigger bodies count as walls, with the point of contact when no level collider is touched.
 - `enemy_contact` probe (0-1, first enemy of each type, held in place): Filth / Stray walk min gap -0.0001 / blocked, dash passes through, dropped on top: canJump && !onGround then a jump (vel.y -11.5 → 27.8). Malicious Face: blocked in the air, dash deflected around the layer-11 head mesh, dropped on top: onGround on the mesh. `enemy_colliders` lists every enemy's colliders by type.
 - Bot (`bot.rs`): the gap-jump check samples 1.3/1.6/1.9 ahead (a single ray fell through the 0.14 seam between two Fan Room glass panels and jumped the bot into the fan pit), and a waypoint whose hold ends with the bot strafed away is walked back to before advancing. 0-1 autopilot back at waypoint 47; quick harness 0 failing.
+
+## 2026-10-08 — F3 debug overlay, crosshair rings, Malicious Face movement and corpse, arena status gating
+- F3 toggles a debug overlay (off by default): the placeholder crosshair, the bottom-left debug text and the checkpoint banner only draw with it on.
+- Crosshair HUD (`hud.rs`): Crosshair.CheckCrossHair (crossHair / crossHairColor / crossHairHud prefs: main and alt crosshairs, colour, the chuds' circle sprite), FadeOutBars (CheckState, ResetTimer, the fade) and SliderToFillAmount (fillAmount from the slider × maxFill, copyColor, alpha from the parent FadeOutBars, Image disabled while invisible). `hud_probe`: a 40 hit takes HealthSlider to 0.291 at once, HealthSliderAfterImage follows it down to 0.291, and the HealthBars show at alpha 1 for 2 s, then fade out within 1 s. Boost -100 draws the stamina rings down (0.120 → 0.051) and back to 0.150 as it recharges, and StaminaBars fades the same way.
+- NavMeshAgent settings come out of the scene (`SceneDef.nav_agents`, class 195: baseOffset, speed, acceleration, radius, height).
+- Malicious Face:
+  - MovementUpdate: while not charging a beam, the agent heads for the player along a complete navmesh path (speed 3.5, acceleration 8, braking into the destination), riding baseOffset × scale (10) above the navmesh. It stops when there is no complete path, and the beam charge stops it.
+  - ProcessDeath / HandleCollision: the corpse stays. It falls with gravity on layer 11 until it touches the Floor-tagged arena floor (0-1: centre 53.5), drops 1.5, loses its SphereCollider and SpiderBodyTrigger, and keeps the head mesh solid.
+  - `mf_probe`: the live Face blocks walking, deflects dashes, can be stood on and stops jumps. The corpse blocks walking and dashing (min gap 0), and a player dropped onto it slides off the round top.
+- ActivateArena waitForStatus with ArenaStatus (GetComponentInParent; SetStatus / AddToStatus calls):
+  - OnEnable activates only once the status is reached.
+  - OnTriggerEnter below the status remembers the player (playerIn); exit forgets them.
+  - Update activates once the status is reached while the player is in.
+  - Before this, every wave trigger in a room fired on the first visit.
+- `arena_status` probe in 2-3's Main Hall (ArenaStatus 0):
+  - Entering Triggers 1A/1B spawns wave 1. Trigger 2 (wait 1) and Trigger 3 (wait 2: the Mindflayer and the four door locks) stay off.
+  - AddToStatus to 2 with the player standing in Trigger 3 activates it. Re-entering Trigger 2 at status ≥ 1 activates it.
+  - In the game, the status moves when skulls are taken off the four altars (ItemPlaceZone reverseArenaStatuses). ItemPlaceZone / ItemIdentifier (skulls) are not ported, so those two waves stay dormant until skulls exist.
+- forEnemy arenas (activated by an Enemy-tagged collider) are still not ported; parity.rs marks ActivateArena Partial.

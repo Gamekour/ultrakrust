@@ -69,6 +69,13 @@ pub struct Enemy {
     pub beam_fire_t: f32,
     pub beam_target: Vec3,
     pub rng: u32,
+    /// NavMeshAgent (None without one)
+    pub agent: Option<Agent>,
+    /// the agent's velocity
+    pub agent_vel: Vec3,
+    /// MaliciousFace.ProcessDeath: the corpse falls (spiderFalling) until it lands on a Floor
+    pub corpse_falling: bool,
+    pub corpse_landed: bool,
     // NavMeshAgent (Zombie TrackTick / Enemy.SetDestination)
     pub nav_dest: Option<Vec3>,
     pub path: Vec<crate::nav::Corner>,
@@ -83,6 +90,17 @@ pub struct Enemy {
     pub was_grounded: bool,
     /// seconds off the ground (step-down flicker is not a fall)
     pub air_t: f32,
+}
+
+/// NavMeshAgent settings in world units.
+#[derive(Clone, Copy, Debug)]
+pub struct Agent {
+    /// baseOffset x the transform's scale
+    pub offset: f32,
+    pub speed: f32,
+    pub accel: f32,
+    /// navmesh query half extents: radius, height (x scale)
+    pub half_ext: Vec3,
 }
 
 #[derive(Clone, Debug)]
@@ -167,6 +185,13 @@ impl Enemy {
             break;
         }
         let activate_on_death = crate::scripts::nodes(def, eid.get("activateOnDeath"));
+        let scale = def.nodes[node as usize].world0.to_scale_rotation_translation().0;
+        let agent = def.nav_agents.iter().find(|a| a.node == node).map(|a| Agent {
+            offset: a.base_offset * scale.y,
+            speed: a.speed,
+            accel: a.acceleration,
+            half_ext: Vec3::new(a.radius * scale.x, a.height * scale.y, a.radius * scale.x),
+        });
         Some(Self {
             node,
             kind,
@@ -200,6 +225,10 @@ impl Enemy {
             beam_fire_t: -1.0,
             beam_target: Vec3::ZERO,
             rng: node.wrapping_mul(2654435761).max(1),
+            agent,
+            agent_vel: Vec3::ZERO,
+            corpse_falling: false,
+            corpse_landed: false,
             nav_dest: None,
             path: Vec::new(),
             path_i: 0,
@@ -358,6 +387,10 @@ pub fn fixed_update(g: &mut Game) {
             continue;
         }
         let en = &mut g.s.enemies[i];
+        if en.corpse_falling {
+            malicious_face_corpse(g, i, dt);
+            continue;
+        }
         if !en.alive || en.kind == Kind::MaliciousFace || en.kind == Kind::Other {
             continue;
         }
@@ -667,6 +700,10 @@ pub fn update(g: &mut Game, dt: f32) {
                 }
             }
             Kind::MaliciousFace => {
+                // Update: MovementUpdate runs while neither charging nor holding a beam charge
+                if g.s.enemies[i].beam_charge < 0.0 {
+                    malicious_face_movement(g, i, dt);
+                }
                 malicious_face(g, i, dt, target);
             }
             Kind::Other => {}
@@ -696,11 +733,6 @@ fn malicious_face(g: &mut Game, i: usize, dt: f32, target: Vec3) {
     let dist = to.length();
     let dir = to.normalize_or_zero();
     en.yaw = dir.x.atan2(-dir.z);
-    // slow walk toward the player (NavMeshAgent speed 3.5), keeping height
-    if en.beam_charge < 0.0 && dist > 20.0 {
-        let flat = Vec3::new(dir.x, 0.0, dir.z).normalize_or_zero();
-        en.pos += flat * 3.5 * dt;
-    }
     // beam: charging -> locked target -> fire
     if en.beam_charge >= 0.0 {
         en.beam_charge = (en.beam_charge + 0.5 * dt).min(1.0);
@@ -749,6 +781,8 @@ fn malicious_face(g: &mut Game, i: usize, dt: f32, target: Vec3) {
         let beam = (en.beam_prob > 5.0 || r < en.beam_prob) && dist <= 50.0;
         if beam {
             en.beam_charge = 0.0;
+            // BeamChargeUpdate: speed 0 and isStopped; BeamFire disables the agent
+            en.agent_vel = Vec3::ZERO;
             en.beam_fire_t = -1.0;
             en.beam_prob = if en.health > 10.0 { 0.0 } else { 1.0 };
             false
@@ -765,6 +799,76 @@ fn malicious_face(g: &mut Game, i: usize, dt: f32, target: Vec3) {
         en.current_burst += 1;
         en.burst_charge = 0.1;
         g.s.projectiles.push(Projectile { pos: mouth + pdir * 3.0, vel: pdir * 65.0, damage: 25.0, friendly: false, life: 10.0 });
+    }
+}
+
+/// MaliciousFace.MovementUpdate: the NavMeshAgent heads for the player when a complete path to
+/// them exists and stops otherwise. The transform rides `baseOffset` above the agent's navmesh
+/// position (spiderTargetHeight stays at its default without a buff targeter, so the offset does
+/// not change). Steering: velocity moves toward the next corner at `speed` by `acceleration`,
+/// braking into the destination (autoBraking).
+fn malicious_face_movement(g: &mut Game, i: usize, dt: f32) {
+    let Some(nav) = g.nav.as_ref() else { return };
+    let Some(agent) = g.s.enemies[i].agent else { return };
+    let player = g.s.player.pos;
+    let en = &mut g.s.enemies[i];
+    // the agent's position on the navmesh (isOnNavMesh)
+    let Some((_, on)) = nav.nearest(en.pos - Vec3::Y * agent.offset, agent.half_ext) else { return };
+    // CalculatePath(target) must be PathComplete; otherwise SetDestination(transform.position)
+    let path = nav.nearest(player, agent.half_ext).and_then(|(_, goal)| nav.find_path(on, goal)).filter(|(_, complete)| *complete);
+    let (steer, remaining) = match &path {
+        Some((corners, _)) if corners.len() > 1 => {
+            let pts: Vec<Vec3> = std::iter::once(on).chain(corners[1..].iter().map(|c| c.pos)).collect();
+            (corners[1].pos - on, pts.windows(2).map(|w| w[0].distance(w[1])).sum::<f32>())
+        }
+        _ => (Vec3::ZERO, 0.0),
+    };
+    let desired = steer.with_y(0.0).normalize_or_zero() * agent.speed.min((2.0 * agent.accel * remaining).sqrt());
+    en.agent_vel = uk_core::umath::vmove_towards(en.agent_vel, desired, agent.accel * dt);
+    // stay on the navmesh: the moved point snaps back onto it
+    let to = on + en.agent_vel * dt;
+    let new_on = nav.nearest(to, Vec3::new(1.0, agent.half_ext.y, 1.0)).map_or(on, |(_, p)| p);
+    if (new_on - to).with_y(0.0).length() > 0.01 {
+        en.agent_vel = Vec3::ZERO;
+    }
+    en.pos = new_on + Vec3::Y * agent.offset;
+}
+
+/// MaliciousFace corpse (ProcessDeath / HandleCollision): the Rigidbody turns dynamic with gravity
+/// and falls (excludeLayers: Default) until its sphere touches a "Floor"-tagged collider; there it
+/// turns kinematic, drops 1.5 along its up axis and loses its SphereCollider and SpiderBodyTrigger.
+/// The head's mesh collider (layer 11) stays as a solid corpse.
+fn malicious_face_corpse(g: &mut Game, i: usize, dt: f32) {
+    let def = g.def.clone();
+    let solid = |o: u32| o == uk_core::collide::ALWAYS || def.colliders.get(o as usize).is_some_and(|c| c.layer != 0 && !c.trigger);
+    let en = &mut g.s.enemies[i];
+    en.vel.y += GRAVITY * dt;
+    en.pos += en.vel * dt;
+    let mut cap = Capsule { a: en.center(), b: en.center(), radius: en.radius };
+    let before = cap.a;
+    let mut normals = Vec::new();
+    g.world.depenetrate_capsule_filtered(&mut cap, &mut normals, solid);
+    let en = &mut g.s.enemies[i];
+    en.pos += cap.a - before;
+    for n in &normals {
+        let into = en.vel.dot(*n);
+        if into < 0.0 {
+            en.vel -= *n * into;
+        }
+    }
+    if normals.is_empty() {
+        return;
+    }
+    let (c, r) = (en.center(), en.radius);
+    let floor = g.world.overlap_sphere(c, r + 0.05).into_iter().map(|id| g.world.owner(id)).any(|o| {
+        solid(o) && o != uk_core::collide::ALWAYS && def.nodes[def.colliders[o as usize].node as usize].tag == tags::FLOOR
+    });
+    if floor {
+        let en = &mut g.s.enemies[i];
+        en.corpse_falling = false;
+        en.corpse_landed = true;
+        en.vel = Vec3::ZERO;
+        en.pos -= Vec3::Y * 1.5;
     }
 }
 
@@ -821,6 +925,15 @@ pub fn kill_enemy(g: &mut Game, e: usize) {
         g.set_active(n, true);
     }
     g.add_dead_enemy(node);
+    let en = &mut g.s.enemies[e];
+    if en.kind == Kind::MaliciousFace {
+        // ProcessDeath: the corpse falls and stays (BreakCorpse needs a ground slam, breaker or
+        // cannonball hitter, none of which is ported)
+        en.corpse_falling = true;
+        en.vel = Vec3::ZERO;
+        en.agent_vel = Vec3::ZERO;
+        return;
+    }
     // corpse disappears (gibs/ragdoll not ported)
     g.set_active(node, false);
 }
