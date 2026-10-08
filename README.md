@@ -109,6 +109,12 @@ Add them to object names. They're case-insensitive, and `-x`, `_x` or `$x` all w
   - `IMAGE`: an infinite ground plane.
   - `SINGLE_ARROW`: a ray. Skipped, since Unity has no ray collider.
 - **Meshes without a suffix** are visible but have no collision.
+
+**Enemies** go on empties, by suffix: `-filth`, `-stray` or `-maliciousface` (e.g.
+`Guard-stray`). Each one is a copy of a 0-1 enemy. It stands on the empty's origin, faces the
+empty's forward (Blender's +Y), and is in the level from the start, with no spawn bubble. There
+are no arenas or waves yet. Custom maps have no navmesh yet, so Filth and Strays walk straight at
+the player instead of pathing around walls.
 - **Normals matter.** ULTRAKILL culls back faces, and its surface queries are single-sided. Run
   *Mesh → Normals → Recalculate Outside* in Blender if a floor is invisible from above.
 

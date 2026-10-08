@@ -566,3 +566,23 @@ CPU-skinned enemies, 3,393 colliders/569 triggers, 11,758 MonoBehaviours with ty
 - `hull_check` checks every hull-shaped collider: closed (each edge has its twin), all points on or behind every face, faces = 2V - 4.
   - 1-1: 911 hulls, 0 bad, largest 96 faces. 1-1 loads in 3.2 s (Game::new 80 ms).
   - 2-3 and 0-1: the 3 and 2 meshes it flags are non-convex MeshColliders that aren't flagged convex (left as triangles). Their hull happens to have the same face count.
+
+## 2026-10-08 — Custom maps: Filth, Stray and Malicious Face placements
+- Suffixes on empties (docs/MAP_FORMAT.md): `-filth`, `-stray`, `-maliciousface`. A suffix on a mesh warns, and the mesh is not imported.
+- Templates are 0-1's own enemies:
+  - Filth: `11 - Projectile Zombies Room/.../Wave 1/Filth/Zombie`
+  - Stray: `10 - Combo Hallway/.../Wave 1/Projectile Zombie`
+  - Malicious Face: `13 - Malicious Face Arena/13 Content/Boss/Spider`
+  - `prune_base` keeps them, with their ancestors, until they are copied. Then they go.
+- `SceneDef::clone_subtree` does what Object.Instantiate does for a scene subtree. It copies:
+  - nodes, renderers (skin bones remapped) and colliders;
+  - scripts (with prefab and nested refs), rigidbodies and nav agents;
+  - lights, animators, UI natives, surface meshes and particle systems.
+  - The copy gets fresh path ids, and scene-file PPtrs inside it point at the copies.
+- Placing a copy:
+  - The root keeps the template's scale and tilt, turned by the yaw between the template and the empty, at the empty's origin.
+  - It is set active, and EnemyIdentifier spawnIn is false (no SpawnEffect).
+- `map_probe` on a scratchpad map (Filth at (-4, -1, -5); a Stray at (4, -1, -5) turned 90 degrees; a Malicious Face at (0, -1, 8)), all three alive with spawn_in false and 0 spawn effects:
+  - At start: Filth yaw 0 (hp 0.5), Stray yaw -90 (hp 1.5), Malicious Face hp 25, with its body at (0, 9, 8), the template's offset.
+  - After 3 s: the Filth walked to the player and hit them (player hp 100 to 70), and the Stray turned to face them.
+- Custom maps have no navmesh (retain_nodes clears 0-1's), so Filth and Strays use the port's straight-line fallback. The parser warns. MAP_FORMAT said they would stand still, which is now corrected.

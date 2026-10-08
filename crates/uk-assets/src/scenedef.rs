@@ -107,7 +107,7 @@ pub struct NavAgentDef {
 }
 
 /// A native (non-MonoBehaviour) UI component: Canvas (223) or CanvasGroup (225), raw serialized data.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct UiNativeDef {
     pub node: u32,
     pub class_id: i32,
@@ -115,7 +115,7 @@ pub struct UiNativeDef {
     pub data: Value,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct RenderDef {
     pub node: u32,
     pub material: Option<MaterialKey>,
@@ -244,7 +244,7 @@ pub struct SurfaceMat {
 /// footstep layer, a non-trigger first Collider, a MeshRenderer, no non-kinematic Rigidbody),
 /// with the mesh it gets (PreservedOriginalMesh, else the MeshCollider's, else the MeshFilter's)
 /// at the object's load-time transform; the copy only follows the source's active state.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct SurfaceMeshDef {
     pub node: u32,
     pub layer: u8,
@@ -293,7 +293,7 @@ pub struct MaterialOverride {
     pub textures: Vec<(String, Arc<crate::texture::TextureData>)>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ScriptDef {
     pub node: u32,
     pub class: String,
@@ -471,6 +471,158 @@ impl SceneDef {
             x.planes = x.planes.iter().filter_map(|&p| m(p)).collect();
         }
         self.comp_to_particle = self.comp_to_particle.iter().filter_map(|(&k, &v)| Some((k, pmap[v as usize]?))).collect();
+    }
+
+    /// Copies `src`'s subtree (components, baked geometry, particle systems, lights, animators)
+    /// under `parent`, with the copy's root at world matrix `world` (Bevy space; it must differ
+    /// from `src`'s by a rigid transform). The copy's objects get new path ids, and PPtrs inside
+    /// the subtree's scene-file components point at the copies, as Object.Instantiate does.
+    /// Returns the copy's root node.
+    pub fn clone_subtree(&mut self, src: u32, parent: u32, world: Mat4) -> u32 {
+        let mut sub = Vec::new();
+        let mut stack = vec![src];
+        while let Some(n) = stack.pop() {
+            sub.push(n);
+            stack.extend(self.nodes[n as usize].children.iter().rev().copied());
+        }
+        let base = self.nodes.len() as u32;
+        let nmap: HashMap<u32, u32> = sub.iter().enumerate().map(|(i, &n)| (n, base + i as u32)).collect();
+        let m = |n: u32| nmap.get(&n).copied();
+        let mn = |n: u32| m(n).unwrap_or(n);
+        let d = world * self.nodes[src as usize].world0.inverse();
+        let (_, dr, _) = d.to_scale_rotation_translation();
+        let pt = |p: Vec3| d.transform_point3(p);
+        // fresh path ids below every id in use
+        let mut next = [self.obj_to_node.keys(), self.comp_to_script.keys(), self.comp_to_collider.keys(), self.comp_to_particle.keys()]
+            .into_iter()
+            .flatten()
+            .copied()
+            .min()
+            .unwrap_or(0)
+            .min(0)
+            - 1;
+        let mut ids: Vec<(i64, u32)> = self.obj_to_node.iter().filter(|(_, n)| nmap.contains_key(n)).map(|(&k, &n)| (k, n)).collect();
+        ids.sort_unstable();
+        let mut idmap = HashMap::new();
+        for &(k, n) in &ids {
+            idmap.insert(k, next);
+            self.obj_to_node.insert(next, mn(n));
+            next -= 1;
+        }
+        let id = |k: i64| idmap.get(&k).copied().unwrap_or(k);
+        // nodes
+        for &n in &sub {
+            let mut nd = self.nodes[n as usize].clone();
+            nd.parent = if n == src { Some(parent) } else { nd.parent.map(mn) };
+            nd.children = nd.children.iter().map(|&c| mn(c)).collect();
+            nd.world0 = d * nd.world0;
+            self.nodes.push(nd);
+        }
+        let root = base;
+        let (s, r, t) = (self.nodes[parent as usize].world0.inverse() * world).to_scale_rotation_translation();
+        let rn = &mut self.nodes[root as usize];
+        (rn.local_pos, rn.local_rot, rn.local_scale) = (t, r, s);
+        self.nodes[parent as usize].children.push(root);
+        // renderers
+        for ri in 0..self.renderers.len() {
+            let Some(node) = m(self.renderers[ri].node) else { continue };
+            let mut r = self.renderers[ri].clone();
+            r.node = node;
+            r.batch.positions.iter_mut().for_each(|p| *p = pt(Vec3::from(*p)).into());
+            r.batch.normals.iter_mut().for_each(|p| *p = (dr * Vec3::from(*p)).into());
+            if let Some(sk) = &r.skin {
+                r.skin = Some(Arc::new(SkinDef { mesh: sk.mesh.clone(), bones: sk.bones.iter().map(|b| b.map(mn)).collect() }));
+            }
+            if let Some(&o) = self.renderer_override.get(&(ri as u32)) {
+                self.renderer_override.insert(self.renderers.len() as u32, o);
+            }
+            self.renderers.push(r);
+        }
+        // colliders
+        let old: Vec<(i64, u32)> = self.comp_to_collider.iter().map(|(&k, &v)| (k, v)).collect();
+        let mut cmap = HashMap::new();
+        for ci in 0..self.colliders.len() {
+            let Some(node) = m(self.colliders[ci].node) else { continue };
+            let mut c = self.colliders[ci].clone();
+            c.node = node;
+            transform_shape(&mut c.shape, &pt, dr);
+            cmap.insert(ci as u32, self.colliders.len() as u32);
+            self.colliders.push(c);
+        }
+        for (k, v) in old {
+            if let Some(&nv) = cmap.get(&v) {
+                self.comp_to_collider.insert(id(k), nv);
+            }
+        }
+        // scripts
+        let old: Vec<(i64, u32)> = self.comp_to_script.iter().map(|(&k, &v)| (k, v)).collect();
+        let mut smap = HashMap::new();
+        for si in 0..self.scripts.len() {
+            let Some(node) = m(self.scripts[si].node) else { continue };
+            let mut s = self.scripts[si].clone();
+            s.node = node;
+            s.path_id = id(s.path_id);
+            if s.file.is_none() {
+                remap_pptrs(&mut s.data, &idmap);
+            }
+            smap.insert(si as u32, self.scripts.len() as u32);
+            self.scripts.push(s);
+        }
+        for (k, v) in old {
+            if let Some(&nv) = smap.get(&v) {
+                self.comp_to_script.insert(id(k), nv);
+            }
+        }
+        let sp: Vec<_> = self.script_prefabs.iter().filter_map(|((s, f), &v)| Some(((*smap.get(s)?, f.clone()), v))).collect();
+        self.script_prefabs.extend(sp);
+        let sn: Vec<_> = self.script_nested.iter().filter_map(|((s, f), v)| Some(((*smap.get(s)?, f.clone()), v.clone()))).collect();
+        self.script_nested.extend(sn);
+        // the rest of the per-node components
+        let rbs: Vec<u32> = self.rigidbodies.iter().filter_map(|&n| m(n)).collect();
+        self.rigidbodies.extend(rbs);
+        let rbs: Vec<u32> = self.dynamic_rigidbodies.iter().filter_map(|&n| m(n)).collect();
+        self.dynamic_rigidbodies.extend(rbs);
+        let v: Vec<_> = self.nav_agents.iter().filter_map(|a| Some(NavAgentDef { node: m(a.node)?, path_id: id(a.path_id), ..a.clone() })).collect();
+        self.nav_agents.extend(v);
+        let v: Vec<_> = self.lights.iter().filter_map(|l| Some(LightDef { node: m(l.node)?, ..l.clone() })).collect();
+        self.lights.extend(v);
+        let v: Vec<_> = self.animators.iter().filter_map(|a| Some(AnimatorDef { node: m(a.node)?, path_id: id(a.path_id), ..a.clone() })).collect();
+        self.animators.extend(v);
+        let v: Vec<_> = self
+            .ui_natives
+            .iter()
+            .filter_map(|u| {
+                let mut u = UiNativeDef { node: m(u.node)?, path_id: id(u.path_id), ..u.clone() };
+                remap_pptrs(&mut u.data, &idmap);
+                Some(u)
+            })
+            .collect();
+        self.ui_natives.extend(v);
+        let v: Vec<_> = self
+            .surface_meshes
+            .iter()
+            .filter_map(|s| {
+                let mut s = SurfaceMeshDef { node: m(s.node)?, ..s.clone() };
+                s.tris.iter_mut().flatten().for_each(|p| *p = pt(*p));
+                Some(s)
+            })
+            .collect();
+        self.surface_meshes.extend(v);
+        let old: Vec<(i64, u32)> = self.comp_to_particle.iter().map(|(&k, &v)| (k, v)).collect();
+        let mut pmap = HashMap::new();
+        for pi in 0..self.particle_systems.len() {
+            let p = &self.particle_systems[pi];
+            let Some(node) = m(p.node) else { continue };
+            let p = SceneParticleDef { node, path_id: id(p.path_id), shape_node: p.shape_node.map(mn), planes: p.planes.iter().map(|&q| mn(q)).collect(), ..p.clone() };
+            pmap.insert(pi as u32, self.particle_systems.len() as u32);
+            self.particle_systems.push(p);
+        }
+        for (k, v) in old {
+            if let Some(&nv) = pmap.get(&v) {
+                self.comp_to_particle.insert(id(k), nv);
+            }
+        }
+        root
     }
 
     /// Applies a rigid world-space transform to `root`'s subtree and everything baked under it,
@@ -1511,4 +1663,40 @@ fn skin(mesh: &MeshData, bones: &[Mat4]) -> MeshData {
         }
     }
     out
+}
+
+/// A shape moved by a rigid transform (`pt` maps points, `dr` is its rotation).
+fn transform_shape(shape: &mut ShapeDef, pt: &dyn Fn(Vec3) -> Vec3, dr: Quat) {
+    match shape {
+        ShapeDef::Box { center, rot, .. } => {
+            *center = pt(*center);
+            *rot = dr * *rot;
+        }
+        ShapeDef::Sphere { center, .. } => *center = pt(*center),
+        ShapeDef::Capsule { a, b, .. } => {
+            *a = pt(*a);
+            *b = pt(*b);
+        }
+        ShapeDef::Mesh(t) => t.iter_mut().flatten().for_each(|p| *p = pt(*p)),
+    }
+}
+
+/// Points scene-file PPtrs (m_FileID 0) whose path id is in `map` at the mapped id.
+fn remap_pptrs(v: &mut Value, map: &HashMap<i64, i64>) {
+    match v {
+        Value::Struct(fields) => {
+            let is_ptr = fields.iter().any(|(k, v)| &**k == "m_FileID" && v.i64() == 0) && fields.iter().any(|(k, _)| &**k == "m_PathID");
+            for (k, f) in fields.iter_mut() {
+                if is_ptr && &**k == "m_PathID" {
+                    if let Some(&n) = map.get(&f.i64()) {
+                        *f = Value::Int(n);
+                    }
+                } else {
+                    remap_pptrs(f, map);
+                }
+            }
+        }
+        Value::Array(a) => a.iter_mut().for_each(|x| remap_pptrs(x, map)),
+        _ => {}
+    }
 }

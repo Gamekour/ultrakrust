@@ -22,6 +22,11 @@
 //!
 //! The rest of the scene comes from 0-1: its player rig (HUD included), GameController managers,
 //! OnLevelStart, StatsManager and EventSystem, with the player moved to stand at the origin.
+//!
+//! ULTRAKILL suffixes (docs/MAP_FORMAT.md), on empties: `-filth`, `-stray` and `-maliciousface`
+//! place a copy of one of 0-1's enemies at the empty, standing on its origin and facing its
+//! forward (glTF -Z: Blender's +Y), in the level from the start (no spawn effect). Custom maps
+//! have no navmesh yet, so Filth and Strays walk straight at the player (warned).
 
 use crate::db::AssetDb;
 use crate::scene::{Batch, MaterialKey};
@@ -52,23 +57,112 @@ pub struct MapReport {
     pub materials: usize,
     pub textures: usize,
     pub tris: usize,
+    pub enemies: usize,
     pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum EnemyKind {
+    Filth,
+    Stray,
+    MaliciousFace,
+}
+
+impl EnemyKind {
+    const ALL: [(&'static str, EnemyKind); 3] = [("filth", EnemyKind::Filth), ("stray", EnemyKind::Stray), ("maliciousface", EnemyKind::MaliciousFace)];
+
+    /// The 0-1 enemy each one is copied from (its EnemyIdentifier root, or the boss's own root).
+    fn template(self) -> &'static str {
+        match self {
+            EnemyKind::Filth => "11 - Projectile Zombies Room/11 Content/Enemies/Wave 1/Filth/Zombie",
+            EnemyKind::Stray => "10 - Combo Hallway/10 Content/Enemies/Wave 1/Projectile Zombie",
+            EnemyKind::MaliciousFace => "13 - Malicious Face Arena/13 Content/Boss/Spider",
+        }
+    }
 }
 
 /// 0-1 pruned to the player, its managers and HUD, with the glTF scene added on top.
 pub fn custom_scene(db: &mut AssetDb, mut def: SceneDef, path: &Path) -> Result<(SceneDef, MapReport)> {
     prune_base(&mut def)?;
-    let report = append_gltf(db, &mut def, path)?;
+    let (mut report, enemies) = append_gltf_with(db, &mut def, path)?;
+    place_enemies(&mut def, &enemies, &mut report);
+    if enemies.iter().any(|(k, _)| *k != EnemyKind::MaliciousFace) {
+        report.warnings.push("no navmesh (custom maps have none yet): Filth and Strays walk straight at the player instead of pathing".into());
+    }
+    // the templates go, with the 0-1 rooms around them
+    let chain = template_chain(&def);
+    def.retain_nodes(|n| !chain[n as usize]);
+    def.warnings.extend(report.warnings.iter().cloned());
     Ok((def, report))
+}
+
+fn template_nodes(def: &SceneDef) -> Vec<(EnemyKind, Option<u32>)> {
+    EnemyKind::ALL.iter().map(|&(_, k)| (k, (0..def.nodes.len() as u32).find(|&n| def.path(n) == k.template()))).collect()
+}
+
+/// The enemy templates, their ancestors and their subtrees.
+fn template_chain(def: &SceneDef) -> Vec<bool> {
+    let mut chain = vec![false; def.nodes.len()];
+    for (_, t) in template_nodes(def) {
+        let Some(t) = t else { continue };
+        let mut p = def.nodes[t as usize].parent;
+        while let Some(q) = p {
+            chain[q as usize] = true;
+            p = def.nodes[q as usize].parent;
+        }
+        for n in 0..def.nodes.len() as u32 {
+            if def.is_descendant(n, t) {
+                chain[n as usize] = true;
+            }
+        }
+    }
+    chain
+}
+
+/// A copy of the kind's template at each placement: on the empty's origin, turned to face its
+/// forward, active, and without the spawn effect.
+fn place_enemies(def: &mut SceneDef, enemies: &[(EnemyKind, u32)], report: &mut MapReport) {
+    let templates = template_nodes(def);
+    for &(kind, at) in enemies {
+        let Some(t) = templates.iter().find(|(k, _)| *k == kind).and_then(|(_, t)| *t) else {
+            report.warnings.push(format!("{}: 0-1 has no {} to copy ({})", def.nodes[at as usize].name, kind.template(), "enemy skipped"));
+            continue;
+        };
+        let (ts, tr, _) = def.nodes[t as usize].world0.to_scale_rotation_translation();
+        let (_, pr, pp) = def.nodes[at as usize].world0.to_scale_rotation_translation();
+        let yaw = |r: Quat| {
+            let f = r * Vec3::NEG_Z;
+            f.x.atan2(-f.z)
+        };
+        // a turn about +Y by a lowers this yaw by a
+        let rot = Quat::from_rotation_y(yaw(tr) - yaw(pr)) * tr;
+        let root = def.clone_subtree(t, at, Mat4::from_scale_rotation_translation(ts, rot, pp));
+        def.nodes[root as usize].active_self = true;
+        // the copy's nodes are the last ones added
+        let n = def.nodes.len() as u32;
+        for s in def.scripts.iter_mut().filter(|s| s.class == "EnemyIdentifier" && s.node >= root && s.node < n) {
+            set_field(&mut s.data, "spawnIn", false);
+        }
+        report.enemies += 1;
+    }
 }
 
 /// Keeps FirstRoom (minus its Room geometry and the PlayerActivator Cube), StatsManager and
 /// EventSystem, and moves FirstRoom so the player stands at the origin facing -Z (glTF forward).
 fn prune_base(def: &mut SceneDef) -> Result<()> {
     let first = def.nodes.iter().position(|n| n.parent.is_none() && n.name == "FirstRoom").ok_or_else(|| Error("base scene has no FirstRoom".into()))? as u32;
+    // the enemy templates stay (with their ancestors) until custom_scene has copied them
+    let chain = template_chain(def);
     let keep: Vec<bool> = (0..def.nodes.len())
         .map(|i| {
             let n = &def.nodes[i];
+            let mut root = i;
+            while let Some(q) = def.nodes[root].parent {
+                root = q as usize;
+            }
+            if chain[root] {
+                return chain[i];
+            }
             match n.parent {
                 None => matches!(n.name.as_str(), "FirstRoom" | "StatsManager" | "EventSystem"),
                 Some(p) if p == first => !matches!(n.name.as_str(), "Room" | "Cube"),
@@ -121,12 +215,18 @@ struct NodeKind {
     col: Col,
     /// the mesh is not drawn
     only: bool,
+    enemy: Option<EnemyKind>,
 }
 
 fn classify(raw: &str, warnings: &mut Vec<String>) -> NodeKind {
-    let mut k = NodeKind { name: raw.to_string(), noimp: false, col: Col::None, only: false };
+    let mut k = NodeKind { name: raw.to_string(), noimp: false, col: Col::None, only: false, enemy: None };
     if has_suffix(raw, "noimp") {
         k.noimp = true;
+        return k;
+    }
+    if let Some(&(s, e)) = EnemyKind::ALL.iter().find(|(s, _)| has_suffix(raw, s)) {
+        k.name = strip_suffix(raw, s);
+        k.enemy = Some(e);
         return k;
     }
     let found = [("convcolonly", Col::Convex, true), ("colonly", Col::Tri, true), ("convcol", Col::Convex, false), ("col", Col::Tri, false)].into_iter().find(|(s, ..)| has_suffix(raw, s));
@@ -145,6 +245,19 @@ fn classify(raw: &str, warnings: &mut Vec<String>) -> NodeKind {
         }
     }
     k
+}
+
+/// Sets a serialized bool field (stored as a bool or an int) on a struct value.
+fn set_field(v: &mut crate::serialized::Value, key: &str, on: bool) {
+    use crate::serialized::Value;
+    let Value::Struct(fields) = v else { return };
+    if let Some((_, f)) = fields.iter_mut().find(|(k, _)| &**k == key) {
+        *f = match f {
+            Value::Bool(_) => Value::Bool(on),
+            Value::UInt(_) => Value::UInt(on as u64),
+            _ => Value::Int(on as i64),
+        };
+    }
 }
 
 fn extras_str(extras: &Option<Box<serde_json::value::RawValue>>, keys: &[&str]) -> Option<String> {
@@ -173,10 +286,19 @@ struct Ctx<'a> {
     /// glTF texture -> decoded image (None: undecodable)
     images: HashMap<usize, Option<Arc<TextureData>>>,
     white: Option<Arc<TextureData>>,
+    /// enemy placements: (kind, node)
+    enemies: Vec<(EnemyKind, u32)>,
 }
 
 /// Adds the glTF file's default scene under a new root node.
 pub fn append_gltf(db: &mut AssetDb, def: &mut SceneDef, path: &Path) -> Result<MapReport> {
+    let (report, _) = append_gltf_with(db, def, path)?;
+    def.warnings.extend(report.warnings.iter().cloned());
+    Ok(report)
+}
+
+/// `append_gltf`, also returning the enemy placements (warnings are left to the caller).
+fn append_gltf_with(db: &mut AssetDb, def: &mut SceneDef, path: &Path) -> Result<(MapReport, Vec<(EnemyKind, u32)>)> {
     let bytes = std::fs::read(path).map_err(|e| Error(format!("{}: {e}", path.display())))?;
     let g = gltf::Gltf::from_slice(&bytes).map_err(|e| Error(format!("{}: {e}", path.display())))?;
     let mut warnings = Vec::new();
@@ -214,19 +336,18 @@ pub fn append_gltf(db: &mut AssetDb, def: &mut SceneDef, path: &Path) -> Result<
         rect: None,
     });
     let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
-    let mut cx = Ctx { def, buffers, material, surface, report: MapReport { nodes: 1, warnings, ..Default::default() }, next_id: -0x6c74_6700_0000, dir, mats: HashMap::new(), images: HashMap::new(), white: None };
+    let mut cx = Ctx { def, buffers, material, surface, report: MapReport { nodes: 1, warnings, ..Default::default() }, next_id: -0x6c74_6700_0000, dir, mats: HashMap::new(), images: HashMap::new(), white: None, enemies: Vec::new() };
     let scene = g.default_scene().or_else(|| g.scenes().next()).ok_or_else(|| Error("glTF has no scene".into()))?;
     for n in scene.nodes() {
         visit(&mut cx, &n, root, Mat4::IDENTITY);
     }
-    let mut report = cx.report;
+    let (mut report, enemies) = (cx.report, cx.enemies);
     // Blender's exporter leaves lights out unless asked to
     if report.lights == 0 {
         report.warnings.push("no lights in the file (Blender: export with Include > Data > Punctual Lights)".into());
     }
-    def.warnings.extend(report.warnings.iter().cloned());
     report.warnings.dedup();
-    Ok(report)
+    Ok((report, enemies))
 }
 
 /// The placeholder material and the surface its collision geometry is tagged with (its own
@@ -284,7 +405,14 @@ fn visit(cx: &mut Ctx, n: &gltf::Node, parent: u32, parent_world: Mat4) {
     if n.camera().is_some() {
         cx.report.warnings.push(format!("{raw}: camera not imported"));
     }
+    if let Some(e) = kind.enemy {
+        if n.mesh().is_some() {
+            cx.report.warnings.push(format!("{raw}: an enemy goes on an empty; the mesh is not imported"));
+        }
+        cx.enemies.push((e, idx));
+    }
     match n.mesh() {
+        Some(_) if kind.enemy.is_some() => {}
         Some(mesh) => add_mesh(cx, &mesh, idx, world, &kind),
         None if kind.col != Col::None => add_empty_shape(cx, n, idx, world, &raw),
         None => {}

@@ -73,8 +73,10 @@ Placement conventions:
     spawn bubble.
   - Anywhere else: the enemy is in the level from the start, with no bubble.
 - **Properties:** `spawn_in` (true in waves, else false) overrides the bubble.
-- **Filth and Strays need a navmesh to chase the player** (see `-navmesh`). Without one they
-  stand still, and the parser warns.
+- **Filth and Strays need a navmesh to path to the player** (see `-navmesh`). Without one they
+  walk straight at the player (the port's fallback), and the parser warns.
+- **Implemented:** the three suffixes, outside waves only (no `-wave` or `spawn_in` yet). Every
+  placement warns about the missing navmesh until `-navmesh` is imported.
 
 ### Geometry with behaviour
 | Suffix | Object | Becomes | Collision | Properties (default) |

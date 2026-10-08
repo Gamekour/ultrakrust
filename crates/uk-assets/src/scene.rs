@@ -46,7 +46,7 @@ pub struct MaterialKey {
     pub path_id: i64,
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub struct Batch {
     pub positions: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,

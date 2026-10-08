@@ -66,6 +66,17 @@ fn main() {
         let (on, range) = g.s.lights[i];
         println!("light {}: kind {} color {:.3?} intensity {:.3} range {range:.2} spot {:.1} enabled {on} active {}", g.def.path(l.node), l.kind, l.color, l.intensity, l.spot_angle, g.active(l.node));
     }
+    let enemies = |g: &Game| {
+        for e in &g.s.enemies {
+            let spawn_fx = g.def.nodes[e.node as usize].children.iter().filter(|&&c| g.def.nodes[c as usize].name.starts_with("SpawnEffect") && g.active(c)).count();
+            println!(
+                "  enemy {:?} {}: active {} alive {} spawn_in {} hp {:.1} pos {:.2?} yaw {:.1} vel {:.2?} grounded {} spawn effects active {spawn_fx}",
+                e.kind, g.def.path(e.node), g.active(e.node), e.alive, e.spawn_in, e.health, e.pos, e.yaw.to_degrees(), e.vel, e.grounded
+            );
+        }
+    };
+    println!("enemies at start:");
+    enemies(&g);
     let p = &g.s.player;
     println!("start: pos {:.3?} yaw {:.1} activated {} timer {} level started {}", p.pos, g.spawn_yaw, p.activated, g.s.stats.timer, g.s.stats.level_started);
     let mut t = 0.0f64;
@@ -79,6 +90,8 @@ fn main() {
             println!("t {:.2}: pos {:.3?} vel {:.2?} grounded {} hp {}", g.s.time, p.pos, p.vel, p.gc.on_ground, g.s.hp);
         }
     }
+    println!("enemies after 3 s:");
+    enemies(&g);
     let p = g.s.player.pos;
     if let Some(h) = g.world.raycast(p, -Vec3::Y, 10.0) {
         let c = &g.def.colliders[g.world.owner(h.collider) as usize];
