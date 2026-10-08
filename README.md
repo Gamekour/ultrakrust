@@ -22,6 +22,17 @@ never written back.
   ULTRAKILL's post-processing.
 - **Custom maps** from glTF files (see below).
 
+## Not there yet
+- **Weapons and enemies:** only the revolver and the Feedbacker. Many enemies are partly ported;
+  bosses spawn but do little else, enemy projectiles are placeholders, and there are no death
+  animations or ragdolls.
+- **Sound and music:** none.
+- **Menus, settings and difficulty:** none; the game starts straight into a level.
+- **Game feel:** no style meter, freeze frames or muzzle flashes.
+- **Level features:** no secrets, skulls, pickups, bounce pads, terminals, cutscenes, intro text,
+  Cyber Grind or special levels.
+- **Known bugs** from playtesting are listed in [PARITY.md §7](PARITY.md#7-known-bugs-from-playtesting).
+
 [PARITY.md](PARITY.md) has the measured gap analysis against the original. [MODLOG.md](MODLOG.md)
 records each change, with the probe numbers behind it.
 

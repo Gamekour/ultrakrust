@@ -22,7 +22,7 @@ pub const PORTED: &[(&str, Port)] = &[
     ("ArenaStatus", Port::Full),
     ("ActivateNextWave", Port::Full),
     ("Breakable", Port::Partial("breakParticle (bounds centre, lossy scale, customPositionRotation); no debris/sound")),
-    ("Glass", Port::Partial("shatterParticle; no shards/sound")),
+    ("Glass", Port::Partial("shatterParticle; no shards/sound; every damage type breaks it (playtest)")),
     ("CheckPoint", Port::Partial("no rooms reset beyond snapshot; no sound/anim")),
     ("DeathZone", Port::Full),
     ("TeleportPlayer", Port::Full),
@@ -49,7 +49,7 @@ pub const PORTED: &[(&str, Port)] = &[
     ("GroundCheck", Port::Full),
     ("WallCheck", Port::Full),
     ("CameraController", Port::Partial("no screenshake, no options")),
-    ("Revolver", Port::Partial("piercer variant only; no coin/alt variants, no sound; viewmodel anim fed (Shoot/ChargeShoot)")),
+    ("Revolver", Port::Partial("piercer variant only; no coin/alt variants, no sound; viewmodel anim fed (Shoot/ChargeShoot); the charge-up effect is always on (playtest)")),
     ("Punch", Port::Partial("Feedbacker basics; no Knuckleblaster; viewmodel Jab/Jab2 fed")),
     // enemies (enemy.rs)
     ("EnemyIdentifier", Port::Partial("damage/limb multipliers; no buffs, blessing, radiance, sand")),
