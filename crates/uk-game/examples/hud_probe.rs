@@ -1,0 +1,182 @@
+//! Numeric time series of the HUD scripts (hud.rs) through 0-1's start: player activation,
+//! PlayerActivatorRelay, HudOpenEffect, HealthBar, StaminaMeter, damage, revolver pickup, death.
+//! cargo run --release -p uk-game --example hud_probe -- [level0-1] [KEY=V,...prefs overrides]
+use bevy_math::Vec3;
+use std::sync::Arc;
+use uk_assets::{db::AssetDb, scenedef, ui};
+use uk_core::consts::FIXED_DT;
+use uk_core::player::Input;
+use uk_game::hud::HudScript;
+use uk_game::scripts::Script;
+use uk_game::ugui::{self, UiInput};
+use uk_game::Game;
+
+fn step(g: &mut Game, frames: usize, t: &mut f64) {
+    let input = Input::default();
+    for _ in 0..frames {
+        g.fixed_update(&input);
+        *t += FIXED_DT as f64;
+        g.update(&input, FIXED_DT, *t);
+        g.s.player.events.clear();
+    }
+}
+
+fn find(g: &Game, end: &str) -> Option<u32> {
+    (0..g.def.nodes.len() as u32).find(|&n| g.def.path(n).ends_with(end))
+}
+
+fn report(g: &Game, t: f64) {
+    let ui = g.ui.as_ref().unwrap();
+    let mut line = format!("t={t:.3} hp={} boost={:.2}", g.s.hp, g.s.player.boost_charge);
+    for (sc, s) in g.s.scripts.iter().enumerate() {
+        let Script::Hud(h) = s else { continue };
+        let node = g.def.scripts[sc].node;
+        let live = g.active(node) && g.s.script_enabled[sc];
+        let name = &g.def.nodes[node as usize].name;
+        match &**h {
+            HudScript::OpenEffect(o) if live => {
+                let sc3 = g.s.ui.scale.get(&node).copied().unwrap_or(g.def.nodes[node as usize].local_scale);
+                line += &format!(" | OE {name} [{:.4},{:.4}] anim={}", sc3.x, sc3.y, o.animating);
+            }
+            HudScript::HealthBar(hb) if live => {
+                let sl: Vec<String> = hb.hp_sliders.iter().chain(&hb.after_image).filter_map(|s| ui.script_slider.get(s)).map(|&i| format!("{:.3}", g.s.ui.slider[i as usize])).collect();
+                let txt = hb.text.and_then(|t| ui.script_graphic.get(&t)).map(|&gi| (g.s.ui.text[gi as usize].clone(), g.s.ui.color[gi as usize]));
+                line += &format!(" | HB {name} hp={:.3} sliders={sl:?} text={txt:?}", hb.hp);
+            }
+            HudScript::Stamina(st) if live => {
+                let v = st.slider.and_then(|s| ui.script_slider.get(&s)).map(|&i| g.s.ui.slider[i as usize]);
+                let txt = st.text.map(|gi| (g.s.ui.text[gi as usize].clone(), g.s.ui.color[gi as usize]));
+                let bar = st.bar.map(|b| g.s.ui.color[b as usize]);
+                let fl = st.flash.map(|b| g.s.ui.color[b as usize][3]);
+                line += &format!(" | ST {name} s={:.3} v={v:?} full={} bar={bar:?} flash={fl:?} text={txt:?}", st.stamina, st.full);
+            }
+            _ => {}
+        }
+    }
+    println!("{line}");
+}
+
+fn main() {
+    let a: Vec<String> = std::env::args().collect();
+    let level = a.get(1).cloned().unwrap_or("level0-1".into());
+    let install = uk_assets::find_install().expect("install");
+    let mut db = AssetDb::open(&install).unwrap();
+    let def = Arc::new(scenedef::load_scene(&mut db, &AssetDb::bundle_dir(&install).join(format!("campaign_scenes_{level}.bundle"))).unwrap());
+    let mut g = Game::new(def.clone());
+    let mut prefs = uk_assets::prefs::Prefs::load(&install);
+    for kv in a.get(2).map(String::as_str).unwrap_or("").split(',').filter(|s| !s.is_empty()) {
+        if let Some((k, v)) = kv.split_once('=') {
+            prefs.set(k, v.parse::<f64>().unwrap());
+        }
+    }
+    g.prefs = prefs;
+    g.set_ui(ui::load_ui_assets(&mut db, &def));
+    let assets = g.ui_assets.clone().unwrap();
+    println!("colors hud {:?}", g.colors.hud);
+    println!("sway {:?}", g.sway);
+    let relay = g.def.scripts.iter().find(|s| s.class == "PlayerActivatorRelay").map(|s| s.data.get("toActivate").array().iter().filter_map(|p| def.node_ref(p)).collect::<Vec<u32>>()).unwrap_or_default();
+    let show_relay = |g: &Game| relay.iter().map(|&n| format!("{}={}", g.def.nodes[n as usize].name, g.active(n) as u8)).collect::<Vec<_>>().join(" ");
+    println!("relay at load: {}", show_relay(&g));
+    for n in ["Player/Canvas", "GunCanvas", "StyleCanvas"] {
+        if let Some(x) = find(&g, n) {
+            let c = g.ui.as_ref().unwrap().canvases.iter().position(|c| c.node == x);
+            println!("{n}: active={} canvas_enabled={:?} local={:?} z={:?}", g.active(x), c.map(|c| g.s.ui.canvas_enabled[c]), g.s.ui.local.get(&x), g.s.ui.z.get(&x));
+        }
+    }
+    let mut t = 0.0;
+    let mut was = false;
+    let mut since: Option<f64> = None;
+    for _ in 0..5000 {
+        step(&mut g, 1, &mut t);
+        if g.s.player.activated && !was {
+            was = true;
+            since = Some(t);
+            println!("activated at t={t:.3}: {}", show_relay(&g));
+        }
+        if let Some(s0) = since {
+            let k = ((t - s0) / FIXED_DT as f64).round() as i64;
+            if std::env::var_os("HUD_TRACE").is_some() && k < 60 {
+                let r = g.s.scripts.iter().find_map(|s| match s { Script::Hud(h) => match &**h { HudScript::Relay(r) => Some(r.index), _ => None }, _ => None });
+                println!("  k={k} relay_index={r:?} {} invokes={:?}", show_relay(&g), g.s.invokes.iter().map(|i| (i.act, i.at)).collect::<Vec<_>>());
+            }
+            if k % 25 == 0 && k <= 500 {
+                report(&g, t - s0);
+            }
+            if k % 25 == 0 && k <= 250 {
+                println!("  relay {}", show_relay(&g));
+            }
+            if k > 500 {
+                break;
+            }
+        }
+    }
+    // uGUI draws of the HUD
+    let frame = |g: &Game| {
+        ugui::build_frame(&UiInput { def: &g.def, ui: g.ui.as_ref().unwrap(), assets: &assets, state: &g.s.ui, active: &g.s.active, script_enabled: &g.s.script_enabled, screen: [1920.0, 1080.0], dpi: 96.0, world_of: Some(&|n| g.node_world(n)) })
+    };
+    let f = frame(&g);
+    for b in &f.batches {
+        let path = def.path(g.ui.as_ref().unwrap().canvases[b.canvas as usize].node);
+        if !path.contains("HUD") && !path.contains("Player/Canvas") {
+            continue;
+        }
+        println!("BATCH {path} draws {}", b.draws.len());
+        for d in &b.draws {
+            let gr = &g.ui.as_ref().unwrap().graphics[d.graphic as usize];
+            let mut mn = Vec3::splat(f32::MAX);
+            let mut mx = Vec3::splat(f32::MIN);
+            for v in &d.verts {
+                mn = mn.min(v.pos);
+                mx = mx.max(v.pos);
+            }
+            println!("  {} {} v{} col{:?} [{:.3},{:.3}]-[{:.3},{:.3}]", def.path(d.node).rsplit_once("HUD/").map_or(def.path(d.node).as_str(), |x| x.1), def.scripts[gr.script as usize].class, d.verts.len(), d.verts.first().map(|v| v.color), mn.x, mn.y, mx.x, mx.y);
+        }
+    }
+    // damage
+    g.hurt_player(75, false);
+    println!("hurt 75");
+    for i in 0..=20 {
+        if i % 5 == 0 {
+            report(&g, t);
+        }
+        step(&mut g, 5, &mut t);
+    }
+    g.heal_player(60);
+    println!("heal 60");
+    for i in 0..=40 {
+        if i % 5 == 0 {
+            report(&g, t);
+        }
+        step(&mut g, 5, &mut t);
+    }
+    // dash: stamina drain and refill
+    g.s.player.boost_charge -= 100.0;
+    println!("boost -100");
+    for i in 0..=60 {
+        if i % 6 == 0 {
+            report(&g, t);
+        }
+        step(&mut g, 5, &mut t);
+    }
+    // revolver
+    if let Some(p) = find(&g, "3 - Gun Room/RevolverPickUp") {
+        g.s.player.pos = g.def.nodes[p as usize].world0.w_axis.truncate() + Vec3::Y * 0.5;
+        g.s.player.prev_pos = g.s.player.pos;
+        step(&mut g, 30, &mut t);
+        println!("revolver={} gunpanel: {}", g.s.has_revolver, ["GunPanel"].iter().filter_map(|n| find(&g, &format!("GunCanvas/{n}"))).map(|n| g.active(n)).map(|a| a.to_string()).collect::<Vec<_>>().join(","));
+    }
+    // sway with velocity
+    g.s.player.vel = Vec3::new(0.0, 0.0, 30.0);
+    let sw = g.sway.unwrap();
+    for _ in 0..3 {
+        step(&mut g, 1, &mut t);
+    }
+    println!("sway after 3 frames at vel 30: hud {:?} cam {:?}", g.s.ui.local.get(&sw.screen_hud), g.s.ui.local.get(&sw.hud_cam));
+    g.hurt_player(999, false);
+    println!("dead: screenHud active={}", g.active(sw.screen_hud));
+    step(&mut g, 10, &mut t);
+    g.respawn();
+    println!("respawn: screenHud active={}", g.active(sw.screen_hud));
+    step(&mut g, 1, &mut t);
+    report(&g, t);
+}

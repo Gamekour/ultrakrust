@@ -278,6 +278,8 @@ pub enum Script {
     DualWieldPickup { infinite: bool, juice: f32 },
     /// DisablePowerUp: Start ends a running power-up.
     DisablePowerUp,
+    /// HUD scripts (hud.rs)
+    Hud(Box<crate::hud::HudScript>),
     Other,
 }
 
@@ -448,7 +450,7 @@ pub fn parse(def: &SceneDef, idx: usize) -> Script {
         "OnLevelStart" => Script::OnLevelStart { on_start: parse_uevent(def, v.get("onStart")), activated: false },
         "DualWieldPickup" => Script::DualWieldPickup { infinite: b("infiniteUses"), juice: f("juiceAmount") },
         "DisablePowerUp" => Script::DisablePowerUp,
-        _ => Script::Other,
+        _ => crate::hud::parse(def, idx).map_or(Script::Other, |h| Script::Hud(Box::new(h))),
     }
 }
 

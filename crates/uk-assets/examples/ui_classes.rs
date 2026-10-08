@@ -1,5 +1,6 @@
 //! Script classes on the nodes under a path prefix (active flag split), for scoping uGUI work.
 //! cargo run --release -p uk-assets --example ui_classes -- level0-1 [path-prefix]
+//! UI_CLASS=A,B lists those classes' active paths (UI_ALL=1: inactive too).
 use std::collections::BTreeMap;
 use uk_assets::{db::AssetDb, scenedef};
 
@@ -25,8 +26,8 @@ fn main() {
         if !def.path(s.node).starts_with(&prefix) || def.nodes[s.node as usize].rect.is_none() {
             continue;
         }
-        if std::env::var("UI_CLASS").is_ok_and(|c| c == s.class) && active(s.node) && s.enabled {
-            println!("{}", def.path(s.node));
+        if std::env::var("UI_CLASS").is_ok_and(|c| c.split(',').any(|c| c == s.class)) && (std::env::var("UI_ALL").is_ok() || active(s.node) && s.enabled) {
+            println!("{} {} {}{}", s.class, def.path(s.node), if active(s.node) { "" } else { "(inactive)" }, if s.enabled { "" } else { "(disabled)" });
         }
         let e = counts.entry(s.class.clone()).or_default();
         if active(s.node) && s.enabled {

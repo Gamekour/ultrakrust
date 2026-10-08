@@ -282,6 +282,8 @@ pub struct UnityFrame {
     pub vignette: Option<[f32; 4]>,
     /// `_RandomNoiseStrength` while WICKED is on
     pub noise: Option<f32>,
+    /// the HUD Camera's current world matrix (Bevy space; NewMovement's HUD sway moves it)
+    pub hud_cam: Option<Mat4>,
 }
 
 impl UnityFrame {
@@ -1121,10 +1123,10 @@ pub fn frame(game: &uk_game::Game, scene: &SceneData, time: f32, screen: [f32; 2
             script_enabled: &s.script_enabled,
             screen,
             dpi: 96.0,
-            world_of: Some(&|n| game.anim.world_of(n)),
+            world_of: Some(&|n| game.node_world(n)),
         });
         // a world-space root draws with its node's current (Unity-space) world matrix
-        let world = f.batches.iter().map(|b| if b.mode == uk_game::ugui::RenderMode::World { game.anim.world_of(b.root_node) } else { b.to_screen }).collect();
+        let world = f.batches.iter().map(|b| if b.mode == uk_game::ugui::RenderMode::World { game.node_world(b.root_node) } else { b.to_screen }).collect();
         (Arc::new(f), Arc::new(world))
     });
     UnityFrame {
@@ -1140,6 +1142,7 @@ pub fn frame(game: &uk_game::Game, scene: &SceneData, time: f32, screen: [f32; 2
         underwater: s.underwater_overlay,
         vignette: s.vignette,
         noise: s.screen_noise,
+        hud_cam: scene.hud_cam.and(game.sway).map(|sw| game.node_world_bevy(sw.hud_cam)),
     }
 }
 
@@ -2038,6 +2041,7 @@ fn prepare(
     };
     // HUD Camera: the viewmodel animates in its load-time world space, so its camera stays there too
     let hud_ctx = scene.hud_cam.map(|(w, fov)| {
+        let w = frame.hud_cam.unwrap_or(w);
         let v = w.inverse() * mirror;
         let fy = 1.0 / (fov.to_radians() * 0.5).tan();
         let proj = Mat4::from_cols(proj.x_axis * (fy / proj.y_axis.y), proj.y_axis * (fy / proj.y_axis.y), proj.z_axis, proj.w_axis);
@@ -2646,7 +2650,7 @@ fn draw(
     let cam = extracted.world_from_view.translation();
     let cam_u = Vec3::new(cam.x, cam.y, -cam.z);
     let hud_u = scene.hud_cam.map_or(cam_u, |(w, _)| {
-        let c = w.w_axis.truncate();
+        let c = world.resource::<UnityFrame>().hud_cam.unwrap_or(w).w_axis.truncate();
         Vec3::new(c.x, c.y, -c.z)
     });
     let sorted = |hud: bool| {

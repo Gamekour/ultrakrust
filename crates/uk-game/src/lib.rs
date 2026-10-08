@@ -7,6 +7,7 @@ pub mod anim;
 pub mod bot;
 pub mod enemy;
 pub mod game;
+pub mod hud;
 pub mod nav;
 pub mod parity;
 pub mod scripts;

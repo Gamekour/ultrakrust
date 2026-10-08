@@ -437,3 +437,21 @@ CPU-skinned enemies, 3,393 colliders/569 triggers, 11,758 MonoBehaviours with ty
   - Enabled sliders drive their fill/handle anchors every layout (OnEnable -> UpdateVisuals).
   - SelectableDef from any script with m_Transition/m_Colors/m_TargetGraphic: enabled ColorTint selectables set their target's CanvasRenderer colour to normal or disabled (m_Interactable and ParentGroupAllowsInteraction, CanvasGroup.interactable) times the multiplier. No pointer/selection states yet (no EventSystem).
   - `ugui_frame` (0-1): style meter fill at value 0 is the 10x25 sizeDelta nub (was zero-height); freshness fills Dull 442 wide (value 1), others 0.
+
+- HUD scripts (`crates/uk-game/src/hud.rs`, `Script::Hud`):
+  - PlayerActivatorRelay: PlayerActivator (not onlyActivatePlayer) runs ResetIndex + Activate, one `toActivate` entry per `delay` (Act::HudRelay). The gun panel needs weapons and weaponIcons; the crosshair always shows. GunControl.Start hides `gunPanel` without weapons; the revolver pickup runs UpdateWeaponIcon.
+  - HudOpenEffect: Awake Initialize, OnEnable ResetValues (scale 0.05 or sizeDelta), Update's MoveTowards (|t−v|+0.1)·speed, x then y (or YFirst), closes into SetActive(false) at 0,0; Reverse.
+  - HealthBar, StaminaMeter: literal Updates over `UiState` sliders, Graphic colours and TMP text. `hud::net_fixed` formats "F0" and "0.00" like Mono (7 significant digits, then half away from zero).
+  - ColorBlindSettings colours with ColorBlindActivator.Start's ColorBlindSetter prefs (`hudColor.<name>.r/g/b`); ColorBlindGet on Start/OnEnable.
+  - HudController.Start: CheckSituation (hudType 1 = GunCanvas enabled at z 1, else z −100 and disabled; alt HUDs by hudType 2/3), weaponIcons/armIcons/styleMeter/styleInfo, hudBackgroundOpacity. HUDPos.CheckPos with weaponHoldPosition.
+  - NewMovement: screenHud off at death, on at respawn; HUD/hudCam velocity sway (`UiState::local`, `Game::node_world`); the renderer takes the HUD Camera from `UnityFrame::hud_cam` each frame.
+  - Game gets `prefs` (the frontend sets them before `set_ui`). set_ui replays the HUD scripts' Awake/OnEnable/Start, then retakes the start snapshot.
+  - `hud_probe` (0-1):
+    - The player-only activator fires at landing (t 2.28). The ObjectActivator's PlayerActivator follows 0.208 s later, and the relay then takes 0.2 s per entry: StatsPanel, Panel (2), Panel (3), GunPanel (skipped, no weapon), RailcannonChargePanel, Image, Crosshair Filler, SpeedometerPanel.
+    - StatsPanel opens 0.05 → 4 in under 0.2 s.
+    - HP counts up 0 → 63 → 87 → 96 → 99 → 100 over 1.2 s, text "63"…"100".
+    - Stamina ramps to 300 and each slider flashes when it fills.
+    - Hurt 75: hp 25 at once, after-image 51.4 → 33.9 → 27.6 → 25.3. The classic text stays white (changeTextColor 0, normalTextColor clear).
+    - Boost −100: slider 3 at 215.6, alpha 0.6 charging colour, then a full flash.
+    - Revolver: GunPanel on.
+    - Death/respawn toggle screenHud.

@@ -68,6 +68,17 @@ pub const PORTED: &[(&str, Port)] = &[
     ("Slider", Port::Partial("value -> fill/handle anchors and Filled amount; no dragging/navigation")),
     ("Button", Port::Partial("ColorTint normal/disabled only; no EventSystem")),
     ("Text", Port::Partial("not meshed (Unity's native TextGenerator)")),
+    // HUD (hud.rs)
+    ("PlayerActivatorRelay", Port::Full),
+    ("HudOpenEffect", Port::Full),
+    ("HealthBar", Port::Partial("NewMovement.antiHp (hard damage) not ported: always 0")),
+    ("StaminaMeter", Port::Partial("no flash sound")),
+    ("ColorBlindGet", Port::Full),
+    ("ColorBlindSettings", Port::Partial("HUD and variation colours; enemy colours unused")),
+    ("ColorBlindSetter", Port::Partial("prefs applied at load (ColorBlindActivator.Start); no options menu")),
+    ("ColorBlindActivator", Port::Full),
+    ("HudController", Port::Partial("no fist fill (WeaponCharges.punchStamina), no SetAlwaysOnTop material swap, no HideUI cheat")),
+    ("HUDPos", Port::Full),
 ];
 
 pub fn status(class: &str) -> Option<Port> {

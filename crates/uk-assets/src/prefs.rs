@@ -32,6 +32,18 @@ const DEFAULTS: &[(&str, f64)] = &[
     ("simplifyEnemies", 0.0),
 ];
 
+/// PrefsManager.defaultValues' booleans (GetBool of a key with no default is false).
+const BOOL_DEFAULTS: &[(&str, bool)] = &[
+    ("cameraTilt", true),
+    ("weaponIcons", true),
+    ("armIcons", true),
+    ("styleMeter", true),
+    ("styleInfo", true),
+    ("crossHairHudFade", true),
+    ("powerUpMeter", true),
+    ("railcannonMeter", true),
+];
+
 #[derive(Default, Clone, Debug)]
 pub struct Prefs {
     map: HashMap<String, Value>,
@@ -64,6 +76,16 @@ impl Prefs {
 
     pub fn bool(&self, key: &str, default: bool) -> bool {
         self.get(key).and_then(Value::as_bool).unwrap_or(default)
+    }
+
+    /// PrefsManager.GetBool(key): the stored value, else the default table, else false.
+    pub fn flag(&self, key: &str) -> bool {
+        self.bool(key, BOOL_DEFAULTS.iter().find(|d| d.0 == key).is_some_and(|d| d.1))
+    }
+
+    /// PrefsManager.GetFloat(key, fallback): the stored value, else `fallback`.
+    pub fn float_or(&self, key: &str, fallback: f32) -> f32 {
+        self.get(key).and_then(Value::as_f64).map_or(fallback, |v| v as f32)
     }
 
     /// Overrides a value for this run (never written back).

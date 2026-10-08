@@ -495,6 +495,11 @@ pub struct UiState {
     pub slider: Vec<f32>,
     /// Selectable.m_Interactable per selectable
     pub interactable: Vec<bool>,
+    /// RectTransform localPosition.z overrides (Unity space)
+    pub z: HashMap<u32, f32>,
+    /// Transform localPosition / localRotation overrides (Unity space) for nodes placed outside
+    /// the RectTransform layout: world-space canvas roots and their ancestors (`Game::node_world`)
+    pub local: HashMap<u32, (Vec3, Quat)>,
 }
 
 impl UiState {
@@ -513,6 +518,8 @@ impl UiState {
             text: vec![None; ui.graphics.len()],
             slider: ui.sliders.iter().map(|s| s.value).collect(),
             interactable: ui.selectables.iter().map(|s| s.interactable).collect(),
+            z: HashMap::new(),
+            local: HashMap::new(),
         }
     }
 
@@ -1700,7 +1707,7 @@ impl<'a> Layout<'a> {
                 let psize = Vec2::new(parent_rect.w, parent_rect.h);
                 let size = psize * (amax - amin) + Vec2::from_array(rd.size_delta);
                 let p = Vec2::new(parent_rect.x, parent_rect.y) + psize * (amin + (amax - amin) * pivot) + Vec2::from_array(rd.anchored_pos);
-                (Vec3::new(p.x, p.y, -nd.local_pos.z), Rect { x: -pivot.x * size.x, y: -pivot.y * size.y, w: size.x, h: size.y })
+                (Vec3::new(p.x, p.y, self.inp.state.z.get(&n).copied().unwrap_or(-nd.local_pos.z)), Rect { x: -pivot.x * size.x, y: -pivot.y * size.y, w: size.x, h: size.y })
             }
             None => (to_bevy_point(nd.local_pos), Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }),
         };

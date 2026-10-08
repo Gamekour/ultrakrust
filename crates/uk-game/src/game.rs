@@ -23,6 +23,8 @@ pub enum Act {
     FinalDoorOpenDoors,
     FinalDoorOpenerGoTime,
     HideMessage,
+    /// PlayerActivatorRelay.Activate
+    HudRelay,
 }
 
 #[derive(Clone, Debug)]
@@ -242,6 +244,14 @@ pub struct Game {
     /// uGUI scene: canvases / graphics resolved against the loaded UI assets (`set_ui`)
     pub ui: Option<Arc<crate::ugui::UiDef>>,
     pub ui_assets: Option<Arc<uk_assets::ui::UiAssets>>,
+    /// The player's prefs (read-only): HUD options, difficulty
+    pub prefs: uk_assets::prefs::Prefs,
+    /// ColorBlindSettings with the hudColor prefs applied (set_ui)
+    pub colors: crate::hud::ColorBlind,
+    /// NewMovement.screenHud / hudCam sway
+    pub sway: Option<crate::hud::Sway>,
+    /// GunControl.gunPanel: the weapon icon panels
+    gun_panel: Vec<u32>,
 }
 
 struct WaterDef {
@@ -453,6 +463,10 @@ impl Game {
             death_ui: DeathUi::from_def(&def),
             ui: None,
             ui_assets: None,
+            prefs: Default::default(),
+            colors: crate::hud::ColorBlind { variation: Vec::new(), hud: [crate::hud::WHITE; 10] },
+            sway: crate::hud::Sway::from_def(&def),
+            gun_panel: def.scripts.iter().find(|s| s.class == "GunControl").map_or(Vec::new(), |s| s.data.get("gunPanel").array().iter().filter_map(|p| def.node_ref(p)).collect()),
         };
         g.distortion_fields = (0..def.scripts.len() as u32)
             .filter(|&i| def.scripts[i as usize].class == "ScreenDistortionField")
@@ -499,6 +513,12 @@ impl Game {
         }
         if let Some(r) = g.vm_revolver {
             g.s.active_self[r as usize] = g.s.has_revolver;
+        }
+        // GunControl.Start: UpdateWeaponList(firstTime) -> UpdateWeaponIcon; no weapons hides every panel
+        if !g.s.has_revolver {
+            for &p in &g.gun_panel {
+                g.s.active_self[p as usize] = false;
+            }
         }
         // StatsManager.Start: fr.gameObject.SetActive(false)
         if let Some(f) = g.final_rank {
@@ -564,7 +584,7 @@ impl Game {
         }
     }
 
-    fn flush_events(&mut self) {
+    pub(crate) fn flush_events(&mut self) {
         while !self.pending_events.is_empty() {
             let batch: Vec<(u32, bool)> = std::mem::take(&mut self.pending_events);
             for (sc, on) in batch {
@@ -674,12 +694,12 @@ impl Game {
         self.s.uwc_waters = kept;
     }
 
-    fn script_live(&self, sc: u32) -> bool {
+    pub(crate) fn script_live(&self, sc: u32) -> bool {
         let i = sc as usize;
         self.s.active[self.def.scripts[i].node as usize] && self.s.script_enabled[i]
     }
 
-    fn invoke(&mut self, sc: u32, act: Act, delay: f32) {
+    pub(crate) fn invoke(&mut self, sc: u32, act: Act, delay: f32) {
         self.s.invokes.push(Invoke { at: self.s.time + delay as f64, script: sc, act });
     }
 
@@ -717,6 +737,7 @@ impl Game {
                     }
                 }
             }
+            Script::Hud(_) => self.hud_awake(sc),
             _ => {}
         }
     }
@@ -765,6 +786,7 @@ impl Game {
                 let e = *e;
                 enemy::on_enable(self, e);
             }
+            Script::Hud(_) => self.hud_enable(sc),
             _ => {}
         }
     }
@@ -840,6 +862,7 @@ impl Game {
                         self.end_power_up();
                     }
                 }
+                Script::Hud(_) => self.hud_start(sc),
                 _ => {}
             }
         }
@@ -1588,7 +1611,12 @@ impl Game {
             return;
         }
         *activated = true;
+        let only = matches!(self.s.scripts[sc as usize], Script::PlayerActivator { only_player: true, .. });
         self.s.player.activated = true;
+        if !only {
+            // ActivateObjects: PlayerActivatorRelay.ResetIndex + Activate
+            self.relay_reset_activate();
+        }
     }
 
     /// OnLevelStart.Update: once the level has started (StatsManager's timer, i.e. the player
@@ -2019,6 +2047,10 @@ impl Game {
             self.s.death_screen = false;
             // NewMovement.GetHurt death: PowerUpMeter.juice = 0
             self.s.power_juice = 0.0;
+            // NewMovement.GetHurt death: screenHud.SetActive(false)
+            if let Some(sw) = self.sway {
+                self.set_active(sw.screen_hud, false);
+            }
             self.events.push(GameEvent::Died);
         }
     }
@@ -2065,6 +2097,11 @@ impl Game {
         // DeathSequence.OnDisable
         self.s.dead_timer = 0.0;
         self.s.death_screen = false;
+        // NewMovement.Respawn: screenHud.SetActive(true)
+        if let Some(sw) = self.sway {
+            self.set_active(sw.screen_hud, true);
+            self.flush_events();
+        }
         self.full_refresh = true;
         self.events.push(GameEvent::Respawned);
         self.sync_world();
@@ -2079,6 +2116,13 @@ impl Game {
         }
         self.ui = Some(Arc::new(def));
         self.ui_assets = Some(Arc::new(assets));
+        self.colors = crate::hud::ColorBlind::build(&self.def, &self.prefs);
+        // the HUD scripts ran Awake/OnEnable/Start before the UI existed
+        self.hud_replay();
+        self.flush_events();
+        if self.start.is_some() {
+            self.start = Some(Box::new(self.s.clone()));
+        }
     }
 
     /// Re-takes the level-start snapshot (after the caller customised the initial state).
@@ -2183,6 +2227,7 @@ impl Game {
             if self.s.dead_timer >= 2.0 {
                 self.s.death_screen = true;
             }
+            self.hud_update(dt);
             return;
         }
         self.run_starts();
@@ -2219,6 +2264,7 @@ impl Game {
                     }
                 }
                 Act::HideMessage => {}
+                Act::HudRelay => self.relay_activate(inv.script),
             }
         }
         // per-script Update
@@ -2252,6 +2298,8 @@ impl Game {
         let world = std::mem::take(&mut self.world);
         self.s.player.update(&world, input, dt, now);
         self.world = world;
+        self.hud_sway(dt);
+        self.hud_update(dt);
         enemy::update(self, dt);
         // Falling out of the world: treat like an out-of-bounds death.
         if self.s.player.pos.y < -1000.0 {
@@ -2269,12 +2317,14 @@ impl Game {
         if self.s.has_revolver {
             return;
         }
-        for &n in &self.changed_nodes {
-            let name = &self.def.nodes[n as usize].name;
-            if !self.s.active[n as usize] && name.starts_with("RevolverPickUp") {
-                self.s.has_revolver = true;
-                self.events.push(GameEvent::WeaponGot("REVOLVER"));
-                break;
+        let got = self.changed_nodes.iter().any(|&n| !self.s.active[n as usize] && self.def.nodes[n as usize].name.starts_with("RevolverPickUp"));
+        if got {
+            self.s.has_revolver = true;
+            self.events.push(GameEvent::WeaponGot("REVOLVER"));
+            // WeaponPickUp: GunControl.UpdateWeaponList() -> UpdateWeaponIcon()
+            let on = self.prefs.flag("weaponIcons");
+            for p in self.gun_panel.clone() {
+                self.set_active(p, on);
             }
         }
     }
@@ -2298,7 +2348,7 @@ fn seg_seg_dist(a: Vec3, b: Vec3, c: Vec3, d: Vec3) -> f32 {
 }
 
 /// CameraController's view rotation for (rotationY, rotationX) in degrees (Bevy space, -Z forward).
-fn view_quat(yaw: f32, pitch: f32) -> Quat {
+pub(crate) fn view_quat(yaw: f32, pitch: f32) -> Quat {
     Quat::from_rotation_y(-yaw.to_radians()) * Quat::from_rotation_x(pitch.to_radians())
 }
 
