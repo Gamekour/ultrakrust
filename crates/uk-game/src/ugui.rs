@@ -52,6 +52,7 @@ pub struct GroupDef {
     pub enabled: bool,
     pub alpha: f32,
     pub ignore_parent: bool,
+    pub interactable: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -121,6 +122,92 @@ pub struct RectMaskDef {
     pub softness: [i32; 2],
 }
 
+/// Selectable's colour-tint fields (Button, Slider, Toggle, Scrollbar, InputField, Dropdown, ...)
+#[derive(Clone, Debug)]
+pub struct SelectableDef {
+    pub script: u32,
+    pub node: u32,
+    /// 0 None, 1 ColorTint, 2 SpriteSwap, 3 Animation
+    pub transition: i64,
+    pub normal: [f32; 4],
+    pub disabled: [f32; 4],
+    pub multiplier: f32,
+    /// m_TargetGraphic (graphic index)
+    pub target: Option<u32>,
+    pub interactable: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct SliderDef {
+    pub script: u32,
+    pub node: u32,
+    /// m_FillRect / m_HandleRect after UpdateCachedReferences (None when unset, self, or parentless)
+    pub fill: Option<u32>,
+    pub handle: Option<u32>,
+    /// 0 LeftToRight, 1 RightToLeft, 2 BottomToTop, 3 TopToBottom
+    pub direction: i64,
+    pub min: f32,
+    pub max: f32,
+    pub whole: bool,
+    pub value: f32,
+}
+
+impl SliderDef {
+    fn clamp(&self, v: f32) -> f32 {
+        let n = v.clamp(self.min, self.max);
+        if self.whole {
+            n.round()
+        } else {
+            n
+        }
+    }
+    fn axis(&self) -> usize {
+        if self.direction != 0 && self.direction != 1 {
+            1
+        } else {
+            0
+        }
+    }
+    fn reverse(&self) -> bool {
+        self.direction == 1 || self.direction == 3
+    }
+    /// normalizedValue (Mathf.Approximately(min, max) -> 0, else InverseLerp)
+    pub fn normalized(&self, value: f32) -> f32 {
+        let v = if self.whole { value.round() } else { value };
+        let eps = (1e-6 * self.min.abs().max(self.max.abs())).max(f32::EPSILON * 8.0);
+        if (self.max - self.min).abs() < eps {
+            return 0.0;
+        }
+        ((v - self.min) / (self.max - self.min)).clamp(0.0, 1.0)
+    }
+    /// UpdateVisuals: (fill anchors, fill image amount, handle anchors)
+    #[allow(clippy::type_complexity)]
+    fn visuals(&self, value: f32, fill_filled: bool) -> (Option<([f32; 2], [f32; 2])>, Option<f32>, Option<([f32; 2], [f32; 2])>) {
+        let nv = self.normalized(value);
+        let a = self.axis();
+        let fill = self.fill.map(|_| {
+            let (mut zero, mut one) = ([0.0f32; 2], [1.0f32; 2]);
+            if !fill_filled {
+                if self.reverse() {
+                    zero[a] = 1.0 - nv;
+                } else {
+                    one[a] = nv;
+                }
+            }
+            (zero, one)
+        });
+        let amount = (self.fill.is_some() && fill_filled).then_some(nv);
+        let handle = self.handle.map(|_| {
+            let (mut zero, mut one) = ([0.0f32; 2], [1.0f32; 2]);
+            let v = if self.reverse() { 1.0 - nv } else { nv };
+            one[a] = v;
+            zero[a] = v;
+            (zero, one)
+        });
+        (fill, amount, handle)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct EffectDef {
     pub script: u32,
@@ -141,6 +228,9 @@ pub struct UiDef {
     pub masks: Vec<MaskDef>,
     pub rect_masks: Vec<RectMaskDef>,
     pub effects: Vec<EffectDef>,
+    pub selectables: Vec<SelectableDef>,
+    pub sliders: Vec<SliderDef>,
+    pub script_slider: HashMap<u32, u32>,
     pub node_canvas: HashMap<u32, u32>,
     pub node_group: HashMap<u32, u32>,
     pub node_scaler: HashMap<u32, u32>,
@@ -208,6 +298,7 @@ impl UiDef {
                         enabled: d.get("m_Enabled").bool(),
                         alpha: d.get("m_Alpha").f32(),
                         ignore_parent: d.get("m_IgnoreParentGroups").bool(),
+                        interactable: d.get("m_Interactable").bool(),
                     });
                 }
                 _ => {}
@@ -237,6 +328,37 @@ impl UiDef {
                 material: assets.material(si, "m_Material"),
                 maskable: d.get("m_Maskable").bool(),
             };
+            if d.has("m_Transition") && d.has("m_Colors") && d.has("m_TargetGraphic") {
+                let c = d.get("m_Colors");
+                ui.selectables.push(SelectableDef {
+                    script: si,
+                    node: s.node,
+                    transition: d.get("m_Transition").i64(),
+                    normal: color4(c.get("m_NormalColor")),
+                    disabled: color4(c.get("m_DisabledColor")),
+                    multiplier: c.get("m_ColorMultiplier").f32(),
+                    // resolved to a graphic index below
+                    target: def.script_ref(d.get("m_TargetGraphic")),
+                    interactable: d.get("m_Interactable").bool(),
+                });
+            }
+            if d.has("m_FillRect") && d.has("m_HandleRect") && d.has("m_Direction") && d.has("m_WholeNumbers") {
+                // UpdateCachedReferences
+                let cached = |f: &str| def.node_ref(d.get(f)).filter(|&r| r != s.node && def.nodes[r as usize].parent.is_some_and(|p| def.nodes[p as usize].rect.is_some()));
+                let sl = SliderDef {
+                    script: si,
+                    node: s.node,
+                    fill: cached("m_FillRect"),
+                    handle: cached("m_HandleRect"),
+                    direction: d.get("m_Direction").i64(),
+                    min: d.get("m_MinValue").f32(),
+                    max: d.get("m_MaxValue").f32(),
+                    whole: d.get("m_WholeNumbers").bool(),
+                    value: d.get("m_Value").f32(),
+                };
+                ui.script_slider.insert(si, ui.sliders.len() as u32);
+                ui.sliders.push(sl);
+            }
             let g = match s.class.as_str() {
                 "Image" => Some(graphic(GraphicKind::Image(ImageDef {
                     sprite: assets.sprite(si, "m_Sprite"),
@@ -330,7 +452,21 @@ impl UiDef {
                 ui.graphics.push(g);
             }
         }
+        for i in 0..ui.selectables.len() {
+            ui.selectables[i].target = ui.selectables[i].target.and_then(|t| ui.script_graphic.get(&t).copied());
+        }
         ui
+    }
+
+    /// m_FillImage: the Image on the slider's fill rect
+    fn slider_fill_image(&self, sl: &SliderDef) -> Option<u32> {
+        let g = *self.node_graphic.get(&sl.fill?)?;
+        matches!(&self.graphics[g as usize].kind, GraphicKind::Image(_)).then_some(g)
+    }
+
+    fn slider_fill_filled(&self, sl: &SliderDef) -> (Option<u32>, bool) {
+        let g = self.slider_fill_image(sl);
+        (g, g.is_some_and(|g| matches!(&self.graphics[g as usize].kind, GraphicKind::Image(im) if im.ty == 3)))
     }
 }
 
@@ -355,6 +491,10 @@ pub struct UiState {
     pub group_enabled: Vec<bool>,
     /// TMP_Text.text set by scripts per graphic (None: the serialized text)
     pub text: Vec<Option<Arc<str>>>,
+    /// Slider.m_Value per slider
+    pub slider: Vec<f32>,
+    /// Selectable.m_Interactable per selectable
+    pub interactable: Vec<bool>,
 }
 
 impl UiState {
@@ -371,7 +511,35 @@ impl UiState {
             group_alpha: ui.groups.iter().map(|g| g.alpha).collect(),
             group_enabled: ui.groups.iter().map(|g| g.enabled).collect(),
             text: vec![None; ui.graphics.len()],
+            slider: ui.sliders.iter().map(|s| s.value).collect(),
+            interactable: ui.selectables.iter().map(|s| s.interactable).collect(),
         }
+    }
+
+    /// Slider.Set(value, sendCallback): Some(new value) when it changed (onValueChanged fires).
+    /// UpdateVisuals writes the driven anchors / fill amount even while the slider is inactive.
+    pub fn set_slider(&mut self, def: &SceneDef, ui: &UiDef, i: u32, v: f32) -> Option<f32> {
+        let sl = &ui.sliders[i as usize];
+        let n = sl.clamp(v);
+        if self.slider[i as usize] == n {
+            return None;
+        }
+        self.slider[i as usize] = n;
+        let (fill_img, filled) = ui.slider_fill_filled(sl);
+        let (fa, amount, ha) = sl.visuals(n, filled);
+        for (node, a) in [(sl.fill, fa), (sl.handle, ha)] {
+            if let (Some(node), Some((amin, amax))) = (node, a) {
+                if let Some(mut r) = self.rects.get(&node).copied().or(def.nodes[node as usize].rect) {
+                    r.anchor_min = amin;
+                    r.anchor_max = amax;
+                    self.rects.insert(node, r);
+                }
+            }
+        }
+        if let (Some(g), Some(a)) = (fill_img, amount) {
+            self.fill[g as usize] = a.clamp(0.0, 1.0);
+        }
+        Some(n)
     }
 }
 
@@ -1065,6 +1233,12 @@ struct Layout<'a> {
     frame: UiFrame,
     /// per node script indices (component order)
     scripts_by_node: HashMap<u32, Vec<u32>>,
+    /// anchors driven by enabled Sliders (OnEnable -> UpdateVisuals)
+    driven_anchors: HashMap<u32, ([f32; 2], [f32; 2])>,
+    /// Image.fillAmount driven by enabled Sliders
+    driven_fill: HashMap<u32, f32>,
+    /// CanvasRenderer colour set by enabled Selectables' instant colour tint
+    tint: HashMap<u32, [f32; 4]>,
 }
 
 /// RectTransform world corners (0: bottom-left, 1: top-left, 2: top-right, 3: bottom-right) in root space
@@ -1340,7 +1514,64 @@ impl<'a> Layout<'a> {
     }
 
     fn rect_def(&self, n: u32) -> Option<RectDef> {
-        self.inp.state.rects.get(&n).copied().or(self.inp.def.nodes[n as usize].rect)
+        let r = self.inp.state.rects.get(&n).copied().or(self.inp.def.nodes[n as usize].rect);
+        match (r, self.driven_anchors.get(&n)) {
+            (Some(mut r), Some(&(amin, amax))) => {
+                r.anchor_min = amin;
+                r.anchor_max = amax;
+                Some(r)
+            }
+            _ => r,
+        }
+    }
+
+    /// Selectable.ParentGroupAllowsInteraction
+    fn groups_allow_interaction(&self, n: u32) -> bool {
+        let ui = self.inp.ui;
+        let mut x = Some(n);
+        while let Some(p) = x {
+            if let Some(&g) = ui.node_group.get(&p) {
+                if self.inp.state.group_enabled[g as usize] && !ui.groups[g as usize].interactable {
+                    return false;
+                }
+                if ui.groups[g as usize].ignore_parent {
+                    return true;
+                }
+            }
+            x = self.inp.def.nodes[p as usize].parent;
+        }
+        true
+    }
+
+    /// Enabled Sliders' UpdateVisuals and Selectables' DoStateTransition(instant) for this frame.
+    fn drive(&mut self) {
+        let inp = self.inp;
+        let ui = inp.ui;
+        for (i, sl) in ui.sliders.iter().enumerate() {
+            if !(self.node_active(sl.node) && self.script_on(true, sl.script)) {
+                continue;
+            }
+            let (fill_img, filled) = ui.slider_fill_filled(sl);
+            let (fa, amount, ha) = sl.visuals(sl.clamp(inp.state.slider[i]), filled);
+            if let (Some(n), Some(a)) = (sl.fill, fa) {
+                self.driven_anchors.insert(n, a);
+            }
+            if let (Some(n), Some(a)) = (sl.handle, ha) {
+                self.driven_anchors.insert(n, a);
+            }
+            if let (Some(g), Some(a)) = (fill_img, amount) {
+                self.driven_fill.insert(g, a.clamp(0.0, 1.0));
+            }
+        }
+        for (i, se) in ui.selectables.iter().enumerate() {
+            if se.transition != 1 || !(self.node_active(se.node) && self.script_on(true, se.script)) {
+                continue;
+            }
+            let Some(t) = se.target else { continue };
+            // currentSelectionState without pointer / selection: Normal or Disabled
+            let c = if inp.state.interactable[i] && self.groups_allow_interaction(se.node) { se.normal } else { se.disabled };
+            self.tint.insert(t, c.map(|v| v * se.multiplier));
+        }
     }
 
     fn local_trs(&self, n: u32) -> (Quat, Vec3) {
@@ -1584,7 +1815,7 @@ impl<'a> Layout<'a> {
                             pivot: Vec2::from_array(self.rect_def(n).map(|r| r.pivot).unwrap_or([0.5; 2])),
                             mppu: ppu * im.ppu_multiplier,
                             color,
-                            fill: st.fill[g as usize],
+                            fill: self.driven_fill.get(&g).copied().unwrap_or(st.fill[g as usize]),
                         };
                         match im.ty {
                             0 => mesher.simple(&mut vh, im.preserve_aspect),
@@ -1636,7 +1867,7 @@ impl<'a> Layout<'a> {
             }
         }
         // CanvasRenderer color and inherited alpha
-        let crc = st.cr_color[g as usize];
+        let crc = self.tint.get(&g).copied().unwrap_or(st.cr_color[g as usize]);
         let alpha = self.group_alpha(n);
         let tint = [crc[0], crc[1], crc[2], crc[3] * alpha];
         let mut verts = vh.verts;
@@ -1732,7 +1963,7 @@ impl<'a> Layout<'a> {
                 clip = Some(Clip { rect: [cr.x, cr.y, cr.xmax(), cr.ymax()], softness: [sf[0] as f32, sf[1] as f32] });
             }
         }
-        let crc = st.cr_color[g as usize];
+        let crc = self.tint.get(&g).copied().unwrap_or(st.cr_color[g as usize]);
         let alpha = self.group_alpha(n);
         let tint = [crc[0], crc[1], crc[2], crc[3] * alpha];
         let rts = ui.tmp_mats.lock().unwrap();
@@ -1768,7 +1999,8 @@ pub fn build_frame(inp: &UiInput) -> UiFrame {
     for (i, s) in inp.def.scripts.iter().enumerate() {
         scripts_by_node.entry(s.node).or_default().push(i as u32);
     }
-    let mut l = Layout { inp, frame: UiFrame::default(), scripts_by_node };
+    let mut l = Layout { inp, frame: UiFrame::default(), scripts_by_node, driven_anchors: HashMap::new(), driven_fill: HashMap::new(), tint: HashMap::new() };
+    l.drive();
     for &r in &inp.ui.roots {
         l.root(r);
     }

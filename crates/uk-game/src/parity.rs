@@ -56,6 +56,18 @@ pub const PORTED: &[(&str, Port)] = &[
     ("MaliciousFace", Port::Partial("see SpiderBody")),
     ("Projectile", Port::Partial("basic straight projectile")),
     ("SwingCheck2", Port::DataOnly),
+    // uGUI (ugui.rs, tmp.rs)
+    ("Image", Port::Partial("Simple/Sliced/Tiled/Filled; useSpriteMesh drawn as a quad; no layout element sizes")),
+    ("RawImage", Port::Full),
+    ("Mask", Port::Full),
+    ("RectMask2D", Port::Full),
+    ("Shadow", Port::Full),
+    ("Outline", Port::Full),
+    ("CanvasScaler", Port::Full),
+    ("TextMeshProUGUI", Port::Partial("no Ellipsis/Page/Linked overflow, sprites, underline/strikethrough meshes, rare tags; no preferred sizes")),
+    ("Slider", Port::Partial("value -> fill/handle anchors and Filled amount; no dragging/navigation")),
+    ("Button", Port::Partial("ColorTint normal/disabled only; no EventSystem")),
+    ("Text", Port::Partial("not meshed (Unity's native TextGenerator)")),
 ];
 
 pub fn status(class: &str) -> Option<Port> {

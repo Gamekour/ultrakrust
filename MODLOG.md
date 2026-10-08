@@ -431,3 +431,9 @@ CPU-skinned enemies, 3,393 colliders/569 triggers, 11,758 MonoBehaviours with ty
   - TMP's stencil skips MaskableGraphic's own-Mask check; sub meshes add the text's Mask to their depth and draw after the main mesh in reverse order; Cull tests the compound mesh bounds.
   - `ugui_frame` (0-1, 1600×900): 65 texts in 4-2 build in 5.8 ms (first frame, cached after). VCR OSD Mono advances 14.01 at 24 pt in every label (TIME:/KILLS:/SECRETS: widths 63.34/77.36/105.38); centered titles symmetric (±222.52); "GET 5 KILLS WITH A SINGLE GLASS PANEL" wraps into 3 lines in 316 units. Hash checks: orange 26556144, color 281955, /color 1071884.
   - Probe (0-1): overlay gpu draws 8 → 24, HUD 9 → 12; skipped empty meshes 24 → 5; no missing material or variant.
+
+- Slider + Selectable (ugui.rs):
+  - SliderDef from any script with m_FillRect/m_HandleRect/m_Direction/m_WholeNumbers (UpdateCachedReferences rules); `UiState::slider` values, `UiState::set_slider` = Set (clamp, whole numbers) + UpdateVisuals writing the driven anchors / Filled fillAmount, also while inactive.
+  - Enabled sliders drive their fill/handle anchors every layout (OnEnable -> UpdateVisuals).
+  - SelectableDef from any script with m_Transition/m_Colors/m_TargetGraphic: enabled ColorTint selectables set their target's CanvasRenderer colour to normal or disabled (m_Interactable and ParentGroupAllowsInteraction, CanvasGroup.interactable) times the multiplier. No pointer/selection states yet (no EventSystem).
+  - `ugui_frame` (0-1): style meter fill at value 0 is the 10x25 sizeDelta nub (was zero-height); freshness fills Dull 442 wide (value 1), others 0.
