@@ -228,6 +228,8 @@ pub struct Game {
     pub def: Arc<SceneDef>,
     pub s: State,
     pub world: World,
+    /// SceneHelper's footstep physics scene
+    pub surface: Arc<crate::surface::Surface>,
     /// The level's baked navmesh (humanoid agent type), if it has one.
     pub nav: Option<crate::nav::NavGraph>,
     /// node -> mover index (nearest mover ancestor, including itself)
@@ -238,7 +240,7 @@ pub struct Game {
     pub triggers: Vec<u32>,
     pub spawn_yaw: f32,
     pub player_node: Option<u32>,
-    checkpoint: Option<Box<State>>,
+    pub checkpoint: Option<Box<State>>,
     start: Option<Box<State>>,
     /// Nodes whose active-in-hierarchy changed since the frontend last drained it.
     pub changed_nodes: Vec<u32>,
@@ -524,6 +526,7 @@ impl Game {
             def: def.clone(),
             s,
             world,
+            surface: Arc::new(crate::surface::Surface::new(&def)),
             nav: crate::nav::NavGraph::build(&def.navmeshes),
             node_mover,
             movers,
@@ -1066,6 +1069,7 @@ impl Game {
             }
             (Target::Script(s), "set_enabled") => self.set_script_enabled(*s, c.bool_arg),
             (Target::Collider(col), "set_enabled") => self.s.collider_enabled[*col as usize] = c.bool_arg,
+            (Target::Particle(ps), m @ ("Play" | "Stop" | "Clear")) => self.scene_particle_call(*ps, m),
             (Target::Script(s), m) => {
                 let s = *s;
                 match (&self.s.scripts[s as usize], m) {
@@ -1720,10 +1724,17 @@ impl Game {
         }
         if b.durability > damage {
             b.durability -= damage;
+            self.breakable_particle(sc, "durabilityHurtParticle");
             return;
         }
         b.broken = true;
         let (aob, dob, ev) = (b.activate_on_break.clone(), b.destroy_on_break.clone(), b.destroy_event.clone());
+        // Awake: breakParticleFallback stands in when breakParticle is missing
+        if self.script_prefab(sc, "breakParticle").is_some() {
+            self.breakable_particle(sc, "breakParticle");
+        } else {
+            self.breakable_particle(sc, "breakParticleFallback");
+        }
         for n in aob {
             self.set_active(n, true);
         }
@@ -1734,6 +1745,31 @@ impl Game {
         let pos = self.def.nodes[node as usize].world0.w_axis.truncate();
         self.events.push(GameEvent::Broke { pos });
         self.destroy(node);
+    }
+
+    /// Breakable.CreateParticle: at the transform (or its collider's bounds centre) with its
+    /// rotation, or at customPositionRotation; applyScaleToParticle takes the lossy scale.
+    fn breakable_particle(&mut self, sc: u32, field: &str) {
+        let Some(p) = self.script_prefab(sc, field) else { return };
+        let node = self.def.scripts[sc as usize].node;
+        let Script::Breakable(b) = &self.s.scripts[sc as usize] else { return };
+        let (at_center, scaled, custom) = (b.particle_at_bounds_center, b.apply_scale_to_particle, b.custom_position_rotation);
+        let w = self.node_world_now(node);
+        let (lossy, mut rot, mut pos) = w.to_scale_rotation_translation();
+        if at_center {
+            if let Some(&ci) = self.node_colliders(node).first() {
+                let (lo, hi) = self.collider_bounds(ci);
+                pos = crate::particles::to_unity((lo + hi) * 0.5);
+            }
+        }
+        if let Some(c) = custom {
+            let (_, r, t) = self.node_world_now(c).to_scale_rotation_translation();
+            (pos, rot) = (t, r);
+        }
+        let i = self.fx_instantiate(p, pos, rot);
+        if scaled {
+            self.fx.effects[i].scale = lossy;
+        }
     }
 
     pub fn glass_shatter(&mut self, sc: u32) {
@@ -1761,6 +1797,10 @@ impl Game {
         }
         let pos = self.def.nodes[node as usize].world0.w_axis.truncate();
         self.events.push(GameEvent::Broke { pos });
+        // Instantiate(shatterParticle, transform)
+        if let Some(p) = self.script_prefab(sc, "shatterParticle") {
+            self.fx_instantiate_child(p, node);
+        }
     }
 
     // ---------------------------------------------------------------- player-facing scripts
@@ -1884,7 +1924,12 @@ impl Game {
             return;
         }
         cp.activated = true;
-        let (ta, graphic, doors) = (cp.to_activate, cp.graphic, cp.doors_to_unlock.clone());
+        let (ta, graphic, doors, invisible) = (cp.to_activate, cp.graphic, cp.doors_to_unlock.clone(), cp.invisible);
+        // Instantiate(activateEffect, player position, identity)
+        if let Some(p) = self.script_prefab(sc, "activateEffect").filter(|_| !invisible) {
+            let at = crate::particles::to_unity(self.s.player.pos);
+            self.fx_instantiate(p, at, Quat::IDENTITY);
+        }
         if let Some(t) = ta {
             self.set_active(t, true);
         }
@@ -1915,8 +1960,14 @@ impl Game {
             dz.disabled = true;
         }
         self.run_uevent(&ev, false);
+        // Instantiate(sawSound, player position, identity) after the hurt
+        let saw = self.script_prefab(sc, "sawSound");
+        let at = crate::particles::to_unity(self.s.player.pos);
         if insta {
             self.hurt_player(999_999, false);
+            if let Some(p) = saw {
+                self.fx_instantiate(p, at, Quat::IDENTITY);
+            }
         } else if self.s.hp > 0 {
             if damage == 0 || self.s.hp == 1 {
             } else if self.s.hp > damage {
@@ -1924,6 +1975,9 @@ impl Game {
             } else if self.s.hp > 1 {
                 let d = self.s.hp - 1;
                 self.hurt_player(d, true);
+            }
+            if let Some(p) = saw {
+                self.fx_instantiate(p, at, Quat::IDENTITY);
             }
             // send the player back to safety
             let node = self.def.scripts[sc as usize].node;
@@ -1971,6 +2025,11 @@ impl Game {
         if t.reset_speed {
             self.s.player.vel = Vec3::ZERO;
         }
+        // Instantiate(teleportEffect, target.position, identity)
+        if let Some(p) = self.script_prefab(sc, "teleportEffect") {
+            let at = crate::particles::to_unity(self.s.player.pos);
+            self.fx_instantiate(p, at, Quat::IDENTITY);
+        }
         self.run_uevent(&t.on_teleport, false);
     }
 
@@ -1996,6 +2055,12 @@ impl Game {
 
     /// Collider.ClosestPointOnBounds: `p` clamped to the collider's current world AABB.
     pub(crate) fn collider_bounds_closest(&self, ci: u32, p: Vec3) -> Vec3 {
+        let (lo, hi) = self.collider_bounds(ci);
+        p.clamp(lo, hi)
+    }
+
+    /// Collider.bounds: the collider's current world AABB (min, max).
+    pub(crate) fn collider_bounds(&self, ci: u32) -> (Vec3, Vec3) {
         let c = &self.def.colliders[ci as usize];
         let pts: Vec<Vec3> = match &c.shape {
             ShapeDef::Box { center, half, rot } => (0..8)
@@ -2012,7 +2077,7 @@ impl Game {
             lo = lo.min(q);
             hi = hi.max(q);
         }
-        p.clamp(lo, hi)
+        (lo, hi)
     }
 
     pub(crate) fn trigger_contains(&self, ci: u32, cap: &Capsule) -> bool {
@@ -2246,6 +2311,11 @@ impl Game {
     /// DualWieldPickup.PickedUp + DualWield.Start (the duplicated weapon itself is not ported).
     fn dual_wield_pickup(&mut self, sc: u32) {
         let Script::DualWieldPickup { infinite, juice } = self.s.scripts[sc as usize] else { return };
+        // Instantiate(pickUpEffect, transform.position, identity)
+        if let Some(p) = self.script_prefab(sc, "pickUpEffect") {
+            let at = self.node_world_now(self.def.scripts[sc as usize].node).w_axis.truncate();
+            self.fx_instantiate(p, at, Quat::IDENTITY);
+        }
         if !infinite {
             self.set_active(self.def.scripts[sc as usize].node, false);
         }
@@ -2276,6 +2346,11 @@ impl Game {
         self.s.power_max = 0.0;
         self.s.vignette = None;
         self.s.dual_wields = 0;
+        // Instantiate(endEffect, NewMovement position, identity)
+        if let Some(p) = self.class_prefab("PowerUpMeter", "endEffect") {
+            let at = crate::particles::to_unity(self.s.player.pos);
+            self.fx_instantiate(p, at, Quat::IDENTITY);
+        }
     }
 
     pub fn hurt_player(&mut self, damage: i32, invincible: bool) {
@@ -2361,6 +2436,9 @@ impl Game {
         if let Some(sw) = self.sway {
             self.set_active(sw.screen_hud, true);
             self.flush_events();
+        }
+        if self.checkpoint.is_some() {
+            self.fx_checkpoint_restart();
         }
         self.full_refresh = true;
         self.events.push(GameEvent::Respawned);
@@ -2460,8 +2538,10 @@ impl Game {
         self.sync_world();
         self.wind_sweep();
         let world = std::mem::take(&mut self.world);
+        let pev0 = self.s.player.events.len();
         self.s.player.fixed_update(&world, input);
         self.world = world;
+        self.fx_player_fixed(pev0);
         self.update_triggers();
         self.water_tracking();
         self.update_contacts();
@@ -2571,8 +2651,10 @@ impl Game {
         }
         self.sync_world();
         let world = std::mem::take(&mut self.world);
+        let pev0 = self.s.player.events.len();
         self.s.player.update(&world, input, dt, now);
         self.world = world;
+        self.fx_player(pev0);
         self.hud_sway(dt);
         self.hud_update(dt);
         enemy::update(self, dt);

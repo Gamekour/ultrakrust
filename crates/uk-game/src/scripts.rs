@@ -16,6 +16,8 @@ pub enum Target {
     Node(u32),
     Script(u32),
     Collider(u32),
+    /// a scene ParticleSystem (index into `SceneDef::particle_systems`)
+    Particle(u32),
     None,
 }
 
@@ -61,6 +63,8 @@ pub fn parse_calls(def: &SceneDef, v: &Value) -> Vec<Call> {
                 Target::Script(s)
             } else if let Some(&col) = def.comp_to_collider.get(&id) {
                 Target::Collider(col)
+            } else if let Some(&ps) = def.comp_to_particle.get(&id) {
+                Target::Particle(ps)
             } else if let Some(n) = def.node_ref(t) {
                 Target::Node(n)
             } else {
@@ -198,6 +202,9 @@ pub struct Breakable {
     pub destroy_on_break: Vec<u32>,
     pub destroy_event: UEvent,
     pub broken: bool,
+    pub particle_at_bounds_center: bool,
+    pub apply_scale_to_particle: bool,
+    pub custom_position_rotation: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -212,6 +219,7 @@ pub struct CheckPoint {
     pub graphic: Option<u32>,
     pub doors_to_unlock: Vec<u32>,
     pub activated: bool,
+    pub invisible: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -426,6 +434,9 @@ pub fn parse(def: &SceneDef, idx: usize) -> Script {
             destroy_on_break: nodes(def, v.get("destroyOnBreak")),
             destroy_event: parse_uevent(def, v.get("destroyEvent")),
             broken: false,
+            particle_at_bounds_center: b("particleAtBoundsCenter"),
+            apply_scale_to_particle: b("applyScaleToParticle"),
+            custom_position_rotation: def.node_ref(v.get("customPositionRotation")),
         })),
         "Glass" => Script::Glass(Box::new(Glass { broken: false, on_shatter: parse_uevent(def, v.get("onShatter")) })),
         "CheckPoint" => Script::CheckPoint(CheckPoint {
@@ -433,6 +444,7 @@ pub fn parse(def: &SceneDef, idx: usize) -> Script {
             graphic: def.node_ref(v.get("graphic")),
             doors_to_unlock: scripts(def, v.get("doorsToUnlock")),
             activated: false,
+            invisible: b("invisible"),
         }),
         "DeathZone" => Script::DeathZone(Box::new(DeathZone {
             not_instakill: b("notInstakill"),

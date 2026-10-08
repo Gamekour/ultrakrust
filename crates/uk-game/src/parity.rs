@@ -20,8 +20,8 @@ pub const PORTED: &[(&str, Port)] = &[
     ("ActivateArena", Port::Partial("forEnemy (Enemy-tagged trigger) arenas never activate")),
     ("ArenaStatus", Port::Full),
     ("ActivateNextWave", Port::Full),
-    ("Breakable", Port::Partial("no debris/particles/sound")),
-    ("Glass", Port::Partial("no shards/sound")),
+    ("Breakable", Port::Partial("breakParticle (bounds centre, lossy scale, customPositionRotation); no debris/sound")),
+    ("Glass", Port::Partial("shatterParticle; no shards/sound")),
     ("CheckPoint", Port::Partial("no rooms reset beyond snapshot; no sound/anim")),
     ("DeathZone", Port::Full),
     ("TeleportPlayer", Port::Full),
@@ -29,7 +29,7 @@ pub const PORTED: &[(&str, Port)] = &[
     ("PlayerActivator", Port::Full),
     ("OnLevelStart", Port::Partial("hideFogUntilStart / levelNameOnStart / music not applied")),
     ("GetPlayerPref", Port::Full),
-    ("PowerUpMeter", Port::Partial("juice meter drives VIGNETTE; no meter UI, endEffect")),
+    ("PowerUpMeter", Port::Partial("juice meter drives VIGNETTE, endEffect; no meter UI")),
     ("DualWieldPickup", Port::Partial("grants DualWield juice; no duplicated weapon, pickup effect, camera shake")),
     ("DisablePowerUp", Port::Full),
     ("DeathSequence", Port::Partial("deathness + log + EndSequence BlackScreen; no LaughingSkull/Flash/ISeeYou sprites, audio, pitch")),
@@ -64,6 +64,8 @@ pub const PORTED: &[(&str, Port)] = &[
     ("Bloodsplatter", Port::Partial("play on enable, heal sphere, repool when stopped; particle collisions only counted (no stains, no sound)")),
     ("BloodUnderwaterChecker", Port::Full),
     ("RemoveOnTime", Port::Full),
+    ("DestroyOnCheckpointRestart", Port::Partial("effect prefabs only; scene objects come back with the checkpoint snapshot")),
+    ("EnviroGibModifier", Port::Full),
     ("PortalAwareParticleSystem", Port::Partial("environment raycast kill; no portals")),
     // uGUI (ugui.rs, tmp.rs)
     ("Image", Port::Partial("Simple/Sliced/Tiled/Filled; useSpriteMesh drawn as a quad; no layout element sizes")),
@@ -123,8 +125,8 @@ pub const NATIVE: &[(i32, &str, f64)] = &[
     (108, "Light", 0.05),
     (157, "LightmapSettings", 0.0),
     (104, "RenderSettings", 0.1),
-    (198, "ParticleSystem", 0.4), // runtime effect prefabs: initial/shape/emission/colour/size/rotation/velocity/trail; no collision, noise, sub-emitters, texture sheet; scene-placed systems not run
-    (199, "ParticleSystemRenderer", 0.4), // billboard mode only, view alignment, size clamp; sortingFudge ignored
+    (198, "ParticleSystem", 0.75), // effect prefabs + scene systems: every module the campaign enables except sub-emitters, lights, external forces, custom data; Play/Stop/Clear calls, stopAction; RNG not Unity's
+    (199, "ParticleSystemRenderer", 0.6), // billboard, stretched, horizontal/vertical, mesh; texture sheet; sortingFudge and culling ignored
     (96, "TrailRenderer", 0.0),
     (120, "LineRenderer", 0.05),
     (212, "SpriteRenderer", 0.0),

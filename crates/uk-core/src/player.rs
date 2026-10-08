@@ -110,6 +110,16 @@ pub struct WallCheck {
     pub body_cols: Vec<u32>,
 }
 
+/// What NewMovement.CreateSlideScrape reads for its surface lookup: the transform position, the
+/// gravity direction, gc.onGround, and the active wall check's position and point of contact.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScrapeQuery {
+    pub pos: Vec3,
+    pub grav: Vec3,
+    pub on_ground: bool,
+    pub wall: Option<(Vec3, Vec3)>,
+}
+
 /// Events for the frontend (sounds, particles, camera shake).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Event {
@@ -117,12 +127,20 @@ pub enum Event {
     DashJump,
     SlamJump,
     WallJump(u32),
-    Dash,
+    /// transform position and dodgeDirection when the dodge started
+    Dash { pos: Vec3, dir: Vec3 },
     StaminaFail,
-    SlideStart,
+    /// transform position (after the crouch shift), dodgeDirection, boostLeft > 0
+    SlideStart { pos: Vec3, dir: Vec3, boosted: bool, scrape: ScrapeQuery },
+    /// FixedUpdate while sliding on the ground or a wall: CreateSlideScrape()
+    SlideScrape(ScrapeQuery),
     SlideStop,
     SlamStart,
-    Land { impact: bool },
+    /// `gc` is the ground check's position at the landing, `pos` the transform's, `up` its up
+    Land { impact: bool, gc: Vec3, pos: Vec3, up: Vec3, fall_speed: f32 },
+    /// GroundCheck: superJumpChance ran out while slide was still held (the shockwave; `gc` is
+    /// the ground check's position, `up` its up)
+    Shockwave { gc: Vec3, up: Vec3 },
     Ssj { gained: f32 },
 }
 
@@ -163,6 +181,9 @@ pub struct Player {
     jump_cooldown_timer: f32,
     pub current_wall_jumps: u32,
     cling_fade: f32,
+    /// Cling this Update: CreateWallScrape(hitInfo.point + up) facing hitInfo.normal; None
+    /// detaches the wall scrape
+    pub wall_scrape: Option<(Vec3, Vec3)>,
     pub boost: bool,
     pub boost_charge: f32,
     pub boost_left: f32,
@@ -196,6 +217,9 @@ pub struct Player {
     pub cam_dodge_direction: u8,
     /// Camera eye target offset (CameraController.defaultTarget).
     pub cam_default_target: Vec3,
+    /// CameraController.defaultPos (local to the player), published by the camera each
+    /// LateUpdate for GetDefaultPos
+    pub cam_default_pos: Vec3,
     pub cam_reset_requested: bool,
 
     /// GameObject layer 15 ("Invincible"): set while dashing or just hurt; blocks hits
@@ -245,6 +269,7 @@ impl Player {
             jump_cooldown_timer: 0.0,
             current_wall_jumps: 0,
             cling_fade: 0.0,
+            wall_scrape: None,
             boost: false,
             boost_charge: 300.0,
             boost_left: 0.0,
@@ -276,6 +301,7 @@ impl Player {
             last_jump: 100.0,
             cam_dodge_direction: 0,
             cam_default_target: CAMERA_POS,
+            cam_default_pos: CAMERA_POS,
             cam_reset_requested: false,
             invincible_layer: false,
             hurt_invincibility: 0.0,
@@ -315,7 +341,7 @@ impl Player {
         Capsule::unity(self.pos + Vec3::Y * COLLIDER_CENTER_Y, self.collider_height, RADIUS)
     }
 
-    fn gc_pos(&self) -> Vec3 {
+    pub fn gc_pos(&self) -> Vec3 {
         self.pos + self.gc_local
     }
 
@@ -396,6 +422,7 @@ impl Player {
         if self.activated {
             self.handle_inputs(world, input, dt, now);
         }
+        self.wall_scrape = None;
         if !self.gc.on_ground {
             self.cling(world, dt);
         }
@@ -455,11 +482,14 @@ impl Player {
                 g.since_last_grounded += dt;
             }
         }
+        let shock_at = (self.pos + self.gc_local, self.up());
         let g = &mut self.gc;
         if g.super_jump_chance > 0.0 {
             g.super_jump_chance = move_towards(g.super_jump_chance, 0.0, dt);
             if g.super_jump_chance == 0.0 {
-                // (shockwave spawns here when still holding slide)
+                if self.still_holding {
+                    self.events.push(Event::Shockwave { gc: shock_at.0, up: shock_at.1 });
+                }
                 g.extra_jump_chance = 0.306;
                 self.still_holding = false;
             }
@@ -500,7 +530,7 @@ impl Player {
             if impact {
                 self.gc.has_impacted = true;
             }
-            self.events.push(Event::Land { impact });
+            self.events.push(Event::Land { impact, gc: self.gc_pos(), pos: self.pos, up: self.up(), fall_speed: self.fall_speed });
             if !self.jump_cooldown {
                 self.falling = false;
             }
@@ -564,7 +594,7 @@ impl Player {
         self.dodge_direction = if self.input_dir == Vec3::ZERO { self.forward() } else { self.input_dir };
         self.boost_charge -= 100.0;
         self.cam_dodge_direction = self.dodge_dir_code();
-        self.events.push(Event::Dash);
+        self.events.push(Event::Dash { pos: self.pos, dir: self.dodge_direction });
         if self.gc.heavy_fall {
             self.fall_speed = 0.0;
             self.gc.heavy_fall = false;
@@ -610,9 +640,10 @@ impl Player {
         if !self.wall.on_wall {
             return;
         }
-        let toward_wall = world.raycast(self.pos, self.input_dir, 1.0).is_some();
+        let hit = world.raycast(self.pos, self.input_dir, 1.0);
         let up_speed = (-self.gravity_dir()).dot(self.vel);
-        if !self.sliding && toward_wall && !self.gc.heavy_fall && up_speed < -1.0 {
+        if let Some(h) = hit.filter(|_| !self.sliding && !self.gc.heavy_fall && up_speed < -1.0) {
+            self.wall_scrape = Some((h.point + self.up(), h.normal));
             // The original calls Mathf.Clamp(-1, 1, x): value -1 clamped to [1, x], which is
             // always 1. Kept as-is, since this is what the game does.
             let r = 1.0;
@@ -697,7 +728,15 @@ impl Player {
             self.dodge_direction = self.forward();
         }
         self.cam_dodge_direction = self.dodge_dir_code();
-        self.events.push(Event::SlideStart);
+        let scrape = self.scrape_query();
+        self.events.push(Event::SlideStart { pos: self.pos, dir: self.dodge_direction, boosted: self.boost_left > 0.0, scrape });
+    }
+
+    /// CreateSlideScrape's inputs; the wall is wcGroup.TryGetActiveInstance (onWall and
+    /// CheckForCols found a point of contact).
+    pub fn scrape_query(&self) -> ScrapeQuery {
+        let wall = (self.wall.on_wall && (!self.wall.cols.is_empty() || !self.wall.body_cols.is_empty())).then(|| (self.pos + WALL_CHECK_POS, self.wall.poc));
+        ScrapeQuery { pos: self.pos, grav: self.gravity_dir(), on_ground: self.gc.on_ground, wall }
     }
 
     pub fn stop_slide(&mut self) {
@@ -983,6 +1022,10 @@ impl Player {
             let num2 = (-g).dot(self.vel);
             let mut v = project_on_plane(self.dodge_direction, g) * WALK_SPEED * dt * 4.0 * num;
             v += -g * num2;
+            if self.gc.on_ground || self.wall.on_wall {
+                let q = self.scrape_query();
+                self.events.push(Event::SlideScrape(q));
+            }
             if self.boost_left > 0.0 {
                 self.dash_storage = move_towards(self.dash_storage, 0.0, dt);
                 if self.dash_storage <= 0.0 {

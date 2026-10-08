@@ -166,6 +166,8 @@ pub struct SceneData {
     pub ui: Option<UiScene>,
     /// particle / trail material -> its draw slots (one ParticleSystemRenderer each per frame)
     pub particle_slots: HashMap<(String, i64), Vec<usize>>,
+    /// per `SceneDef::particle_systems`: its renderer is drawn by the player camera
+    pub scene_ps_drawn: Vec<bool>,
 }
 
 /// Draw slots per particle material: the most renderers using one material drawn separately in a
@@ -180,13 +182,38 @@ pub struct ParticleDraw {
     /// the renderer's bounds centre (transparent sorting, culling) and radius
     pub center: Vec3,
     pub radius: f32,
-    /// ParticleSystemRenderer min / maxParticleSize (fractions of the viewport height)
-    pub min_size: f32,
-    pub max_size: f32,
-    /// billboards: position, size, rotation (radians), color
-    pub quads: Vec<(Vec3, f32, f32, [f32; 4])>,
+    /// particles, per renderer drawing into this slot
+    pub groups: Vec<ParticleGroup>,
     /// trails, head first: position, width, color, u
     pub strips: Vec<Vec<(Vec3, f32, [f32; 4], f32)>>,
+}
+
+/// One ParticleSystemRenderer's particles this frame.
+#[derive(Clone, Default)]
+pub struct ParticleGroup {
+    pub renderer: Option<Arc<uk_assets::particles::ParticleRendererDef>>,
+    /// the emitter's world rotation (local render alignment)
+    pub emitter_rot: Quat,
+    /// simulation space -> world rotation (world render alignment of mesh particles)
+    pub sim_rot: Quat,
+    pub quads: Vec<ParticleQuad>,
+}
+
+/// One particle as the renderer sees it (Unity world space).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ParticleQuad {
+    pub pos: Vec3,
+    /// per axis (billboards use x and y)
+    pub size: Vec3,
+    /// radians per axis; z is the billboard roll
+    pub rot: Vec3,
+    pub color: [f32; 4],
+    /// texture sheet frame: u0, v0, du, dv
+    pub uv: [f32; 4],
+    pub vel: Vec3,
+    pub age: f32,
+    /// render mode 4: which of the renderer's meshes
+    pub mesh: u8,
 }
 
 /// The shader globals GraphicsSettings / PostProcessV2_Handler derive from the player's prefs.
@@ -603,14 +630,36 @@ pub fn build(
     let mut simplified: HashMap<(String, i64, bool), Arc<MaterialProps>> = HashMap::new();
     // every particle / trail material the effect prefabs use: a template draw (a quad fixing the
     // vertex layout), copied into PARTICLE_SLOTS slots below
+    // (effects can have any number live, so their materials get every slot; a scene material
+    // gets one per renderer using it)
     let mut particle_keys: Vec<uk_assets::scene::MaterialKey> = Vec::new();
+    let mut slot_count: HashMap<(String, i64), usize> = HashMap::new();
     for pf in &def.particle_prefabs {
         for r in pf.nodes.iter().filter_map(|n| n.renderer.as_ref()) {
             for k in r.materials.iter().flatten() {
                 if !particle_keys.iter().any(|q| q.file == k.file && q.path_id == k.path_id) {
                     particle_keys.push(k.clone());
                 }
+                slot_count.insert((k.file.clone(), k.path_id), PARTICLE_SLOTS);
             }
+        }
+    }
+    let scene_ps_drawn: Vec<bool> = def
+        .particle_systems
+        .iter()
+        .map(|p| {
+            p.renderer.as_ref().is_some_and(|r| r.enabled && r.render_mode != 5)
+                && !uk_assets::scenedef::HIDDEN_LAYERS.contains(&def.nodes[p.node as usize].layer)
+                && (def.nodes[p.node as usize].layer == uk_assets::scenedef::VIEWMODEL_LAYER || !skip_node(p.node))
+        })
+        .collect();
+    for (p, _) in def.particle_systems.iter().zip(&scene_ps_drawn).filter(|(_, d)| **d) {
+        for k in p.renderer.as_ref().unwrap().materials.iter().flatten() {
+            if !particle_keys.iter().any(|q| q.file == k.file && q.path_id == k.path_id) {
+                particle_keys.push(k.clone());
+            }
+            let n = slot_count.entry((k.file.clone(), k.path_id)).or_default();
+            *n = (*n + 1).min(PARTICLE_SLOTS);
         }
     }
     let particle_defs: Vec<uk_assets::scenedef::RenderDef> = particle_keys
@@ -835,7 +884,8 @@ pub fn build(
         });
         if particle {
             let t = draws.len() - 1;
-            let slots: Vec<usize> = (0..PARTICLE_SLOTS).map(|k| if k == 0 { t } else { draws.push(draws[t].clone()); draws.len() - 1 }).collect();
+            let n = slot_count.get(&(key.file.clone(), key.path_id)).copied().unwrap_or(1).max(1);
+            let slots: Vec<usize> = (0..n).map(|k| if k == 0 { t } else { draws.push(draws[t].clone()); draws.len() - 1 }).collect();
             particle_slots.insert((key.file.clone(), key.path_id), slots);
         }
     }
@@ -1094,6 +1144,7 @@ pub fn build(
         prefs,
         ui,
         particle_slots,
+        scene_ps_drawn,
     };
     (scene, summary)
 }
@@ -1148,77 +1199,135 @@ pub fn skin_rest_error(game: &uk_game::Game, scene: &SceneData) -> (usize, f32) 
 }
 
 /// Per-frame state from the game: what is visible, where movers have moved things, lights.
-/// The live effects' ParticleSystemRenderers: billboards (render mode 0) and trails, in world
-/// space, each renderer in its own slot of its material.
+/// The ParticleSystemRenderers of live effects and of active scene systems (every render mode),
+/// with their trails, in world space, each renderer in its own slot of its material.
 fn particle_draws(game: &uk_game::Game, scene: &SceneData) -> Vec<ParticleDraw> {
     let mut out: Vec<ParticleDraw> = Vec::new();
     let mut used: HashMap<(String, i64), usize> = HashMap::new();
-    let mut slot_of = |out: &mut Vec<ParticleDraw>, key: &uk_assets::scene::MaterialKey, r: &uk_assets::particles::ParticleRendererDef| -> Option<usize> {
-        let slots = scene.particle_slots.get(&(key.file.clone(), key.path_id))?;
-        let n = used.entry((key.file.clone(), key.path_id)).or_default();
-        let slot = slots[(*n).min(slots.len() - 1)];
-        *n += 1;
-        Some(out.iter().position(|d| d.slot == slot).unwrap_or_else(|| {
-            out.push(ParticleDraw { slot, min_size: r.min_particle_size, max_size: r.max_particle_size, ..Default::default() });
-            out.len() - 1
-        }))
+    let mut add = |out: &mut Vec<ParticleDraw>, sys: &uk_game::particles::System, r: &Arc<uk_assets::particles::ParticleRendererDef>| {
+        if sys.particles.is_empty() || !r.enabled || r.render_mode == 5 || (r.render_mode == 4 && r.meshes.is_empty()) {
+            return;
+        }
+        let mut slot_of = |out: &mut Vec<ParticleDraw>, key: &uk_assets::scene::MaterialKey| -> Option<usize> {
+            let slots = scene.particle_slots.get(&(key.file.clone(), key.path_id))?;
+            let n = used.entry((key.file.clone(), key.path_id)).or_default();
+            let slot = slots[(*n).min(slots.len() - 1)];
+            *n += 1;
+            Some(out.iter().position(|d| d.slot == slot).unwrap_or_else(|| {
+                out.push(ParticleDraw { slot, ..Default::default() });
+                out.len() - 1
+            }))
+        };
+        let def = &sys.def;
+        let scale = sys.size_scale;
+        let m = sys.sim_to_world;
+        let (_, emitter_rot, _) = sys.emitter.to_scale_rotation_translation();
+        // particles simulated in local space turn with the emitter (3D rotation, mesh particles)
+        let sim_rot = if def.simulation_space == 1 { Quat::IDENTITY } else { emitter_rot };
+        let total_w: f32 = r.mesh_weights.iter().take(r.meshes.len()).sum();
+        let mut quads = Vec::with_capacity(sys.particles.len());
+        let mut strips = Vec::new();
+        for p in &sys.particles {
+            let pos = m.transform_point3(p.pos);
+            let size3 = p.size3(def) * scale;
+            let size = size3.x;
+            let color = p.color(def);
+            // renderer flip: this share of particles is mirrored per axis
+            let fr = (p.mesh_pick * 977.0).fract();
+            let flip = [fr < r.flip.x, (fr * 31.0).fract() < r.flip.y];
+            let mesh = if r.meshes.len() > 1 {
+                if r.mesh_distribution == 1 && total_w > 0.0 {
+                    let mut k = p.mesh_pick * total_w;
+                    (0..r.meshes.len()).find(|&i| {
+                        k -= r.mesh_weights[i];
+                        k < 0.0
+                    }).unwrap_or(r.meshes.len() - 1) as u8
+                } else {
+                    ((p.mesh_pick * r.meshes.len() as f32) as usize).min(r.meshes.len() - 1) as u8
+                }
+            } else {
+                0
+            };
+            let mut uv = p.sheet_uv(def).unwrap_or([0.0, 0.0, 1.0, 1.0]);
+            for a in 0..2 {
+                if flip[a] {
+                    uv[a] += uv[a + 2];
+                    uv[a + 2] = -uv[a + 2];
+                }
+            }
+            quads.push(ParticleQuad {
+                pos,
+                size: if def.size3d { size3 } else { Vec3::splat(size) },
+                rot: p.rot,
+                color,
+                uv,
+                vel: m.transform_vector3(p.total_vel),
+                age: p.age,
+                mesh,
+            });
+            let (Some(tr), Some(td)) = (&p.trail, &def.trail) else { continue };
+            // head (the particle) first, then the recorded points newest to oldest
+            let pts: Vec<Vec3> = std::iter::once(pos).chain(tr.points.iter().rev().map(|(q, _)| m.transform_point3(*q))).collect();
+            let mut along = vec![0.0f32; pts.len()];
+            for k in 1..pts.len() {
+                along[k] = along[k - 1] + pts[k].distance(pts[k - 1]);
+            }
+            let total = along.last().copied().unwrap_or(0.0);
+            if pts.len() < 2 || total <= 1e-5 {
+                continue;
+            }
+            let life = td.color_over_lifetime.eval(p.age / p.lifetime, p.rand[0]);
+            let base = uk_game::particles::mul4(if td.inherit_particle_color { color } else { [1.0; 4] }, life);
+            strips.push(
+                pts.iter()
+                    .zip(&along)
+                    .map(|(q, a)| {
+                        let u = a / total;
+                        let w = td.width_over_trail.eval(u, p.rand[0]) * if td.size_affects_width { size } else { 1.0 };
+                        (*q, w, uk_game::particles::mul4(base, td.color_over_trail.eval(u, p.rand[0])), u)
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
+        if let Some(Some(k)) = r.materials.first() {
+            if let Some(i) = slot_of(out, k) {
+                out[i].groups.push(ParticleGroup { renderer: Some(r.clone()), emitter_rot, sim_rot, quads });
+            }
+        }
+        if let (Some(Some(k)), false) = (r.materials.get(1), strips.is_empty()) {
+            if let Some(i) = slot_of(out, k) {
+                out[i].strips.extend(strips);
+            }
+        }
     };
+    for ss in &game.fx.scene {
+        if !ss.on || !scene.scene_ps_drawn[ss.index as usize] {
+            continue;
+        }
+        if let Some(r) = &game.def.particle_systems[ss.index as usize].renderer {
+            add(&mut out, &ss.sys, r);
+        }
+    }
     for e in game.fx.effects.iter().filter(|e| !e.destroyed && e.active) {
         let pf = &game.def.particle_prefabs[e.prefab as usize];
         for sys in &e.systems {
-            if sys.particles.is_empty() || !e.node_active_in_hierarchy(pf, sys.node) {
+            if !e.node_active_in_hierarchy(pf, sys.node) {
                 continue;
             }
-            let Some(r) = pf.nodes[sys.node as usize].renderer.as_ref().filter(|r| r.enabled && r.render_mode == 0) else { continue };
-            let def = &sys.def;
-            let scale = sys.sim_to_world.x_axis.truncate().length();
-            let mut quads = Vec::with_capacity(sys.particles.len());
-            let mut strips = Vec::new();
-            for p in &sys.particles {
-                let pos = sys.sim_to_world.transform_point3(p.pos);
-                let size = p.size(def) * scale;
-                let color = p.color(def);
-                quads.push((pos, size, p.rot, color));
-                let (Some(tr), Some(td)) = (&p.trail, &def.trail) else { continue };
-                // head (the particle) first, then the recorded points newest to oldest
-                let pts: Vec<Vec3> = std::iter::once(pos).chain(tr.points.iter().rev().map(|(q, _)| sys.sim_to_world.transform_point3(*q))).collect();
-                let mut along = vec![0.0f32; pts.len()];
-                for k in 1..pts.len() {
-                    along[k] = along[k - 1] + pts[k].distance(pts[k - 1]);
-                }
-                let total = along.last().copied().unwrap_or(0.0);
-                if pts.len() < 2 || total <= 1e-5 {
-                    continue;
-                }
-                let life = td.color_over_lifetime.eval(p.age / p.lifetime, p.rand[0]);
-                let base = uk_game::particles::mul4(if td.inherit_particle_color { color } else { [1.0; 4] }, life);
-                strips.push(
-                    pts.iter()
-                        .zip(&along)
-                        .map(|(q, a)| {
-                            let u = a / total;
-                            let w = td.width_over_trail.eval(u, p.rand[0]) * if td.size_affects_width { size } else { 1.0 };
-                            (*q, w, uk_game::particles::mul4(base, td.color_over_trail.eval(u, p.rand[0])), u)
-                        })
-                        .collect::<Vec<_>>(),
-                );
-            }
-            if let Some(Some(k)) = r.materials.first() {
-                if let Some(i) = slot_of(&mut out, k, r) {
-                    out[i].quads.extend(quads);
-                }
-            }
-            if let (Some(Some(k)), false) = (r.materials.get(1), strips.is_empty()) {
-                if let Some(i) = slot_of(&mut out, k, r) {
-                    out[i].strips.extend(strips);
-                }
-            }
+            let Some(r) = pf.nodes[sys.node as usize].renderer.as_ref() else { continue };
+            add(&mut out, sys, r);
         }
     }
     for d in &mut out {
         let (mut lo, mut hi, mut big) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN), 0.0f32);
-        for &(p, s, _, _) in &d.quads {
-            (lo, hi, big) = (lo.min(p), hi.max(p), big.max(s));
+        for g in &d.groups {
+            let r = g.renderer.as_ref().unwrap();
+            for q in &g.quads {
+                // stretched billboards reach along their velocity, meshes by their extent
+                let reach = q.size.max_element() * r.length_scale.abs().max(1.0) + q.vel.length() * r.velocity_scale.abs();
+                let reach = if r.render_mode == 4 { reach * r.meshes.get(q.mesh as usize).map_or(1.0, |m| m.positions.iter().fold(0.0f32, |a, p| a.max(p.length())) * 2.0) } else { reach };
+                (lo, hi, big) = (lo.min(q.pos), hi.max(q.pos), big.max(reach));
+            }
         }
         for &(p, w, _, _) in d.strips.iter().flatten() {
             (lo, hi, big) = (lo.min(p), hi.max(p), big.max(w));
@@ -1703,6 +1812,128 @@ struct FrameCtx {
     ambient: [f32; 4],
     near: f32,
     size: UVec2,
+}
+
+/// The camera as particle geometry is built for it (Unity space).
+#[derive(Clone, Copy, Debug)]
+pub struct ParticleCam {
+    pub pos: Vec3,
+    pub right: Vec3,
+    pub up: Vec3,
+    /// towards the viewer
+    pub back: Vec3,
+    /// world -> view
+    pub view: Mat4,
+    /// projection y scale (1 / tan(fov / 2))
+    pub fy: f32,
+}
+
+/// One particle vertex: position, normal, color, uv (Unity space).
+pub type ParticleVertex = (Vec3, Vec3, [f32; 4], [f32; 2]);
+
+/// ParticleSystemRenderer geometry for one camera: billboards per render mode and alignment
+/// (pivot, roll, min / maxParticleSize), stretched billboards, mesh particles, in the renderer's
+/// sort order.
+pub fn particle_geometry(pd: &ParticleDraw, cam: &ParticleCam, verts: &mut Vec<ParticleVertex>, idx: &mut Vec<u32>) {
+    for g in &pd.groups {
+        let Some(r) = g.renderer.as_ref() else { continue };
+        let mut order: Vec<usize> = (0..g.quads.len()).collect();
+        let key = |i: &usize| -> f32 {
+            let q = &g.quads[*i];
+            match r.sort_mode {
+                1 => -q.pos.distance_squared(cam.pos),
+                4 => cam.view.transform_point3(q.pos).z,
+                // oldest in front: the youngest are drawn first
+                2 => q.age,
+                3 => -q.age,
+                _ => 0.0,
+            }
+        };
+        if r.sort_mode != 0 {
+            order.sort_by(|a, b| key(a).total_cmp(&key(b)));
+        }
+        for i in order {
+            let q = &g.quads[i];
+            let [u0, v0, du, dv] = q.uv;
+            if r.render_mode == 4 {
+                let Some(mesh) = r.meshes.get(q.mesh as usize) else { continue };
+                let basis = match r.render_alignment {
+                    0 => Quat::from_mat3(&Mat3::from_cols(cam.right, cam.up, cam.back)),
+                    2 => g.emitter_rot,
+                    _ => g.sim_rot,
+                };
+                let rot = basis * uk_game::particles::unity_euler(q.rot * (180.0 / std::f32::consts::PI));
+                let base = verts.len() as u32;
+                for (k, v) in mesh.positions.iter().enumerate() {
+                    let n = mesh.normals.get(k).copied().unwrap_or(Vec3::Z);
+                    let uv = mesh.uvs.get(k).copied().unwrap_or([0.0; 2]);
+                    verts.push((q.pos + rot * (*v * q.size), (rot * n).normalize_or_zero(), q.color, [u0 + uv[0] * du, v0 + uv[1] * dv]));
+                }
+                for t in &mesh.tris {
+                    idx.extend(t.iter().map(|&k| base + k));
+                }
+                continue;
+            }
+            let (mut w, mut h) = (q.size.x, q.size.y);
+            // ParticleSystemRenderer min/maxParticleSize: fractions of the viewport height
+            let depth = -cam.view.transform_point3(q.pos).z;
+            let vh = 2.0 * depth.max(0.0) / cam.fy;
+            if vh > 0.0 && r.render_mode != 1 {
+                let big = w.max(h);
+                if big > 0.0 {
+                    let k = big.clamp(r.min_particle_size * vh, r.max_particle_size * vh) / big;
+                    w *= k;
+                    h *= k;
+                }
+            }
+            let mut roll = -q.rot.z;
+            let to_cam = (cam.pos - q.pos).normalize_or(cam.back);
+            let face = |back: Vec3| -> (Vec3, Vec3, Vec3) {
+                let right = cam.up.cross(back).normalize_or(cam.right);
+                (right, back.cross(right), back)
+            };
+            let (right, up, normal) = match r.render_mode {
+                // stretched: the length along the velocity as seen from the camera, centred on
+                // the particle; no roll
+                1 => {
+                    let speed = q.vel.length();
+                    let dir = if speed > 1e-6 { q.vel / speed } else { cam.up };
+                    let along = (dir - to_cam * dir.dot(to_cam)).normalize_or(cam.up);
+                    let side = along.cross(to_cam).normalize_or(cam.right);
+                    h = q.size.x * r.length_scale + speed * r.velocity_scale;
+                    w = q.size.x;
+                    roll = 0.0;
+                    (side, along, to_cam)
+                }
+                // horizontal: flat on the XZ plane, facing up
+                2 => (Vec3::X, Vec3::Z, Vec3::Y),
+                // vertical: upright, turned toward the camera about Y
+                3 => {
+                    let back = Vec3::new(cam.back.x, 0.0, cam.back.z).normalize_or(Vec3::Z);
+                    (Vec3::Y.cross(back), Vec3::Y, back)
+                }
+                _ => match r.render_alignment {
+                    1 | 2 => {
+                        let base = if r.render_alignment == 2 { g.emitter_rot } else { Quat::IDENTITY };
+                        let rot = base * uk_game::particles::unity_euler(Vec3::new(q.rot.x, q.rot.y, 0.0) * (180.0 / std::f32::consts::PI));
+                        (rot * Vec3::X, rot * Vec3::Y, rot * Vec3::NEG_Z)
+                    }
+                    3 => face(to_cam),
+                    4 if q.vel.length_squared() > 1e-12 => face(-q.vel.normalize()),
+                    _ => (cam.right, cam.up, cam.back),
+                },
+            };
+            let center = q.pos + right * (r.pivot.x * w) + up * (r.pivot.y * h) + normal * (r.pivot.z * q.size.x);
+            let (sn, cs) = roll.sin_cos();
+            let base = verts.len() as u32;
+            for (x, y, u, v) in [(-0.5f32, -0.5f32, 0.0f32, 0.0f32), (0.5, -0.5, 1.0, 0.0), (0.5, 0.5, 1.0, 1.0), (-0.5, 0.5, 0.0, 1.0)] {
+                let (xw, yh) = (x * w, y * h);
+                let p = center + right * (xw * cs - yh * sn) + up * (xw * sn + yh * cs);
+                verts.push((p, normal, q.color, [u0 + u * du, v0 + v * dv]));
+            }
+            idx.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+    }
 }
 
 /// Unity's legacy vertex lights for one renderer: up to 8, directional first, then by brightness
@@ -2261,25 +2492,19 @@ fn prepare(
         let iv = ctx.v.inverse();
         let (right, up, back) = (iv.x_axis.truncate().normalize(), iv.y_axis.truncate().normalize(), iv.z_axis.truncate().normalize());
         let (mut vb, mut ib) = (Vec::new(), Vec::new());
+        let mut pverts: Vec<ParticleVertex> = Vec::new();
+        let pcam = ParticleCam { pos: ctx.cam_pos, right, up, back, view: ctx.v, fy };
         for pd in frame.particles.iter() {
             let Some(Some(g)) = gpu.draws.get_mut(pd.slot) else { continue };
             let inputs = &scene.variants[scene.draws[pd.slot].variant as usize].inputs;
             vb.clear();
             ib.clear();
-            let mut n = 0u32;
-            for &(p, size, rot, col) in &pd.quads {
-                // ParticleSystemRenderer min/maxParticleSize: fractions of the viewport height
-                let depth = -ctx.v.transform_point3(p).z;
-                let h = 2.0 * depth.max(0.0) / fy;
-                let size = if h > 0.0 { size.clamp(pd.min_size * h, pd.max_size * h) } else { size };
-                let (sn, cs) = (-rot).sin_cos();
-                for (x, y, u, v) in [(-0.5f32, -0.5f32, 0.0f32, 0.0f32), (0.5, -0.5, 1.0, 0.0), (0.5, 0.5, 1.0, 1.0), (-0.5, 0.5, 0.0, 1.0)] {
-                    let q = p + (right * (x * cs - y * sn) + up * (x * sn + y * cs)) * size;
-                    push_vertex(&mut vb, inputs, q, back, col, [u, v]);
-                }
-                ib.extend_from_slice(&[n, n + 1, n + 2, n, n + 2, n + 3]);
-                n += 4;
+            pverts.clear();
+            particle_geometry(pd, &pcam, &mut pverts, &mut ib);
+            for &(q, nrm, col, uv) in &pverts {
+                push_vertex(&mut vb, inputs, q, nrm, col, uv);
             }
+            let mut n = pverts.len() as u32;
             for strip in &pd.strips {
                 for (k, &(q, w, col, u)) in strip.iter().enumerate() {
                     let a = strip[k.saturating_sub(1)].0;
@@ -2339,7 +2564,7 @@ fn prepare(
         let slots: Vec<String> = frame
             .particles
             .iter()
-            .map(|p| format!("{}#{} in view {} quads {} strips {} count {}", scene.draws[p.slot].material.name, p.slot, gpu.in_view[p.slot], p.quads.len(), p.strips.len(), gpu.draws[p.slot].as_ref().map_or(0, |g| g.count)))
+            .map(|p| format!("{}#{} in view {} quads {} strips {} count {}", scene.draws[p.slot].material.name, p.slot, gpu.in_view[p.slot], p.groups.iter().map(|g| g.quads.len()).sum::<usize>(), p.strips.len(), gpu.draws[p.slot].as_ref().map_or(0, |g| g.count)))
             .collect();
         info!("unity particle stats: {} slots {slots:?}", slots.len());
     }
@@ -3369,5 +3594,114 @@ fn frame_stats(gpu: Res<UnityGpu>, dev: Res<RenderDevice>, scene: Res<UnityScene
             predicted,
             black
         );
+    }
+}
+
+#[cfg(test)]
+mod particle_tests {
+    use super::*;
+    use uk_assets::particles::{EmitMesh, ParticleRendererDef};
+
+    fn cam() -> ParticleCam {
+        // at the origin looking down -z (Unity: +z forward is away; this view keeps world axes)
+        ParticleCam { pos: Vec3::ZERO, right: Vec3::X, up: Vec3::Y, back: Vec3::Z, view: Mat4::IDENTITY, fy: 1.0 }
+    }
+
+    fn draw(r: ParticleRendererDef, quads: Vec<ParticleQuad>) -> ParticleDraw {
+        ParticleDraw { groups: vec![ParticleGroup { renderer: Some(Arc::new(r)), quads, ..Default::default() }], ..Default::default() }
+    }
+
+    fn quad(pos: Vec3) -> ParticleQuad {
+        ParticleQuad { pos, size: Vec3::splat(2.0), color: [1.0; 4], uv: [0.0, 0.0, 1.0, 1.0], ..Default::default() }
+    }
+
+    fn geom(d: &ParticleDraw) -> (Vec<ParticleVertex>, Vec<u32>) {
+        let (mut v, mut i) = (Vec::new(), Vec::new());
+        particle_geometry(d, &cam(), &mut v, &mut i);
+        (v, i)
+    }
+
+    fn base() -> ParticleRendererDef {
+        ParticleRendererDef { enabled: true, max_particle_size: 100.0, length_scale: 2.0, ..Default::default() }
+    }
+
+    #[test]
+    fn billboard_faces_camera() {
+        let (v, i) = geom(&draw(base(), vec![quad(Vec3::new(0.0, 0.0, -10.0))]));
+        assert_eq!((v.len(), i.len()), (4, 6));
+        assert_eq!(v[0].0, Vec3::new(-1.0, -1.0, -10.0));
+        assert_eq!(v[2].0, Vec3::new(1.0, 1.0, -10.0));
+        assert_eq!(v[0].1, Vec3::Z);
+    }
+
+    #[test]
+    fn roll_and_max_size() {
+        // a quarter turn: corner (-.5,-.5) goes to (.5,-.5) (Unity rolls clockwise on screen)
+        let mut q = quad(Vec3::new(0.0, 0.0, -10.0));
+        q.rot.z = std::f32::consts::FRAC_PI_2;
+        let (v, _) = geom(&draw(base(), vec![q]));
+        assert!(v[0].0.distance(Vec3::new(-1.0, 1.0, -10.0)) < 1e-5, "{:?}", v[0].0);
+        // maxParticleSize 0.05 of the viewport height at depth 10 (fy 1): 20 * 0.05 = 1
+        let r = ParticleRendererDef { max_particle_size: 0.05, ..base() };
+        let (v, _) = geom(&draw(r, vec![quad(Vec3::new(0.0, 0.0, -10.0))]));
+        assert!((v[2].0.x - v[0].0.x - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn stretched_along_velocity() {
+        let mut q = quad(Vec3::new(0.0, 0.0, -10.0));
+        q.vel = Vec3::new(3.0, 0.0, 0.0);
+        let r = ParticleRendererDef { render_mode: 1, length_scale: 2.0, velocity_scale: 0.5, ..base() };
+        let (v, _) = geom(&draw(r, vec![q]));
+        // length 2 * 2 + 3 * 0.5 = 5.5 along x, width 2 along y, centred
+        let xs: Vec<f32> = v.iter().map(|v| v.0.x).collect();
+        let ys: Vec<f32> = v.iter().map(|v| v.0.y).collect();
+        let span = |a: &[f32]| a.iter().cloned().fold(f32::MIN, f32::max) - a.iter().cloned().fold(f32::MAX, f32::min);
+        assert!((span(&xs) - 5.5).abs() < 1e-4 && (span(&ys) - 2.0).abs() < 1e-4, "{xs:?} {ys:?}");
+        assert!(xs.iter().sum::<f32>().abs() < 1e-4);
+    }
+
+    #[test]
+    fn horizontal_vertical_world() {
+        let p = Vec3::new(0.0, 0.0, -10.0);
+        let (v, _) = geom(&draw(ParticleRendererDef { render_mode: 2, ..base() }, vec![quad(p)]));
+        assert!(v.iter().all(|v| v.0.y == 0.0 && v.1 == Vec3::Y));
+        let (v, _) = geom(&draw(ParticleRendererDef { render_mode: 3, ..base() }, vec![quad(p)]));
+        assert!(v.iter().all(|v| v.0.z == -10.0) && v[2].0.y == 1.0);
+        // world alignment with a 90 degree x rotation: lies on the XZ plane
+        let mut q = quad(p);
+        q.rot.x = std::f32::consts::FRAC_PI_2;
+        let (v, _) = geom(&draw(ParticleRendererDef { render_alignment: 1, ..base() }, vec![q]));
+        assert!(v.iter().all(|v| v.0.y.abs() < 1e-5), "{v:?}");
+    }
+
+    #[test]
+    fn sheet_uv_and_sort() {
+        let mut a = quad(Vec3::new(0.0, 0.0, -10.0));
+        a.uv = [0.25, 0.5, 0.25, 0.5];
+        a.age = 1.0;
+        let mut b = quad(Vec3::new(0.0, 0.0, -20.0));
+        b.age = 2.0;
+        let (v, _) = geom(&draw(base(), vec![a, b]));
+        assert_eq!((v[0].3, v[2].3), ([0.25, 0.5], [0.5, 1.0]));
+        // distance: the far one first; youngest in front (3): oldest first
+        let (v, _) = geom(&draw(ParticleRendererDef { sort_mode: 1, ..base() }, vec![a, b]));
+        assert_eq!(v[0].0.z, -20.0);
+        let (v, _) = geom(&draw(ParticleRendererDef { sort_mode: 3, ..base() }, vec![a, b]));
+        assert_eq!(v[0].0.z, -20.0);
+        let (v, _) = geom(&draw(ParticleRendererDef { sort_mode: 2, ..base() }, vec![a, b]));
+        assert_eq!(v[0].0.z, -10.0);
+    }
+
+    #[test]
+    fn mesh_particles() {
+        let m = EmitMesh { positions: vec![Vec3::ZERO, Vec3::X, Vec3::Y], normals: vec![Vec3::Z; 3], uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], tris: vec![[0, 1, 2]], area_cdf: vec![0.5] };
+        let r = ParticleRendererDef { render_mode: 4, render_alignment: 1, meshes: vec![Arc::new(m)], ..base() };
+        let mut q = quad(Vec3::new(5.0, 0.0, 0.0));
+        q.rot.y = std::f32::consts::FRAC_PI_2;
+        let (v, i) = geom(&draw(r, vec![q]));
+        assert_eq!((v.len(), i.len()), (3, 3));
+        // size 2, then a quarter turn about y: +x goes to -z
+        assert!(v[1].0.distance(Vec3::new(5.0, 0.0, -2.0)) < 1e-5, "{:?}", v[1].0);
     }
 }

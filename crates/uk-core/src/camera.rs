@@ -96,6 +96,7 @@ impl FpCamera {
             self.default_pos =
                 vmove_towards(self.default_pos, eye_target, ((eye_target - self.default_pos).length() + 0.5) * dt * 10.0);
         }
+        nm.cam_default_pos = self.default_pos;
         if nm.walking && nm.standing && self.default_pos == eye_target {
             let speed = nm.vel.length().min(15.0) / 15.0;
             let lp = self.local_pos;

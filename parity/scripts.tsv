@@ -1,24 +1,24 @@
 class	scenes	instances	status
-Image	54	140762	MISSING
-TextMeshProUGUI	54	64961	MISSING
-Button	54	29172	MISSING
-HudOpenEffect	54	14141	MISSING
-Slider	54	11716	MISSING
-PlayOnAwakeTracker	54	8779	MISSING
+Image	54	140762	partial: Simple/Sliced/Tiled/Filled; useSpriteMesh drawn as a quad; no layout element sizes
+TextMeshProUGUI	54	64961	partial: no Ellipsis/Page/Linked overflow, sprites, underline/strikethrough meshes, rare tags; no preferred sizes
+Button	54	29172	partial: ColorTint normal/disabled only; no EventSystem
+HudOpenEffect	54	14141	full
+Slider	54	11716	partial: value -> fill/handle anchors and Filled amount; no dragging/navigation
+PlayOnAwakeTracker	54	8826	MISSING
 VerticalLayoutGroup	54	4561	MISSING
 HorizontalLayoutGroup	54	2684	MISSING
-Mask	54	2370	MISSING
-CanvasScaler	54	776	MISSING
+Mask	54	2370	full
+CanvasScaler	54	776	full
 GraphicRaycaster	54	535	MISSING
 SliderValueToText	53	10808	MISSING
-Text	53	4163	MISSING
+Text	53	4163	partial: not meshed (Unity's native TextGenerator)
 ObjectActivator	53	4093	full
-GunColorGetter	53	3536	MISSING
-ColorBlindGet	53	3496	MISSING
+GunColorGetter	53	3630	MISSING
+ColorBlindGet	53	3496	full
 ContentSizeFitter	53	2272	MISSING
 Scrollbar	53	1731	MISSING
 ScrollRect	53	1672	MISSING
-RawImage	53	1105	MISSING
+RawImage	53	1105	full
 CullingOverride	53	1034	MISSING
 GridLayoutGroup	53	276	MISSING
 IconPackSprite	53	265	MISSING
@@ -39,7 +39,7 @@ GameStateManager	53	53	MISSING
 LogLine	53	53	MISSING
 PinConsole	53	53	MISSING
 PrefabReplacer	53	53	MISSING
-RectMask2D	53	53	MISSING
+RectMask2D	53	53	full
 SceneHelper	53	53	MISSING
 TMP_InputField	53	53	MISSING
 PreservedOriginalMesh	52	37979	MISSING
@@ -47,11 +47,11 @@ ShopButton	52	19146	MISSING
 ControllerPointer	52	16132	MISSING
 BackSelectOverride	52	12352	MISSING
 EnemySimplifier	52	7361	MISSING
-RemoveOnTime	52	4379	MISSING
+RemoveOnTime	52	4379	full
 RandomPitch	52	4080	MISSING
 OutdoorsChecker	52	3950	MISSING
 SeasonalHats	52	3122	MISSING
-ColorBlindSetter	52	1802	MISSING
+ColorBlindSetter	52	1802	partial: prefs applied at load (ColorBlindActivator.Start); no options menu
 Spin	52	1734	MISSING
 GamepadObjectSelector	52	1646	MISSING
 VariationInfo	52	1539	MISSING
@@ -65,7 +65,7 @@ ShopCategory	52	488	MISSING
 InputField	52	425	MISSING
 PrefOptionToggle	52	424	MISSING
 SettingsRestoreDefaultButton	52	424	MISSING
-SliderToFillAmount	52	424	MISSING
+SliderToFillAmount	52	424	full
 CustomMusicPlaceholder	52	418	MISSING
 GunColorLock	52	405	MISSING
 GunColorTypeGetter	52	405	MISSING
@@ -73,20 +73,20 @@ BackSelectEvent	52	371	MISSING
 KeepInBounds	52	370	MISSING
 SettingsPageBuilder	52	319	MISSING
 EventOnSceneName	52	318	MISSING
-StaminaMeter	52	314	MISSING
+StaminaMeter	52	314	partial: no flash sound
 AspectRatioFitter	52	266	MISSING
 BasicConfirmationDialog	52	266	MISSING
-HealthBar	52	264	MISSING
+HealthBar	52	264	partial: NewMovement.antiHp (hard damage) not ported: always 0
 TeleportPlayer	52	260	full
 AbruptLevelChanger	52	243	MISSING
 CopyImage	52	212	MISSING
 ShowIfLevelUnlocked	52	212	MISSING
 TextOverride	52	212	MISSING
-HUDPos	52	211	MISSING
-Shadow	52	176	MISSING
+HUDPos	52	211	full
+Shadow	52	176	full
 PlatformDependantObject	52	161	MISSING
 BossHealthSliderTemplate	52	159	MISSING
-HudController	52	158	MISSING
+HudController	52	158	partial: no fist fill (WeaponCharges.punchStamina), no SetAlwaysOnTop material swap, no HideUI cheat
 Speedometer	52	158	MISSING
 FlashImage	52	146	MISSING
 GroundCheck	52	123	full
@@ -95,8 +95,8 @@ SecretMissionChecker	52	111	MISSING
 ShopZone	52	109	MISSING
 SelectionRedirector	52	107	MISSING
 CheatMenuItem	52	106	MISSING
-FadeOutBars	52	106	MISSING
-LevelStats	52	106	MISSING
+FadeOutBars	52	106	full
+LevelStats	52	106	partial: challenge always NO (ChallengeManager not ported), style 0 (StyleHUD), no cyber grind wave text
 SliderReleaseColor	52	106	MISSING
 TooltipManager	52	106	MISSING
 WorkshopMapEndRating	52	105	MISSING
@@ -119,7 +119,7 @@ AutoRegisterState	52	55	MISSING
 ButtonTextColorSetter	52	55	MISSING
 CausticVolumeManager	52	55	MISSING
 CopyColor	52	54	MISSING
-TextAppearByLines	52	54	MISSING
+TextAppearByLines	52	54	full
 AdvancedOptions	52	53	MISSING
 AlterMenuElements	52	53	MISSING
 AlterMenuVector3Field	52	53	MISSING
@@ -129,29 +129,29 @@ BossHealthBarTemplate	52	53	MISSING
 ButtonHighlightParent	52	53	MISSING
 CanvasController	52	53	MISSING
 CheatsManager	52	53	MISSING
-ColorBlindActivator	52	53	MISSING
+ColorBlindActivator	52	53	full
 ControlsOptions	52	53	MISSING
-Crosshair	52	53	MISSING
+Crosshair	52	53	partial: crossHairColor 0's invertMaterial is not swapped in; no options menu (prefs at load)
 CustomPaletteSelector	52	53	MISSING
 CutsceneSkipText	52	53	MISSING
-DeathSequence	52	53	MISSING
+DeathSequence	52	53	partial: deathness + log + EndSequence BlackScreen; no LaughingSkull/Flash/ISeeYou sprites, audio, pitch
 DropdownImageFlipper	52	53	MISSING
 DropdownPipChanger	52	53	MISSING
 GraphicsSettings	52	53	MISSING
 HUDSettings	52	53	MISSING
-HudMessageReceiver	52	53	MISSING
+HudMessageReceiver	52	53	partial: no message sound
 LaughingSkull	52	53	MISSING
 LeaderboardManagementEntry	52	53	MISSING
 LeaderboardManagementScreen	52	53	MISSING
 LevelEndLeaderboard	52	53	MISSING
 LevelNamePopup	52	53	MISSING
-LevelStatsEnabler	52	53	MISSING
+LevelStatsEnabler	52	53	full
 MenuAlphaPop	52	53	MISSING
 MenuNavigationBuilder	52	53	MISSING
 OptionsMenuToManager	52	53	MISSING
 PauseMenu	52	53	MISSING
 PortalRenderV2	52	53	MISSING
-PowerUpMeter	52	53	MISSING
+PowerUpMeter	52	53	partial: juice meter drives VIGNETTE; no meter UI, endEffect
 RefCountedEvent	52	53	MISSING
 RumbleKeyOptionEntry	52	53	MISSING
 RumbleSettingsMenu	52	53	MISSING
@@ -179,13 +179,13 @@ WorkshopMapEndLinks	52	53	MISSING
 AlwaysLookAtCameraManager	52	52	MISSING
 AssistController	52	52	MISSING
 AudioMixerController	52	52	MISSING
-BloodsplatterManager	52	52	MISSING
+BloodsplatterManager	52	52	partial: pools + GetGore; no underwater/sand/blessed gore (eid flags not tracked), no bloodstain decals
 CameraController	52	52	partial: no screenshake, no options
 CameraFrustumTargeter	52	52	MISSING
 ChallengeManager	52	52	MISSING
 CheatsController	52	52	MISSING
 ClimbStep	52	52	full
-ColorBlindSettings	52	52	MISSING
+ColorBlindSettings	52	52	partial: HUD and variation colours; enemy colours unused
 DefaultReferenceManager	52	52	MISSING
 DiscordController	52	52	MISSING
 FireObjectPool	52	52	MISSING
@@ -196,10 +196,10 @@ HookArm	52	52	MISSING
 IconManager	52	52	MISSING
 MeshCombineManager	52	52	MISSING
 MusicManager	52	52	MISSING
-NewMovement	52	52	partial: no hurt/death anim, sounds, slope/water/jump pad interplay
+NewMovement	52	52	partial: no hurt/death anim, sounds, slope/jump pad interplay (water forces ported)
 OptionsManager	52	52	MISSING
 PhysicsSounds	52	52	MISSING
-PlayerActivatorRelay	52	52	MISSING
+PlayerActivatorRelay	52	52	full
 PlayerAnimations	52	52	MISSING
 PlayerMovementParenting	52	52	MISSING
 PlayerTracker	52	52	MISSING
@@ -210,7 +210,8 @@ PostProcessV2_Handler	52	52	MISSING
 PowerVoiceController	52	52	MISSING
 PresenceController	52	52	MISSING
 ProjectileParryZone	52	52	MISSING
-RailcannonMeter	52	52	MISSING
+Punch	52	52	partial: Feedbacker basics; no Knuckleblaster; viewmodel Jab/Jab2 fed
+RailcannonMeter	52	52	partial: raicharge is 0 until the railcannon is ported
 RotateToFaceFrustumTarget	52	52	MISSING
 SandboxSaver	52	52	MISSING
 SimpleMeshCombineManager	52	52	MISSING
@@ -219,7 +220,7 @@ StatsManager	52	52	MISSING
 SteamController	52	52	MISSING
 StockMapInfo	52	52	MISSING
 StyleCalculator	52	52	MISSING
-StyleHUD	52	52	MISSING
+StyleHUD	52	52	partial: meter visibility only (comboActive || forceMeterOn); no style points, ranks, freshness
 TimeController	52	52	MISSING
 UnderwaterController	52	52	MISSING
 VerticalClippingBlocker	52	52	MISSING
@@ -240,16 +241,23 @@ DeathZone	50	479	full
 FinalDoorOpener	50	122	full
 FinalDoor	50	121	partial: no animation/sound
 FirstRoomPrefab	50	50	MISSING
-OnLevelStart	50	50	MISSING
+OnLevelStart	50	50	partial: hideFogUntilStart / levelNameOnStart / music not applied
+PortalAwareLight	49	800	MISSING
+RevolverCylinder	48	51	MISSING
+WeaponIcon	48	51	MISSING
+WeaponIdentifier	48	51	MISSING
+WeaponPos	48	51	MISSING
+RevolverAnimationReceiver	48	49	MISSING
+Revolver	48	48	partial: piercer variant only; no coin/alt variants, no sound; viewmodel anim fed (Shoot/ChargeShoot)
 GunSetter	47	47	MISSING
 EnemyIdentifierIdentifier	45	30315	MISSING
 EnemyIdentifier	45	2800	partial: damage/limb multipliers; no buffs, blessing, radiance, sand
 EnemySpawnableInstance	45	2715	MISSING
-FinalPit	45	139	partial: no results screen
+FinalPit	45	139	full
 AlwaysLookAtCamera	44	3752	MISSING
 DoorController	44	2044	full
 DisabledEnemiesChecker	44	551	MISSING
-TeleportFinalPit	44	63	MISSING
+TeleportFinalPit	44	63	full
 Breakable	43	2859	partial: no debris/particles/sound
 Enemy	43	2691	MISSING
 FinalRoom	43	67	MISSING
@@ -258,20 +266,19 @@ GoreZone	42	388	MISSING
 PortalAwareRenderer	41	2682	MISSING
 SwingCheck2	41	2357	data-only
 AlwaysIncludeSceneOptimizer	41	287	MISSING
-HudMessage	41	252	partial: text only
+HudMessage	41	252	partial: no message sound; legacy InputManager key names print the input name
 CheckPoint	41	183	partial: no rooms reset beyond snapshot; no sound/anim
 OutOfBounds	41	42	MISSING
 StaticSceneOptimizer	41	41	MISSING
-PortalAwareLight	40	753	MISSING
 GroundCheckEnemy	39	2231	MISSING
 ActivateNextWave	38	456	full
 Flammable	37	18283	MISSING
 EnviroParticle	37	739	MISSING
 SandboxPropPart	37	699	MISSING
-ActivateArena	37	407	full
+ActivateArena	37	407	partial: forEnemy (Enemy-tagged trigger) arenas never activate
 Water	36	211	MISSING
 Footsteps	35	1652	MISSING
-Zombie	35	1614	partial: direct pursuit, no navmesh/anim
+Zombie	35	1614	partial: navmesh pursuit (TrackTick); no anim, no agent avoidance
 GamepadSelectionOutline	35	35	MISSING
 InputSystemUIInputModule	35	35	MISSING
 BigDoor	34	1049	MISSING
@@ -340,17 +347,17 @@ PrefConditional	18	36	MISSING
 SecretMissionPit	18	32	MISSING
 FirstPersonInputModule	18	18	MISSING
 StandaloneInputModule	18	18	MISSING
-PortalAwareParticleSystem	16	260	MISSING
+PortalAwareParticleSystem	16	260	partial: environment raycast kill; no portals
 BreakChunks	16	109	MISSING
 Flicker	16	107	MISSING
 HookPoint	16	94	MISSING
-BloodUnderwaterChecker	16	93	MISSING
+BloodUnderwaterChecker	16	93	full
 MovementParticleTrigger	15	210	MISSING
 EnviroMaterialGetter	15	163	MISSING
 ThreadedParticleCollision	15	160	MISSING
 ParticleCollisionSpawn	15	154	MISSING
 ChangeMaterials	15	133	MISSING
-Bloodsplatter	15	85	MISSING
+Bloodsplatter	15	85	partial: play on enable, heal sphere, repool when stopped; particle collisions only counted (no stains, no sound)
 SwordsMachine	15	52	MISSING
 TimeOfDayChanger	15	41	MISSING
 Readable	14	113	MISSING
@@ -373,7 +380,7 @@ Mindflayer	12	17	MISSING
 WeaponPickUp	12	17	partial: revolver only
 Mannequin	11	102	MISSING
 Idol	11	36	MISSING
-GetPlayerPref	11	12	MISSING
+GetPlayerPref	11	12	full
 PlayerDistanceDecal	10	539	MISSING
 MannequinPoses	10	218	MISSING
 LampFlicker	10	75	MISSING
@@ -387,7 +394,7 @@ SetPlayerPref	10	12	MISSING
 Guttertank	9	46	MISSING
 SubtitledAudioSource	9	26	MISSING
 Stalker	9	23	MISSING
-ArenaStatus	9	15	MISSING
+ArenaStatus	9	15	full
 Mass	9	12	MISSING
 RandomForce	8	312	MISSING
 LerpColor	8	77	MISSING
@@ -398,7 +405,7 @@ SimpleMeshCombiner	8	24	MISSING
 PlayerSoftPuller	8	23	MISSING
 BreakBreakables	8	21	MISSING
 SkyboxEnabler	8	21	MISSING
-DualWieldPickup	8	11	MISSING
+DualWieldPickup	8	11	partial: grants DualWield juice; no duplicated weapon, pickup effect, camera shake
 GetMusicVolume	8	11	MISSING
 LimboSwitch	8	10	MISSING
 PooledSplash	7	163	MISSING
@@ -494,7 +501,6 @@ Ferryman	3	5	MISSING
 KillHitterTarget	3	5	MISSING
 BattleDimmingLights	3	4	MISSING
 Tram	3	4	MISSING
-WeaponIcon	3	4	MISSING
 GoToTarget	3	3	MISSING
 KillHitterCache	3	3	MISSING
 ObjectActivatorStay	3	3	MISSING
@@ -525,9 +531,6 @@ PowerIntro	2	6	MISSING
 MoveTowards	2	5	MISSING
 AudioMuffleZone	2	4	MISSING
 GlassBreaker	2	4	MISSING
-RevolverCylinder	2	4	MISSING
-WeaponIdentifier	2	4	MISSING
-WeaponPos	2	4	MISSING
 Bloodstain	2	3	MISSING
 CheckLevelRank	2	3	MISSING
 ComplexSplasher	2	3	MISSING
@@ -562,7 +565,6 @@ OnCheatsEnable	2	2	MISSING
 PlayerPusher	2	2	MISSING
 Radio	2	2	MISSING
 RenderCubemap	2	2	MISSING
-RevolverAnimationReceiver	2	2	MISSING
 SetGravity	2	2	MISSING
 SoundChanger	2	2	MISSING
 SoundStopper	2	2	MISSING
@@ -680,7 +682,7 @@ CyberGrindNavHelper	1	1	MISSING
 CyberGrindSettingsNavigator	1	1	MISSING
 DefaultSandboxCheckpoint	1	1	MISSING
 DeletePlayerPref	1	1	MISSING
-DisablePowerUp	1	1	MISSING
+DisablePowerUp	1	1	full
 EndlessCube	1	1	MISSING
 EndlessGrid	1	1	MISSING
 EndlessHighScore	1	1	MISSING
@@ -731,7 +733,7 @@ MirrorReaper	1	1	MISSING
 MuteWhenPaused	1	1	MISSING
 NoBatchLimboWalls	1	1	MISSING
 OnLineOfSight	1	1	MISSING
-Outline	1	1	MISSING
+Outline	1	1	full
 PickClosestPoint	1	1	MISSING
 PlatformerChecker	1	1	MISSING
 PlatformerDancer	1	1	MISSING
@@ -748,7 +750,6 @@ RandomizeWind	1	1	MISSING
 RankIcon	1	1	MISSING
 ReadableFlipper	1	1	MISSING
 ResumeSoundsOnEnable	1	1	MISSING
-Revolver	1	1	partial: piercer variant only; no coin/alt variants, no anim/sound
 RotateByPosition	1	1	MISSING
 SandboxArm	1	1	MISSING
 SandboxNavmesh	1	1	MISSING

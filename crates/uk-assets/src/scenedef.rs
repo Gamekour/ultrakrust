@@ -36,6 +36,8 @@ const CLASS_NAV_MESH_AGENT: i32 = 195;
 const CLASS_CANVAS_GROUP: i32 = 225;
 const CLASS_ANIMATOR_CONTROLLER: i32 = 91;
 const CLASS_ANIMATOR_OVERRIDE_CONTROLLER: i32 = 221;
+const CLASS_PARTICLE_SYSTEM: i32 = 198;
+const CLASS_PARTICLE_RENDERER: i32 = 199;
 
 /// Tag ids from TagManager (globalgamemanagers): custom tags start at 20000.
 pub mod tags {
@@ -55,7 +57,7 @@ pub mod tags {
 
 /// Layers neither the player's Main Camera (culling mask 0x8fd2dfd7) nor its HUD Camera (0x2000)
 /// draws: trigger volumes (16 Invisible), UI, PlayerOnly/EnemyWall blockers, ...
-const HIDDEN_LAYERS: &[u8] = &[3, 5, 16, 18, 19, 21, 28, 29, 30];
+pub const HIDDEN_LAYERS: &[u8] = &[3, 5, 16, 18, 19, 21, 28, 29, 30];
 
 /// The viewmodel layer ("AlwaysOnTop"): drawn only by the HUD Camera (fov 90, depth cleared).
 pub const VIEWMODEL_LAYER: u8 = 13;
@@ -177,6 +179,20 @@ pub struct LightDef {
     pub culling_mask: u32,
 }
 
+/// A ParticleSystem placed in the scene (or in a prefab instantiated into it) with the
+/// ParticleSystemRenderer on the same GameObject.
+#[derive(Clone, Debug)]
+pub struct SceneParticleDef {
+    pub node: u32,
+    pub path_id: i64,
+    pub system: Arc<crate::particles::ParticleSystemDef>,
+    pub renderer: Option<Arc<crate::particles::ParticleRendererDef>>,
+    /// mesh renderer shape: the node whose MeshRenderer the system emits from
+    pub shape_node: Option<u32>,
+    /// collision planes (CollisionModule.m_Planes) as nodes
+    pub planes: Vec<u32>,
+}
+
 /// RenderSettings (class 104). fog_mode: 1 linear, 2 exponential, 3 exp2. ambient_mode: 0 skybox,
 /// 1 trilight, 3 flat, 4 custom.
 #[derive(Clone, Debug, Default)]
@@ -209,6 +225,62 @@ pub struct ColliderDef {
     pub path_id: i64,
 }
 
+/// A material's SceneHelper surface data: `_SurfaceType` / `_EnviroParticleColor` and the
+/// secondary pair VERTEX_BLENDING switches to.
+#[derive(Debug, Clone, Copy)]
+pub struct SurfaceMat {
+    /// HasProperty(_SurfaceType) (approximated by the saved properties holding it)
+    pub has_surface: bool,
+    pub surface: i32,
+    pub color: [f32; 4],
+    pub secondary: i32,
+    pub secondary_color: [f32; 4],
+    pub vertex_blending: bool,
+    /// STATIC_LIGHTING or STATIONARY_LIGHTING: the first material stands for every submesh
+    pub static_lighting: bool,
+}
+
+/// An object SceneHelper duplicates into its footstep physics scene (IsValidForPhysicsScene: a
+/// footstep layer, a non-trigger first Collider, a MeshRenderer, no non-kinematic Rigidbody),
+/// with the mesh it gets (PreservedOriginalMesh, else the MeshCollider's, else the MeshFilter's)
+/// at the object's load-time transform; the copy only follows the source's active state.
+#[derive(Debug)]
+pub struct SurfaceMeshDef {
+    pub node: u32,
+    pub layer: u8,
+    /// world triangles (Bevy space), in the mesh's triangle order (submeshes concatenated)
+    pub tris: Vec<[Vec3; 3]>,
+    /// per triangle: index into `mats` ResolveHitSurfaceData picks (None: no material)
+    pub tri_mat: Vec<Option<u16>>,
+    /// per triangle: the vertex colors' red channel (empty when the mesh has no colors)
+    pub tri_r: Vec<[f32; 3]>,
+    pub mats: Vec<SurfaceMat>,
+}
+
+/// FootstepSet particle prefabs by SurfaceType (indices into `particle_prefabs`; None for a null
+/// entry). Lookups fall back to Generic (0).
+#[derive(Debug, Default, Clone)]
+pub struct FootstepFx {
+    pub enviro_gib_particles: HashMap<i32, Option<u32>>,
+    pub slide_particles: HashMap<i32, Option<u32>>,
+    pub wall_scrape_particles: HashMap<i32, Option<u32>>,
+}
+
+impl FootstepFx {
+    fn get(m: &HashMap<i32, Option<u32>>, surface: i32) -> Option<u32> {
+        m.get(&surface).or_else(|| m.get(&0)).copied().flatten()
+    }
+    pub fn enviro_gib_particle(&self, surface: i32) -> Option<u32> {
+        Self::get(&self.enviro_gib_particles, surface)
+    }
+    pub fn slide_particle(&self, surface: i32) -> Option<u32> {
+        Self::get(&self.slide_particles, surface)
+    }
+    pub fn wall_scrape_particle(&self, surface: i32) -> Option<u32> {
+        Self::get(&self.wall_scrape_particles, surface)
+    }
+}
+
 #[derive(Debug)]
 pub struct ScriptDef {
     pub node: u32,
@@ -234,6 +306,8 @@ pub struct SceneDef {
     pub comp_to_collider: HashMap<i64, u32>,
     /// Nodes that carry a Rigidbody.
     pub rigidbodies: std::collections::HashSet<u32>,
+    /// Nodes whose Rigidbody is not kinematic.
+    pub dynamic_rigidbodies: std::collections::HashSet<u32>,
     pub nav_agents: Vec<NavAgentDef>,
     pub warnings: Vec<String>,
     /// Baked navmeshes (one per agent type / surface).
@@ -258,6 +332,17 @@ pub struct SceneDef {
     pub particle_prefabs: Vec<Arc<crate::particles::ParticlePrefab>>,
     /// (script, field) -> index into `particle_prefabs`
     pub script_prefabs: HashMap<(u32, String), u32>,
+    /// (script, "field>Class") -> the data of the root `Class` MonoBehaviour of the prefab that
+    /// field references (e.g. a ZombieProjectiles projectile's Projectile settings)
+    pub script_nested: HashMap<(u32, String), Value>,
+    /// SceneHelper's footstep physics scene
+    pub surface_meshes: Vec<SurfaceMeshDef>,
+    /// DefaultReferenceManager.footstepSet's particles
+    pub footstep_fx: FootstepFx,
+    /// ParticleSystems in the node graph, in node order.
+    pub particle_systems: Vec<SceneParticleDef>,
+    /// ParticleSystem component path id -> index into `particle_systems`.
+    pub comp_to_particle: HashMap<i64, u32>,
 }
 
 impl SceneDef {
@@ -453,13 +538,43 @@ impl Loader<'_> {
     }
 }
 
-/// The prefab fields of effect-spawning scripts: BloodsplatterManager.InitPools pools these
-/// (the bloodstain / gib fields aside), MaliciousFace instantiates dripBlood on hits and
-/// woundedParticle at half health.
+/// The effect fields of effect-spawning scripts (GameObjects or AssetReferences they
+/// Instantiate). `a>B.c` follows field `a` to a prefab and reads field `c` of the `B` script on
+/// its root (RevolverBeam.hitParticle through Revolver.revolverBeam). BloodsplatterManager.InitPools
+/// pools its fields (the bloodstain / gib fields aside).
 const EFFECT_PREFABS: &[(&str, &[&str])] = &[
     ("BloodsplatterManager", &["head", "limb", "body", "small", "smallest", "splatter", "underwater", "sand"]),
-    ("MaliciousFace", &["dripBlood", "woundedParticle"]),
+    ("MaliciousFace", &["dripBlood", "woundedParticle", "beamExplosion", "breakParticle", "enrageEffect", "impactParticle", "proj>Projectile.explosionEffect"]),
+    ("NewMovement", &["dodgeParticle", "slideParticle", "fallParticle", "impactDust"]),
+    ("Breakable", &["breakParticle", "breakParticleFallback", "durabilityHurtParticle"]),
+    ("Glass", &["shatterParticle"]),
+    ("CheckPoint", &["activateEffect"]),
+    ("TeleportPlayer", &["teleportEffect"]),
+    ("DeathZone", &["sawSound"]),
+    ("ZombieMelee", &["hitGroundParticle", "pullOutParticle"]),
+    ("ZombieProjectiles", &["projectileBeam", "projectile>Projectile.explosionEffect"]),
+    ("PowerUpMeter", &["endEffect"]),
+    ("DualWieldPickup", &["pickUpEffect"]),
+    ("Punch", &["dustParticle"]),
+    ("Revolver", &["revolverBeam>RevolverBeam.hitParticle", "revolverBeamSuper>RevolverBeam.hitParticle"]),
 ];
+
+/// The GameObject a PPtr (to a GameObject or any of its components) or an AssetReference points at.
+fn effect_target(ld: &mut Loader, from: &Arc<SerializedFile>, v: &Value) -> Option<(Arc<SerializedFile>, i64)> {
+    let guid = v.get("m_AssetGUID").str().to_string();
+    let (f, id) = if !guid.is_empty() {
+        if ld.db.catalog.is_none() {
+            ld.db.catalog = crate::addressables::Catalog::load(&ld.db.install.clone()).ok().map(Arc::new);
+        }
+        let cat = ld.db.catalog.clone()?;
+        cat.load_asset(ld.db, &guid).ok()?
+    } else {
+        ld.db.resolve(from, v.pptr()).ok().flatten()?
+    };
+    let class = f.object(id)?.class_id;
+    let go = if class == 1 { id } else { f.read_id(id).ok()?.get("m_GameObject").pptr().1 };
+    (go != 0).then_some((f, go))
+}
 
 fn load_effect_prefabs(ld: &mut Loader, def: &mut SceneDef) {
     let mut loaded: HashMap<(String, i64), u32> = HashMap::new();
@@ -471,8 +586,23 @@ fn load_effect_prefabs(ld: &mut Loader, def: &mut SceneDef) {
         };
         let Some(from) = from else { continue };
         for &field in *fields {
-            let p = def.scripts[si].data.get(field).pptr();
-            let Ok(Some((f, go))) = ld.db.resolve(&from, p) else { continue };
+            let target = match field.split_once('>') {
+                None => effect_target(ld, &from, def.scripts[si].data.get(field)),
+                Some((outer, inner)) => {
+                    let (class, inner) = inner.split_once('.').unwrap();
+                    effect_target(ld, &from, def.scripts[si].data.get(outer)).and_then(|(f, go)| {
+                        let g = f.read_id(go).ok()?;
+                        let sv = g.get("m_Component").array().iter().find_map(|c| {
+                            let cv = f.read_id(c.get("component").pptr().1).ok()?;
+                            let name = ld.db.read_pptr(&f, cv.get("m_Script").pptr()).ok().flatten()?.2.get("m_ClassName").str().to_string();
+                            (name == class).then_some(cv)
+                        })?;
+                        def.script_nested.insert((si as u32, format!("{outer}>{class}")), sv.clone());
+                        effect_target(ld, &f, sv.get(inner))
+                    })
+                }
+            };
+            let Some((f, go)) = target else { continue };
             let key = (f.name.clone(), go);
             let idx = match loaded.get(&key) {
                 Some(&i) => i,
@@ -492,6 +622,121 @@ fn load_effect_prefabs(ld: &mut Loader, def: &mut SceneDef) {
             def.script_prefabs.insert((si as u32, field.to_string()), idx);
         }
     }
+}
+
+/// TagManager layers in SceneHelper's footstepLayerMask: Environment, Outdoors, EnvironmentBaked,
+/// OutdoorsBaked.
+pub const FOOTSTEP_LAYERS: [u8; 4] = [8, 24, 7, 6];
+
+fn surface_mat(ld: &mut Loader, from: &Arc<SerializedFile>, p: (i32, i64)) -> Option<SurfaceMat> {
+    let (_, _, v) = ld.db.read_pptr(from, p).ok()??;
+    let m = crate::shader::MaterialProps::from_value(&v);
+    let kw = |k: &str| m.keywords.iter().any(|x| x == k);
+    let col = |k: &str| m.colors.get(k).copied().unwrap_or([1.0; 4]);
+    let flt = |k: &str| m.floats.get(k).copied().unwrap_or(0.0).round() as i32;
+    Some(SurfaceMat {
+        has_surface: m.floats.contains_key("_SurfaceType"),
+        surface: flt("_SurfaceType"),
+        color: col("_EnviroParticleColor"),
+        secondary: flt("_SecondarySurfaceType"),
+        secondary_color: col("_SecondaryEnviroParticleColor"),
+        vertex_blending: kw("VERTEX_BLENDING"),
+        static_lighting: kw("STATIC_LIGHTING") || kw("STATIONARY_LIGHTING"),
+    })
+}
+
+/// A footstep physics scene object; per triangle the material SceneHelper.ResolveHitSurfaceData
+/// resolves (`reusableMaterials[submesh - subMeshStartIndex]`, or the first material when the
+/// mesh has one submesh or that material is statically lit).
+#[allow(clippy::too_many_arguments)]
+fn surface_mesh(ld: &mut Loader, file: &Arc<SerializedFile>, node: u32, layer: u8, world: Mat4, mesh: &MeshData, mats: &[(i32, i64)], start: usize) -> SurfaceMeshDef {
+    let smats: Vec<Option<SurfaceMat>> = mats.iter().map(|&p| surface_mat(ld, file, p)).collect();
+    let mut out = SurfaceMeshDef { node, layer, tris: Vec::new(), tri_mat: Vec::new(), tri_r: Vec::new(), mats: Vec::new() };
+    let idx: Vec<Option<u16>> = smats
+        .iter()
+        .map(|m| {
+            m.map(|m| {
+                out.mats.push(m);
+                out.mats.len() as u16 - 1
+            })
+        })
+        .collect();
+    let first = idx.first().copied().flatten();
+    let whole = mesh.submeshes.len() <= 1 || smats.first().copied().flatten().is_some_and(|m| m.static_lighting);
+    let r = |i: u32| mesh.colors.get(i as usize).map_or(1.0, |c| c[0]);
+    let mut t = 0usize;
+    for sm in &mesh.submeshes {
+        for tri in sm.indices.chunks_exact(3) {
+            let p = |i: u32| to_bevy_point(world.transform_point3(Vec3::from(mesh.positions[i as usize])));
+            out.tris.push([p(tri[0]), p(tri[1]), p(tri[2])]);
+            // the submesh walk starts at subMeshStartIndex with its index count from 0
+            let num = t * 3;
+            let mut found = None;
+            if !whole {
+                let mut cum = 0;
+                for i in start..mesh.submeshes.len() {
+                    let next = cum + mesh.submeshes[i].indices.len();
+                    if num < next {
+                        found = Some((i, cum));
+                        break;
+                    }
+                    cum = next;
+                }
+            }
+            out.tri_mat.push(if whole { first } else { found.and_then(|(i, _)| idx.get(i - start).copied().flatten()) });
+            if !mesh.colors.is_empty() {
+                // GetTriangles(submesh)[num - num2..]: the found submesh's own triangle list
+                let (si, base) = found.unwrap_or((0, 0));
+                let ix = &mesh.submeshes[si].indices;
+                let k = num - base;
+                out.tri_r.push(if k + 2 < ix.len() { [r(ix[k]), r(ix[k + 1]), r(ix[k + 2])] } else { [1.0; 3] });
+            }
+            t += 1;
+        }
+    }
+    out
+}
+
+/// DefaultReferenceManager.footstepSet: the FootstepSet's particle tables, last entry per
+/// SurfaceType winning as in its Initialize.
+fn load_footstep_set(ld: &mut Loader, def: &mut SceneDef) {
+    let Some(sc) = def.scripts.iter().find(|s| s.class == "DefaultReferenceManager") else { return };
+    let from = match &sc.file {
+        Some(f) => ld.db.file(f).ok(),
+        None => Some(ld.scene.clone()),
+    };
+    let Some(from) = from else { return };
+    let Ok(Some((sf, _, set))) = ld.db.read_pptr(&from, sc.data.get("footstepSet").pptr()) else {
+        def.warnings.push("DefaultReferenceManager.footstepSet: missing".into());
+        return;
+    };
+    let mut loaded: HashMap<(String, i64), u32> = HashMap::new();
+    let mut fx = FootstepFx::default();
+    for (field, map) in [("enviroGibParticles", &mut fx.enviro_gib_particles), ("slideParticles", &mut fx.slide_particles), ("wallScrapeParticles", &mut fx.wall_scrape_particles)] {
+        for e in set.get(field).array() {
+            let surface = e.get("<SurfaceType>k__BackingField").i64() as i32;
+            let prefab = effect_target(ld, &sf, e.get("<particle>k__BackingField")).and_then(|(f, go)| {
+                let key = (f.name.clone(), go);
+                if let Some(&i) = loaded.get(&key) {
+                    return Some(i);
+                }
+                match crate::particles::load_prefab(ld.db, &f, go) {
+                    Ok(pf) => {
+                        def.particle_prefabs.push(Arc::new(pf));
+                        let i = def.particle_prefabs.len() as u32 - 1;
+                        loaded.insert(key, i);
+                        Some(i)
+                    }
+                    Err(e) => {
+                        def.warnings.push(format!("FootstepSet.{field}: {e}"));
+                        None
+                    }
+                }
+            });
+            map.insert(surface, prefab);
+        }
+    }
+    def.footstep_fx = fx;
 }
 
 /// Resolves the scripts' InputActionReference fields (top-level fields named `action*`, single or
@@ -591,6 +836,7 @@ pub fn load_scene(db: &mut AssetDb, bundle: &std::path::Path) -> Result<SceneDef
     spawn_viewmodel(&mut ld, &mut def);
     load_action_refs(&mut ld, &mut def);
     load_effect_prefabs(&mut ld, &mut def);
+    load_footstep_set(&mut ld, &mut def);
     def.navmeshes = crate::navmesh::load_scene_navmeshes(ld.db, bundle).unwrap_or_default();
     Ok(def)
 }
@@ -725,6 +971,13 @@ fn add_objects(ld: &mut Loader, def: &mut SceneDef, raw_go: &HashMap<i64, Value>
         let world = unity_world[node as usize];
         let mut filter_mesh = None;
         let mut renderer: Option<Value> = None;
+        // SceneHelper.IsValidForPhysicsScene inputs: the first Collider's isTrigger, the
+        // MeshCollider's mesh, a non-kinematic Rigidbody, a PreservedOriginalMesh
+        let mut first_collider_trigger: Option<bool> = None;
+        let mut collider_mesh = None;
+        let mut dynamic_rb = false;
+        let mut preserved_mesh = None;
+        let (mut ps_system, mut ps_renderer) = (None, None);
         for &(f, id) in &comps {
             if f != 0 {
                 continue;
@@ -754,6 +1007,10 @@ fn add_objects(ld: &mut Loader, def: &mut SceneDef, raw_go: &HashMap<i64, Value>
                 }
                 CLASS_BOX_COLLIDER | CLASS_SPHERE_COLLIDER | CLASS_CAPSULE_COLLIDER | CLASS_MESH_COLLIDER => {
                     let Ok(v) = file.read(o) else { continue };
+                    first_collider_trigger.get_or_insert(v.get("m_IsTrigger").bool());
+                    if o.class_id == CLASS_MESH_COLLIDER {
+                        collider_mesh = Some(v.get("m_Mesh").pptr());
+                    }
                     let shape = match o.class_id {
                         CLASS_BOX_COLLIDER => {
                             let (scale, rot, _) = world.to_scale_rotation_translation();
@@ -811,6 +1068,9 @@ fn add_objects(ld: &mut Loader, def: &mut SceneDef, raw_go: &HashMap<i64, Value>
                 CLASS_MONOBEHAVIOUR => {
                     let Ok(v) = file.read(o) else { continue };
                     let class = ld.class_name(v.get("m_Script").pptr());
+                    if class == "PreservedOriginalMesh" {
+                        preserved_mesh = Some(v.get("mesh").pptr()).filter(|p| p.1 != 0);
+                    }
                     def.obj_to_node.insert(id, node);
                     def.comp_to_script.insert(id, def.scripts.len() as u32);
                     def.scripts.push(ScriptDef { node, class, enabled: v.get("m_Enabled").bool(), path_id: id, data: v, file: prefab.clone() });
@@ -838,6 +1098,10 @@ fn add_objects(ld: &mut Loader, def: &mut SceneDef, raw_go: &HashMap<i64, Value>
                 CLASS_RIGIDBODY => {
                     def.obj_to_node.insert(id, node);
                     def.rigidbodies.insert(node);
+                    dynamic_rb |= file.read(o).is_ok_and(|v| !v.get("m_IsKinematic").bool());
+                    if dynamic_rb {
+                        def.dynamic_rigidbodies.insert(node);
+                    }
                 }
                 CLASS_NAV_MESH_AGENT => {
                     def.obj_to_node.insert(id, node);
@@ -872,9 +1136,42 @@ fn add_objects(ld: &mut Loader, def: &mut SceneDef, raw_go: &HashMap<i64, Value>
                         culling_mask: v.get("m_CullingMask").get("m_Bits").i64() as u32,
                     });
                 }
+                CLASS_PARTICLE_SYSTEM => {
+                    def.obj_to_node.insert(id, node);
+                    let Ok(v) = file.read(o) else { continue };
+                    ps_system = Some((id, crate::particles::ParticleSystemDef::read(&v)));
+                }
+                CLASS_PARTICLE_RENDERER => {
+                    def.obj_to_node.insert(id, node);
+                    let Ok(v) = file.read(o) else { continue };
+                    let mats = v.get("m_Materials").array().iter().map(|m| ld.material_key(m.pptr())).collect();
+                    ps_renderer = Some(crate::particles::ParticleRendererDef::read(&v, mats));
+                }
                 _ => {
                     def.obj_to_node.insert(id, node);
                 }
+            }
+        }
+        if let Some((id, mut sys)) = ps_system {
+            let scene = ld.scene.clone();
+            let shape_go = crate::particles::load_system_meshes(ld.db, &scene, &mut sys, ps_renderer.as_mut());
+            def.comp_to_particle.insert(id, def.particle_systems.len() as u32);
+            let planes = sys.collision.as_ref().map(|c| c.planes.iter().filter(|p| p.0 == 0).filter_map(|p| def.obj_to_node.get(&p.1).copied()).collect()).unwrap_or_default();
+            def.particle_systems.push(SceneParticleDef {
+                node,
+                path_id: id,
+                system: Arc::new(sys),
+                renderer: ps_renderer.map(Arc::new),
+                shape_node: shape_go.and_then(|g| def.obj_to_node.get(&g).copied()),
+                planes,
+            });
+        }
+        if let (Some(r), Some(false), false, true) = (&renderer, first_collider_trigger, dynamic_rb, FOOTSTEP_LAYERS.contains(&layer)) {
+            if let Some(mesh) = preserved_mesh.or(collider_mesh).or(filter_mesh).filter(|p| p.1 != 0).and_then(|p| ld.mesh(p)) {
+                let mats: Vec<(i32, i64)> = r.get("m_Materials").array().iter().map(|m| m.pptr()).collect();
+                let start = r.get("m_StaticBatchInfo").get("firstSubMesh").i64() as usize;
+                let sm = surface_mesh(ld, &file, node, layer, world, &mesh, &mats, start);
+                def.surface_meshes.push(sm);
             }
         }
         if let (Some(r), Some(mp)) = (renderer, filter_mesh) {

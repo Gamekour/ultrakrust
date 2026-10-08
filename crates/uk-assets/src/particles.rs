@@ -252,8 +252,10 @@ pub struct Burst {
     pub probability: f32,
 }
 
-/// ShapeModule. kind: 0 sphere, 1 sphere shell (legacy), 2 hemisphere, 4 cone (from the base),
-/// 5 box, 7 cone volume, 10 circle, 12 single-sided edge, 17 donut, 18 rectangle.
+/// ShapeModule.type: 0 sphere, 1 sphere shell, 2 hemisphere, 3 hemisphere shell, 4 cone (from the
+/// base), 5 box, 6 mesh, 7 cone shell, 8 cone volume, 9 cone volume shell, 10 circle, 11 circle
+/// edge, 12 single-sided edge, 13 mesh renderer, 14 skinned mesh renderer, 15 box shell, 16 box
+/// edge, 17 donut, 18 rectangle, 19 sprite, 20 sprite renderer.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Shape {
     pub kind: u8,
@@ -261,9 +263,15 @@ pub struct Shape {
     pub length: f32,
     pub radius: f32,
     pub radius_thickness: f32,
+    /// emission along the radius (single-sided edge): 0 random, 1 loop, 2 ping-pong, 3 burst spread
+    pub radius_mode: u8,
+    pub radius_spread: f32,
+    pub radius_speed: MinMaxCurve,
     pub arc: f32,
     /// arc mode: 0 random, 1 loop, 2 ping-pong, 3 burst spread
     pub arc_mode: u8,
+    pub arc_spread: f32,
+    pub arc_speed: MinMaxCurve,
     pub box_thickness: Vec3,
     pub donut_radius: f32,
     pub position: Vec3,
@@ -274,10 +282,60 @@ pub struct Shape {
     pub random_direction: f32,
     pub spherical_direction: f32,
     pub random_position: f32,
+    /// mesh shapes: 0 vertex, 1 edge, 2 triangle
+    pub placement: u8,
+    pub normal_offset: f32,
+    /// vertex / edge spawn order: 0 random, 1 loop, 2 ping-pong, 3 burst spread
+    pub mesh_spawn_mode: u8,
+    pub mesh_spawn_spread: f32,
+    pub mesh_spawn_speed: MinMaxCurve,
+    pub use_material_index: bool,
+    pub material_index: u32,
+    pub mesh_ref: (i32, i64),
+    pub mesh_renderer_ref: (i32, i64),
+    /// the mesh to emit from (mesh shapes), filled by the loader
+    pub mesh: Option<Arc<EmitMesh>>,
+}
+
+/// A mesh as the shape module samples it (Unity mesh space).
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct EmitMesh {
+    pub positions: Vec<Vec3>,
+    pub normals: Vec<Vec3>,
+    pub uvs: Vec<[f32; 2]>,
+    pub tris: Vec<[u32; 3]>,
+    /// running triangle area (area-weighted triangle choice)
+    pub area_cdf: Vec<f32>,
+}
+
+impl EmitMesh {
+    /// The whole mesh, or one submesh.
+    pub fn new(m: &crate::mesh::MeshData, submesh: Option<usize>) -> Self {
+        let positions: Vec<Vec3> = m.positions.iter().map(|p| Vec3::from(*p)).collect();
+        let normals: Vec<Vec3> = if m.normals.len() == positions.len() { m.normals.iter().map(|n| Vec3::from(*n)).collect() } else { vec![Vec3::Z; positions.len()] };
+        let mut tris = Vec::new();
+        for (i, sm) in m.submeshes.iter().enumerate() {
+            if submesh.is_some_and(|s| s != i) {
+                continue;
+            }
+            tris.extend(sm.indices.chunks_exact(3).map(|t| [t[0], t[1], t[2]]).filter(|t| t.iter().all(|&k| (k as usize) < positions.len())));
+        }
+        let mut acc = 0.0;
+        let area_cdf = tris
+            .iter()
+            .map(|t| {
+                let (a, b, c) = (positions[t[0] as usize], positions[t[1] as usize], positions[t[2] as usize]);
+                acc += (b - a).cross(c - a).length() * 0.5;
+                acc
+            })
+            .collect();
+        let uvs = if m.uv0.len() == positions.len() { m.uv0.clone() } else { vec![[0.0; 2]; positions.len()] };
+        Self { positions, normals, uvs, tris, area_cdf }
+    }
 }
 
 /// VelocityOverLifetimeModule: extra velocity (not integrated into the particle's own) plus
-/// radial speed, with the particle's velocity scaled by `speed_modifier`.
+/// orbital / radial speed, with the particle's velocity scaled by `speed_modifier`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct VelocityOverLifetime {
     pub x: MinMaxCurve,
@@ -310,6 +368,103 @@ pub struct Trail {
     pub color_over_trail: MinMaxGradient,
 }
 
+/// NoiseModule.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Noise {
+    /// x, y, z strength (x for all three unless `separate_axes`)
+    pub strength: [MinMaxCurve; 3],
+    pub separate_axes: bool,
+    pub frequency: f32,
+    pub damping: bool,
+    pub octaves: u32,
+    pub octave_multiplier: f32,
+    pub octave_scale: f32,
+    pub scroll_speed: MinMaxCurve,
+    pub remap: Option<[MinMaxCurve; 3]>,
+    pub position_amount: MinMaxCurve,
+    pub rotation_amount: MinMaxCurve,
+    pub size_amount: MinMaxCurve,
+}
+
+/// LimitVelocityOverLifetime (ClampVelocityModule).
+#[derive(Clone, Debug, PartialEq)]
+pub struct LimitVelocity {
+    pub separate_axes: bool,
+    pub x: MinMaxCurve,
+    pub y: MinMaxCurve,
+    pub z: MinMaxCurve,
+    pub magnitude: MinMaxCurve,
+    pub world_space: bool,
+    pub dampen: f32,
+    pub drag: MinMaxCurve,
+    pub drag_by_size: bool,
+    pub drag_by_velocity: bool,
+}
+
+/// ForceOverLifetime.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Force {
+    pub x: MinMaxCurve,
+    pub y: MinMaxCurve,
+    pub z: MinMaxCurve,
+    pub world_space: bool,
+    pub randomize_per_frame: bool,
+}
+
+/// InheritVelocity: mode 0 initial (added at birth), 1 current (follows the emitter).
+#[derive(Clone, Debug, PartialEq)]
+pub struct InheritVelocity {
+    pub mode: u8,
+    pub curve: MinMaxCurve,
+}
+
+/// A curve over a speed range (LifetimeByEmitterSpeed, RotationBySpeed).
+#[derive(Clone, Debug, PartialEq)]
+pub struct BySpeed {
+    pub x: MinMaxCurve,
+    pub y: MinMaxCurve,
+    pub z: MinMaxCurve,
+    pub separate_axes: bool,
+    pub range: [f32; 2],
+}
+
+/// TextureSheetAnimation (UVModule). time_mode: 0 lifetime, 1 speed, 2 fps.
+/// animation_type: 0 whole sheet, 1 single row. row_mode: 0 custom, 1 random, 2 mesh index.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextureSheet {
+    pub mode: u8,
+    pub time_mode: u8,
+    pub fps: f32,
+    pub frame_over_time: MinMaxCurve,
+    pub start_frame: MinMaxCurve,
+    pub speed_range: [f32; 2],
+    pub tiles_x: u32,
+    pub tiles_y: u32,
+    pub animation_type: u8,
+    pub row_index: u32,
+    pub cycles: f32,
+    pub row_mode: u8,
+    pub flip_u: f32,
+    pub flip_v: f32,
+}
+
+/// CollisionModule. kind: 0 planes, 1 world. mode: 0 3D, 1 2D.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Collision {
+    pub kind: u8,
+    pub mode: u8,
+    pub planes: Vec<(i32, i64)>,
+    pub dampen: MinMaxCurve,
+    pub bounce: MinMaxCurve,
+    pub lifetime_loss: MinMaxCurve,
+    pub min_kill_speed: f32,
+    pub max_kill_speed: f32,
+    pub radius_scale: f32,
+    pub collides_with: u32,
+    pub send_messages: bool,
+    pub quality: u8,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ParticleSystemDef {
     /// lengthInSec
@@ -327,11 +482,22 @@ pub struct ParticleSystemDef {
     pub culling_mode: u8,
     /// 0 none, 1 disable, 2 destroy, 3 callback (Bloodsplatter.Awake switches its own to callback)
     pub stop_action: u8,
+    /// emitterVelocityMode: 0 transform, 1 rigidbody (simulated as transform), 2 custom
+    pub emitter_velocity_mode: u8,
+    pub custom_emitter_velocity: Vec3,
     pub start_lifetime: MinMaxCurve,
     pub start_speed: MinMaxCurve,
     pub start_color: MinMaxGradient,
     pub start_size: MinMaxCurve,
+    /// size3D: startSize is x, these y and z
+    pub size3d: bool,
+    pub start_size_y: MinMaxCurve,
+    pub start_size_z: MinMaxCurve,
     pub start_rotation: MinMaxCurve,
+    /// rotation3D: startRotation is z, these x and y
+    pub rotation3d: bool,
+    pub start_rotation_x: MinMaxCurve,
+    pub start_rotation_y: MinMaxCurve,
     pub randomize_rotation: f32,
     pub max_particles: u32,
     pub gravity_modifier: MinMaxCurve,
@@ -342,15 +508,27 @@ pub struct ParticleSystemDef {
     pub bursts: Vec<Burst>,
     pub color_over_lifetime: Option<MinMaxGradient>,
     pub size_over_lifetime: Option<MinMaxCurve>,
+    /// SizeModule with separateAxes: x (`size_over_lifetime`), y, z
+    pub size_axes: Option<[MinMaxCurve; 2]>,
     /// RotationModule z (radians per second)
     pub rotation_over_lifetime: Option<MinMaxCurve>,
+    /// RotationModule with separateAxes: x, y
+    pub rotation_axes: Option<[MinMaxCurve; 2]>,
     pub velocity_over_lifetime: Option<VelocityOverLifetime>,
     pub trail: Option<Trail>,
+    pub noise: Option<Noise>,
+    pub limit_velocity: Option<LimitVelocity>,
+    pub force: Option<Force>,
+    pub inherit_velocity: Option<InheritVelocity>,
+    pub lifetime_by_emitter_speed: Option<BySpeed>,
+    pub rotation_by_speed: Option<BySpeed>,
+    pub texture_sheet: Option<TextureSheet>,
+    pub collision: Option<Collision>,
     /// Enabled modules (or module settings) the simulation does not implement.
     pub unsupported: Vec<String>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Default)]
 pub struct ParticleRendererDef {
     pub enabled: bool,
     /// 0 billboard, 1 stretched, 2 horizontal, 3 vertical, 4 mesh, 5 none
@@ -365,12 +543,25 @@ pub struct ParticleRendererDef {
     pub render_alignment: u8,
     pub pivot: Vec3,
     pub flip: Vec3,
+    pub allow_roll: bool,
     /// ParticleSystemVertexStream ids fed to the shader (custom streams, else the default set)
     pub vertex_streams: Vec<u8>,
     /// [particle material, trail material]
     pub materials: Vec<Option<MaterialKey>>,
     pub length_scale: f32,
     pub velocity_scale: f32,
+    pub camera_velocity_scale: f32,
+    /// render mode 4: up to four meshes (m_Mesh, m_Mesh1..3)
+    pub mesh_refs: Vec<(i32, i64)>,
+    /// the meshes, filled by the loader (Unity mesh space; every submesh)
+    pub meshes: Vec<Arc<EmitMesh>>,
+    /// 0 uniform random, 1 non-uniform (m_MeshWeighting)
+    pub mesh_distribution: u8,
+    pub mesh_weights: [f32; 4],
+}
+
+fn curve3(m: &Value, keys: [&str; 3]) -> [MinMaxCurve; 3] {
+    keys.map(|k| MinMaxCurve::read(m.get(k)))
 }
 
 impl ParticleSystemDef {
@@ -381,17 +572,26 @@ impl ParticleSystemDef {
         let shape = on("ShapeModule").then(|| {
             let s = v.get("ShapeModule");
             let kind = s.get("type").i64() as u8;
-            if !matches!(kind, 0 | 1 | 2 | 4 | 7 | 10) {
+            if matches!(kind, 14 | 19 | 20) {
                 unsupported.push(format!("ShapeModule.type {kind}"));
             }
+            if s.get("m_Texture").pptr().1 != 0 {
+                unsupported.push("ShapeModule.texture".into());
+            }
+            let ms = s.get("m_MeshSpawn");
             Shape {
                 kind,
                 angle: s.get("angle").f32(),
                 length: s.get("length").f32(),
                 radius: s.get("radius").get("value").f32(),
                 radius_thickness: s.get("radiusThickness").f32(),
+                radius_mode: s.get("radius").get("mode").i64() as u8,
+                radius_spread: s.get("radius").get("spread").f32(),
+                radius_speed: MinMaxCurve::read(s.get("radius").get("speed")),
                 arc: s.get("arc").get("value").f32(),
                 arc_mode: s.get("arc").get("mode").i64() as u8,
+                arc_spread: s.get("arc").get("spread").f32(),
+                arc_speed: MinMaxCurve::read(s.get("arc").get("speed")),
                 box_thickness: Vec3::from(s.get("boxThickness").vec3()),
                 donut_radius: s.get("donutRadius").f32(),
                 position: Vec3::from(s.get("m_Position").vec3()),
@@ -401,6 +601,16 @@ impl ParticleSystemDef {
                 random_direction: s.get("randomDirectionAmount").f32(),
                 spherical_direction: s.get("sphericalDirectionAmount").f32(),
                 random_position: s.get("randomPositionAmount").f32(),
+                placement: s.get("placementMode").i64() as u8,
+                normal_offset: s.get("m_MeshNormalOffset").f32(),
+                mesh_spawn_mode: ms.get("mode").i64() as u8,
+                mesh_spawn_spread: ms.get("spread").f32(),
+                mesh_spawn_speed: MinMaxCurve::read(ms.get("speed")),
+                use_material_index: s.get("m_UseMeshMaterialIndex").bool(),
+                material_index: s.get("m_MeshMaterialIndex").i64().max(0) as u32,
+                mesh_ref: s.get("m_Mesh").pptr(),
+                mesh_renderer_ref: s.get("m_MeshRenderer").pptr(),
+                mesh: None,
             }
         });
         let em = v.get("EmissionModule");
@@ -432,11 +642,6 @@ impl ParticleSystemDef {
                 world_space: m.get("inWorldSpace").bool(),
             }
         });
-        if let Some(vl) = &vel {
-            if vl.orbital.iter().chain(vl.orbital_offset.iter()).any(|c| !c.is_const(0.0)) {
-                unsupported.push("VelocityModule.orbital".into());
-            }
-        }
         let trail = on("TrailModule").then(|| {
             let t = v.get("TrailModule");
             let mode = t.get("mode").i64() as u8;
@@ -459,21 +664,128 @@ impl ParticleSystemDef {
                 color_over_trail: MinMaxGradient::read(t.get("colorOverTrail")),
             }
         });
-        if init.get("size3D").bool() {
-            unsupported.push("InitialModule.size3D".into());
-        }
-        if init.get("rotation3D").bool() {
-            unsupported.push("InitialModule.rotation3D".into());
-        }
-        if v.get("SizeModule").get("separateAxes").bool() && on("SizeModule") {
-            unsupported.push("SizeModule.separateAxes".into());
-        }
-        if v.get("RotationModule").get("separateAxes").bool() && on("RotationModule") {
-            unsupported.push("RotationModule.separateAxes".into());
-        }
+        let noise = on("NoiseModule").then(|| {
+            let m = v.get("NoiseModule");
+            let c = |k: &str| MinMaxCurve::read(m.get(k));
+            Noise {
+                strength: curve3(m, ["strength", "strengthY", "strengthZ"]),
+                separate_axes: m.get("separateAxes").bool(),
+                frequency: m.get("frequency").f32(),
+                damping: m.get("damping").bool(),
+                octaves: m.get("octaves").i64().clamp(1, 4) as u32,
+                octave_multiplier: m.get("octaveMultiplier").f32(),
+                octave_scale: m.get("octaveScale").f32(),
+                scroll_speed: c("scrollSpeed"),
+                remap: m.get("remapEnabled").bool().then(|| curve3(m, ["remap", "remapY", "remapZ"])),
+                position_amount: c("positionAmount"),
+                rotation_amount: c("rotationAmount"),
+                size_amount: c("sizeAmount"),
+            }
+        });
+        let limit_velocity = on("ClampVelocityModule").then(|| {
+            let m = v.get("ClampVelocityModule");
+            let c = |k: &str| MinMaxCurve::read(m.get(k));
+            LimitVelocity {
+                separate_axes: m.get("separateAxis").bool(),
+                x: c("x"),
+                y: c("y"),
+                z: c("z"),
+                magnitude: c("magnitude"),
+                world_space: m.get("inWorldSpace").bool(),
+                dampen: m.get("dampen").f32(),
+                drag: c("drag"),
+                drag_by_size: m.get("multiplyDragByParticleSize").bool(),
+                drag_by_velocity: m.get("multiplyDragByParticleVelocity").bool(),
+            }
+        });
+        let force = on("ForceModule").then(|| {
+            let m = v.get("ForceModule");
+            let [x, y, z] = curve3(m, ["x", "y", "z"]);
+            Force { x, y, z, world_space: m.get("inWorldSpace").bool(), randomize_per_frame: m.get("randomizePerFrame").bool() }
+        });
+        let inherit_velocity = on("InheritVelocityModule").then(|| {
+            let m = v.get("InheritVelocityModule");
+            InheritVelocity { mode: m.get("m_Mode").i64() as u8, curve: MinMaxCurve::read(m.get("m_Curve")) }
+        });
+        let lifetime_by_emitter_speed = on("LifetimeByEmitterSpeedModule").then(|| {
+            let m = v.get("LifetimeByEmitterSpeedModule");
+            let r = m.get("m_Range");
+            let c = MinMaxCurve::read(m.get("m_Curve"));
+            BySpeed { x: c.clone(), y: c.clone(), z: c, separate_axes: false, range: [r.get("x").f32(), r.get("y").f32()] }
+        });
+        let rotation_by_speed = on("RotationBySpeedModule").then(|| {
+            let m = v.get("RotationBySpeedModule");
+            let r = m.get("range");
+            let [x, y, z] = curve3(m, ["x", "y", "curve"]);
+            BySpeed { x, y, z, separate_axes: m.get("separateAxes").bool(), range: [r.get("x").f32(), r.get("y").f32()] }
+        });
+        let texture_sheet = on("UVModule").then(|| {
+            let m = v.get("UVModule");
+            let c = |k: &str| MinMaxCurve::read(m.get(k));
+            let mode = m.get("mode").i64() as u8;
+            if mode != 0 {
+                unsupported.push("UVModule.sprites".into());
+            }
+            TextureSheet {
+                mode,
+                time_mode: m.get("timeMode").i64() as u8,
+                fps: m.get("fps").f32(),
+                frame_over_time: c("frameOverTime"),
+                start_frame: c("startFrame"),
+                speed_range: [m.get("speedRange").get("x").f32(), m.get("speedRange").get("y").f32()],
+                tiles_x: m.get("tilesX").i64().max(1) as u32,
+                tiles_y: m.get("tilesY").i64().max(1) as u32,
+                animation_type: m.get("animationType").i64() as u8,
+                row_index: m.get("rowIndex").i64().max(0) as u32,
+                cycles: m.get("cycles").f32(),
+                row_mode: m.get("rowMode").i64() as u8,
+                flip_u: m.get("flipU").f32(),
+                flip_v: m.get("flipV").f32(),
+            }
+        });
+        let collision = on("CollisionModule").then(|| {
+            let m = v.get("CollisionModule");
+            let c = |k: &str| MinMaxCurve::read(m.get(k));
+            let mode = m.get("collisionMode").i64() as u8;
+            if mode != 0 {
+                unsupported.push("CollisionModule.2D".into());
+            }
+            Collision {
+                kind: m.get("type").i64() as u8,
+                mode,
+                planes: m.get("m_Planes").array().iter().map(|p| p.pptr()).filter(|p| p.1 != 0).collect(),
+                dampen: c("m_Dampen"),
+                bounce: c("m_Bounce"),
+                lifetime_loss: c("m_EnergyLossOnCollision"),
+                min_kill_speed: m.get("minKillSpeed").f32(),
+                max_kill_speed: m.get("maxKillSpeed").f32(),
+                radius_scale: m.get("radiusScale").f32(),
+                collides_with: m.get("collidesWith").get("m_Bits").i64() as u32,
+                send_messages: m.get("collisionMessages").bool(),
+                quality: m.get("quality").i64() as u8,
+            }
+        });
+        let separate = |m: &str| on(m) && v.get(m).get("separateAxes").bool();
         if let Value::Struct(fields) = v {
             for (k, m) in fields {
-                let handled = ["InitialModule", "ShapeModule", "EmissionModule", "ColorModule", "SizeModule", "RotationModule", "VelocityModule", "TrailModule"];
+                let handled = [
+                    "InitialModule",
+                    "ShapeModule",
+                    "EmissionModule",
+                    "ColorModule",
+                    "SizeModule",
+                    "RotationModule",
+                    "VelocityModule",
+                    "TrailModule",
+                    "NoiseModule",
+                    "ClampVelocityModule",
+                    "ForceModule",
+                    "InheritVelocityModule",
+                    "LifetimeByEmitterSpeedModule",
+                    "RotationBySpeedModule",
+                    "UVModule",
+                    "CollisionModule",
+                ];
                 if k.ends_with("Module") && !handled.contains(&&**k) && m.get("enabled").bool() {
                     unsupported.push(k.to_string());
                 }
@@ -482,6 +794,8 @@ impl ParticleSystemDef {
         if v.get("moveWithTransform").i64() == 2 {
             unsupported.push("simulationSpace custom".into());
         }
+        // emitterVelocityMode rigidbody: the simulation uses the transform's velocity (the
+        // bodies' transforms follow their velocity, see PARITY.md)
         Self {
             duration: v.get("lengthInSec").f32(),
             looping: v.get("looping").bool(),
@@ -493,11 +807,19 @@ impl ParticleSystemDef {
             scaling_mode: v.get("scalingMode").i64() as u8,
             culling_mode: v.get("cullingMode").i64() as u8,
             stop_action: v.get("stopAction").i64() as u8,
+            emitter_velocity_mode: v.get("emitterVelocityMode").i64() as u8,
+            custom_emitter_velocity: Vec3::from(init.get("customEmitterVelocity").vec3()),
             start_lifetime: MinMaxCurve::read(init.get("startLifetime")),
             start_speed: MinMaxCurve::read(init.get("startSpeed")),
             start_color: MinMaxGradient::read(init.get("startColor")),
             start_size: MinMaxCurve::read(init.get("startSize")),
+            size3d: init.get("size3D").bool(),
+            start_size_y: MinMaxCurve::read(init.get("startSizeY")),
+            start_size_z: MinMaxCurve::read(init.get("startSizeZ")),
             start_rotation: MinMaxCurve::read(init.get("startRotation")),
+            rotation3d: init.get("rotation3D").bool(),
+            start_rotation_x: MinMaxCurve::read(init.get("startRotationX")),
+            start_rotation_y: MinMaxCurve::read(init.get("startRotationY")),
             randomize_rotation: init.get("randomizeRotationDirection").f32(),
             max_particles: init.get("maxNumParticles").i64().max(0) as u32,
             gravity_modifier: MinMaxCurve::read(init.get("gravityModifier")),
@@ -508,9 +830,19 @@ impl ParticleSystemDef {
             bursts,
             color_over_lifetime: on("ColorModule").then(|| MinMaxGradient::read(v.get("ColorModule").get("gradient"))),
             size_over_lifetime: on("SizeModule").then(|| MinMaxCurve::read(v.get("SizeModule").get("curve"))),
+            size_axes: separate("SizeModule").then(|| [MinMaxCurve::read(v.get("SizeModule").get("y")), MinMaxCurve::read(v.get("SizeModule").get("z"))]),
             rotation_over_lifetime: on("RotationModule").then(|| MinMaxCurve::read(v.get("RotationModule").get("curve"))),
+            rotation_axes: separate("RotationModule").then(|| [MinMaxCurve::read(v.get("RotationModule").get("x")), MinMaxCurve::read(v.get("RotationModule").get("y"))]),
             velocity_over_lifetime: vel,
             trail,
+            noise,
+            limit_velocity,
+            force,
+            inherit_velocity,
+            lifetime_by_emitter_speed,
+            rotation_by_speed,
+            texture_sheet,
+            collision,
             unsupported,
         }
     }
@@ -538,6 +870,12 @@ impl ParticleRendererDef {
             materials,
             length_scale: v.get("m_LengthScale").f32(),
             velocity_scale: v.get("m_VelocityScale").f32(),
+            camera_velocity_scale: v.get("m_CameraVelocityScale").f32(),
+            allow_roll: v.get("m_AllowRoll").bool(),
+            mesh_refs: ["m_Mesh", "m_Mesh1", "m_Mesh2", "m_Mesh3"].iter().map(|k| v.get(k).pptr()).filter(|p| p.1 != 0).collect(),
+            meshes: Vec::new(),
+            mesh_distribution: v.get("m_MeshDistribution").i64() as u8,
+            mesh_weights: ["m_MeshWeighting", "m_MeshWeighting1", "m_MeshWeighting2", "m_MeshWeighting3"].map(|k| v.get(k).f32()),
         }
     }
 }
@@ -562,6 +900,8 @@ pub struct PrefabNode {
     pub local_scale: Vec3,
     pub system: Option<Arc<ParticleSystemDef>>,
     pub renderer: Option<Arc<ParticleRendererDef>>,
+    /// mesh renderer shape: the prefab node whose MeshRenderer the system emits from
+    pub shape_node: Option<u32>,
     /// SphereCollider (center in Bevy space, radius, trigger, enabled)
     pub sphere: Option<(Vec3, f32, bool, bool)>,
     pub scripts: Vec<PrefabScript>,
@@ -573,11 +913,25 @@ pub struct PrefabNode {
 pub struct ParticlePrefab {
     pub name: String,
     pub nodes: Vec<PrefabNode>,
+    /// GameObject / component path id (in the prefab's file) -> node
+    pub obj_node: std::collections::HashMap<i64, u32>,
 }
 
 impl ParticlePrefab {
     pub fn script(&self, node: u32, class: &str) -> Option<&PrefabScript> {
         self.nodes[node as usize].scripts.iter().find(|s| s.class == class)
+    }
+
+    /// `n` is `root` or below it.
+    pub fn is_descendant_of(&self, n: u32, root: u32) -> bool {
+        let mut u = Some(n);
+        while let Some(x) = u {
+            if x == root {
+                return true;
+            }
+            u = self.nodes[x as usize].parent;
+        }
+        false
     }
 
     /// GameObject.activeInHierarchy within the prefab.
@@ -595,9 +949,65 @@ impl ParticlePrefab {
     }
 }
 
+/// A Mesh by PPtr from `from`, decoded (vertex data from the bundle's .resS when streamed).
+pub fn decode_mesh(db: &mut AssetDb, from: &Arc<SerializedFile>, pptr: (i32, i64)) -> Option<crate::mesh::MeshData> {
+    let (file, id) = db.resolve(from, pptr).ok()??;
+    let v = file.read_id(id).ok()?;
+    let sd = v.get("m_StreamData");
+    let path = sd.get("path").str().to_string();
+    let stream = if !path.is_empty() && sd.get("size").i64() > 0 {
+        let res = db.resource(path.rsplit('/').next().unwrap_or(&path))?;
+        let off = sd.get("offset").i64() as usize;
+        let size = sd.get("size").i64() as usize;
+        Some(res[off..off + size].to_vec())
+    } else {
+        None
+    };
+    crate::mesh::decode(&v, stream.as_deref()).ok()
+}
+
+/// The meshes a system and its renderer reference: the shape's Mesh (type 6) or the mesh of its
+/// MeshRenderer (type 13, whose GameObject is returned), and the renderer's particle meshes.
+pub fn load_system_meshes(db: &mut AssetDb, file: &Arc<SerializedFile>, sys: &mut ParticleSystemDef, renderer: Option<&mut ParticleRendererDef>) -> Option<i64> {
+    let mut shape_go = None;
+    if let Some(sh) = sys.shape.as_mut() {
+        let sub = sh.use_material_index.then_some(sh.material_index as usize);
+        match sh.kind {
+            6 => sh.mesh = decode_mesh(db, file, sh.mesh_ref).map(|m| Arc::new(EmitMesh::new(&m, sub))),
+            13 => {
+                let r = db.read_pptr(file, sh.mesh_renderer_ref).ok().flatten();
+                if let Some((rf, _, rv)) = r {
+                    let go = rv.get("m_GameObject").pptr();
+                    if let Ok(Some((gf, _, gv))) = db.read_pptr(&rf, go) {
+                        shape_go = Some(go.1);
+                        for c in gv.get("m_Component").array() {
+                            let cid = c.get("component").pptr();
+                            if gf.object(cid.1).is_some_and(|o| o.class_id == 33) {
+                                if let Ok(mf) = gf.read_id(cid.1) {
+                                    sh.mesh = decode_mesh(db, &gf, mf.get("m_Mesh").pptr()).map(|m| Arc::new(EmitMesh::new(&m, sub)));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(r) = renderer {
+        if r.render_mode == 4 {
+            r.meshes = r.mesh_refs.clone().into_iter().filter_map(|p| decode_mesh(db, file, p)).map(|m| Arc::new(EmitMesh::new(&m, None))).collect();
+        }
+    }
+    shape_go
+}
+
 /// Loads the prefab whose root GameObject is `go` in `file`.
 pub fn load_prefab(db: &mut AssetDb, file: &Arc<SerializedFile>, go: i64) -> Result<ParticlePrefab> {
     let mut nodes: Vec<PrefabNode> = Vec::new();
+    let mut gos: Vec<i64> = Vec::new();
+    let mut shape_gos: Vec<(usize, i64)> = Vec::new();
+    let mut obj_node: std::collections::HashMap<i64, u32> = std::collections::HashMap::new();
     let mut stack = vec![(go, None::<u32>)];
     while let Some((g, parent)) = stack.pop() {
         let v = file.read_id(g)?;
@@ -612,12 +1022,16 @@ pub fn load_prefab(db: &mut AssetDb, file: &Arc<SerializedFile>, go: i64) -> Res
             local_scale: Vec3::ONE,
             system: None,
             renderer: None,
+            shape_node: None,
             sphere: None,
             scripts: Vec::new(),
         };
         let mut kids = Vec::new();
+        let (mut sys, mut rend) = (None, None);
+        obj_node.insert(g, idx);
         for c in v.get("m_Component").array() {
             let (_, cid) = c.get("component").pptr();
+            obj_node.insert(cid, idx);
             let Some(o) = file.object(cid) else { continue };
             let class = o.class_id;
             let cv = file.read_id(cid)?;
@@ -632,7 +1046,7 @@ pub fn load_prefab(db: &mut AssetDb, file: &Arc<SerializedFile>, go: i64) -> Res
                         kids.push(file.read_id(k.pptr().1)?.get("m_GameObject").pptr().1);
                     }
                 }
-                CLASS_PARTICLE_SYSTEM => node.system = Some(Arc::new(ParticleSystemDef::read(&cv))),
+                CLASS_PARTICLE_SYSTEM => sys = Some(ParticleSystemDef::read(&cv)),
                 CLASS_PARTICLE_RENDERER => {
                     let mats = cv
                         .get("m_Materials")
@@ -640,7 +1054,7 @@ pub fn load_prefab(db: &mut AssetDb, file: &Arc<SerializedFile>, go: i64) -> Res
                         .iter()
                         .map(|m| db.resolve(file, m.pptr()).ok().flatten().map(|(f, id)| MaterialKey { file: f.name.clone(), path_id: id }))
                         .collect();
-                    node.renderer = Some(Arc::new(ParticleRendererDef::read(&cv, mats)));
+                    rend = Some(ParticleRendererDef::read(&cv, mats));
                 }
                 CLASS_SPHERE_COLLIDER => {
                     node.sphere = Some((to_bevy_point(Vec3::from(cv.get("m_Center").vec3())), cv.get("m_Radius").f32(), cv.get("m_IsTrigger").bool(), cv.get("m_Enabled").bool()));
@@ -652,14 +1066,25 @@ pub fn load_prefab(db: &mut AssetDb, file: &Arc<SerializedFile>, go: i64) -> Res
                 _ => {}
             }
         }
+        if let Some(mut sd) = sys {
+            if let Some(g) = load_system_meshes(db, file, &mut sd, rend.as_mut()) {
+                shape_gos.push((nodes.len(), g));
+            }
+            node.system = Some(Arc::new(sd));
+        }
+        node.renderer = rend.map(Arc::new);
         nodes.push(node);
+        gos.push(g);
         // children in Transform order: pushed reversed so the stack pops them first-to-last
         for k in kids.into_iter().rev() {
             stack.push((k, Some(idx)));
         }
     }
+    for (n, g) in shape_gos {
+        nodes[n].shape_node = gos.iter().position(|&x| x == g).map(|i| i as u32);
+    }
     let name = nodes.first().map(|n| n.name.clone()).unwrap_or_default();
-    Ok(ParticlePrefab { name, nodes })
+    Ok(ParticlePrefab { name, nodes, obj_node })
 }
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 {

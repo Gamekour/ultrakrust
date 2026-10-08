@@ -22,7 +22,7 @@ fn main() {
             for (c, raw) in parse_calls(&def, &e).into_iter().zip(e.get("m_PersistentCalls").get("m_Calls").array()) {
                 let (_, id) = raw.get("m_Target").pptr();
                 let cls = files.iter().find_map(|f| f.object(id).map(|o| o.class_id)).unwrap_or(-1);
-                let k = match c.target { Target::Script(t) => format!("{}.{}", def.scripts[t as usize].class, c.method), Target::Collider(_) => format!("Collider.{}", c.method), Target::Node(_) => format!("native#{cls}.{}", c.method), Target::None => format!("none.{}", c.method) };
+                let k = match c.target { Target::Script(t) => format!("{}.{}", def.scripts[t as usize].class, c.method), Target::Collider(_) => format!("Collider.{}", c.method), Target::Particle(_) => format!("ParticleSystem.{}", c.method), Target::Node(_) => format!("native#{cls}.{}", c.method), Target::None => format!("none.{}", c.method) };
                 *seen.entry(k).or_default() += 1;
             }
         }

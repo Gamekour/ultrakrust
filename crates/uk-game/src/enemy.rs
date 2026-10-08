@@ -128,6 +128,26 @@ pub struct Projectile {
     pub damage: f32,
     pub friendly: bool,
     pub life: f32,
+    /// Projectile.explosionEffect and Projectile.explosive of the prefab it was instantiated from
+    pub explosion: Option<(u32, bool)>,
+}
+
+/// The explosionEffect (and explosive flag) of the projectile prefab `field` of the `class`
+/// script on an enemy's root.
+fn projectile_explosion(g: &Game, node: u32, class: &str, field: &str) -> Option<(u32, bool)> {
+    let (sc, _) = g.def.scripts_on(node).find(|(_, s)| s.class == class)?;
+    let p = g.def.script_prefabs.get(&(sc, format!("{field}>Projectile.explosionEffect"))).copied()?;
+    let explosive = g.def.script_nested.get(&(sc, format!("{field}>Projectile"))).is_some_and(|v| v.get("explosive").bool());
+    Some((p, explosive))
+}
+
+/// Projectile.CreateExplosionEffect (at the transform) or, for an explosive one, Explode (at
+/// position - velocity * 0.02), both with the projectile's rotation (it faces its velocity).
+fn projectile_explode(g: &mut Game, pos: Vec3, vel: Vec3, explosion: Option<(u32, bool)>) {
+    let Some((p, explosive)) = explosion else { return };
+    let at = if explosive { pos - vel * 0.02 } else { pos };
+    let rot = crate::particles::look_rotation(crate::particles::to_unity(vel));
+    g.fx_instantiate(p, crate::particles::to_unity(at), rot);
 }
 
 fn subtree(def: &SceneDef, root: u32) -> Vec<u32> {
@@ -298,28 +318,40 @@ impl Enemy {
 
     /// Ray against this enemy's hitboxes (world space). Returns (distance, target).
     pub fn raycast(&self, o: Vec3, d: Vec3, max: f32) -> Option<(f32, HitTarget)> {
-        let inv = self.delta().inverse();
+        self.raycast_n(o, d, max).map(|(t, z, _)| (t, z))
+    }
+
+    /// `raycast` with the surface normal at the hit (world space; -d for a point-blank start).
+    pub fn raycast_n(&self, o: Vec3, d: Vec3, max: f32) -> Option<(f32, HitTarget, Vec3)> {
+        let fwd = self.delta();
+        let inv = fwd.inverse();
         let lo = inv.transform_point3(o);
         let ld = inv.transform_vector3(d);
-        let mut best: Option<(f32, HitTarget)> = None;
+        let mut best: Option<(f32, HitTarget, Vec3)> = None;
         for h in &self.hitboxes {
             // a landed Malicious Face corpse has lost its root SphereCollider
             if !self.alive && self.corpse_landed && h.node == self.node {
                 continue;
             }
-            let t = match &h.shape {
+            let hit: Option<(f32, Vec3)> = match &h.shape {
                 ShapeDef::Box { center, half, rot } => {
                     // a ray starting inside still counts (point blank)
                     let b = BoxCollider { center: *center, half: *half, rot: *rot, slippery: false };
-                    if b.closest_point(lo).distance_squared(lo) < 1e-6 { Some(0.0) } else { b.raycast(lo, ld, max).map(|r| r.0) }
+                    if b.closest_point(lo).distance_squared(lo) < 1e-6 { Some((0.0, -ld)) } else { b.raycast(lo, ld, max) }
                 }
-                ShapeDef::Sphere { center, radius } => ray_sphere(lo, ld, *center, *radius, max),
-                ShapeDef::Capsule { a, b, radius } => ray_capsule(lo, ld, *a, *b, *radius, max),
-                ShapeDef::Mesh(tris) => tris.iter().filter_map(|t| Triangle::new(t[0], t[1], t[2]).raycast(lo, ld, max).map(|r| r.0)).reduce(f32::min),
+                ShapeDef::Sphere { center, radius } => ray_sphere(lo, ld, *center, *radius, max).map(|t| (t, lo + ld * t - *center)),
+                ShapeDef::Capsule { a, b, radius } => ray_capsule(lo, ld, *a, *b, *radius, max).map(|t| {
+                    let p = lo + ld * t;
+                    let ab = *b - *a;
+                    let s = if ab.length_squared() > 0.0 { ((p - *a).dot(ab) / ab.length_squared()).clamp(0.0, 1.0) } else { 0.0 };
+                    (t, p - (*a + ab * s))
+                }),
+                ShapeDef::Mesh(tris) => tris.iter().filter_map(|t| Triangle::new(t[0], t[1], t[2]).raycast(lo, ld, max)).reduce(|a, b| if b.0 < a.0 { b } else { a }),
             };
-            if let Some(t) = t {
+            if let Some((t, n)) = hit {
                 if best.is_none_or(|b| t < b.0 || (t - b.0 < 0.05 && h.zone == HitZone::Head)) {
-                    best = Some((t, HitTarget { zone: h.zone, node: h.node, collider: Some(h.collider) }));
+                    let n = fwd.transform_vector3(if t == 0.0 { -ld } else { n }).normalize_or_zero();
+                    best = Some((t, HitTarget { zone: h.zone, node: h.node, collider: Some(h.collider) }, n));
                 }
             }
         }
@@ -362,6 +394,12 @@ pub fn on_enable(g: &mut Game, e: usize) {
     let en = &mut g.s.enemies[e];
     if en.alive && en.spawn_in && en.spawn_t == 0.0 {
         en.spawn_t = 0.6;
+        // EnemyIdentifier.Start: spawnEffect.SetActive(true); spawnIn = false
+        en.spawn_in = false;
+        let fx = g.def.node_ref(g.def.scripts[en.eid_script as usize].data.get("spawnEffect"));
+        if let Some(n) = fx {
+            g.set_active(n, true);
+        }
     }
 }
 
@@ -535,12 +573,15 @@ pub fn fixed_update(g: &mut Game) {
     // projectiles
     let cap = g.s.player.capsule();
     let mut hits = Vec::new();
+    let mut booms = Vec::new();
+    let mut gibs = Vec::new();
     let world = &g.world;
     g.s.projectiles.retain_mut(|p| {
         p.life -= dt;
         let step = p.vel * dt;
         if let Some(h) = world.raycast(p.pos, step, step.length()) {
-            let _ = h;
+            booms.push((h.point, p.vel, p.explosion));
+            gibs.push((h.point, p.vel.normalize_or_zero(), h.collider, p.damage, p.friendly));
             return false;
         }
         p.pos += step;
@@ -549,6 +590,7 @@ pub fn fixed_update(g: &mut Game) {
             let s = ((p.pos - cap.a).dot(ab) / ab.length_squared()).clamp(0.0, 1.0);
             if (cap.a + ab * s).distance(p.pos) < cap.radius + 0.5 {
                 hits.push(p.damage as i32);
+                booms.push((p.pos, p.vel, p.explosion));
                 return false;
             }
         }
@@ -556,6 +598,18 @@ pub fn fixed_update(g: &mut Game) {
     });
     for d in hits {
         g.hurt_player(d, true);
+    }
+    // Projectile.Collided (Environment layer): if IsStaticEnvironment, CreateEnviroGibs(position -
+    // forward, forward, 5, max(2, round(damage / d)), clamp(damage / d, 0.5, 1)), d = 4 for player
+    // / friendly bullets, else 10
+    for (pos, fwd, c, damage, friendly) in gibs {
+        if g.is_static_environment(c) {
+            let r = damage / if friendly { 4.0 } else { 10.0 };
+            g.create_enviro_gibs(pos - fwd, fwd, 5.0, crate::particles::round_half_even(r).max(2), r.clamp(0.5, 1.0));
+        }
+    }
+    for (pos, vel, ex) in booms {
+        projectile_explode(g, pos, vel, ex);
     }
     // friendly (parried) projectiles hit enemies
     let parried: Vec<(usize, Vec3)> = g.s.projectiles.iter().enumerate().filter(|(_, p)| p.friendly).map(|(i, p)| (i, p.pos)).collect();
@@ -573,7 +627,8 @@ pub fn fixed_update(g: &mut Game) {
     }
     remove.sort();
     for i in remove.into_iter().rev() {
-        g.s.projectiles.remove(i);
+        let p = g.s.projectiles.remove(i);
+        projectile_explode(g, p.pos, p.vel, p.explosion);
     }
 }
 
@@ -600,11 +655,12 @@ fn end_attack(en: &mut Enemy) {
 }
 
 fn stray_throw(g: &mut Game, i: usize, target: Vec3) {
+    let explosion = projectile_explosion(g, g.s.enemies[i].node, "ZombieProjectiles", "projectile");
     let en = &mut g.s.enemies[i];
     en.hit_done = true;
     let from = en.center() + Vec3::Y * 1.0;
     let dir = (target + Vec3::Y * 1.0 - from).normalize_or_zero();
-    g.s.projectiles.push(Projectile { pos: from + dir, vel: dir * 65.0, damage: 25.0, friendly: false, life: 10.0 });
+    g.s.projectiles.push(Projectile { pos: from + dir, vel: dir * 65.0, damage: 25.0, friendly: false, life: 10.0, explosion });
 }
 
 /// Each enemy's Animator rig: the first Animator on the enemy root or below it.
@@ -654,6 +710,15 @@ pub fn anim_events(g: &mut Game, from: usize) {
     }
     let target = player_target(g);
     for (i, f) in hits {
+        if f == "PullOut" {
+            // ZombieMelee.PullOut: Instantiate(pullOutParticle, position, identity)
+            let node = g.s.enemies[i].node;
+            let zm = g.def.scripts_on(node).find(|(_, s)| s.class == "ZombieMelee").map(|(k, _)| k);
+            if let Some(p) = zm.and_then(|k| g.script_prefab(k, "pullOutParticle")) {
+                let at = g.node_world_now(node).w_axis.truncate();
+                g.fx_instantiate(p, at, Quat::IDENTITY);
+            }
+        }
         let en = &mut g.s.enemies[i];
         if !en.attacking {
             continue;
@@ -843,7 +908,9 @@ fn malicious_face(g: &mut Game, i: usize, dt: f32, target: Vec3) {
         let pdir = (aim - mouth).normalize_or_zero();
         en.current_burst += 1;
         en.burst_charge = 0.1;
-        g.s.projectiles.push(Projectile { pos: mouth + pdir * 3.0, vel: pdir * 65.0, damage: 25.0, friendly: false, life: 10.0 });
+        let node = en.node;
+        let explosion = projectile_explosion(g, node, "MaliciousFace", "proj");
+        g.s.projectiles.push(Projectile { pos: mouth + pdir * 3.0, vel: pdir * 65.0, damage: 25.0, friendly: false, life: 10.0, explosion });
     }
 }
 
@@ -909,6 +976,13 @@ fn malicious_face_corpse(g: &mut Game, i: usize, dt: f32) {
         solid(o) && o != uk_core::collide::ALWAYS && def.nodes[def.colliders[o as usize].node as usize].tag == tags::FLOOR
     });
     if floor {
+        // OnCollisionEnter with a Floor: Instantiate(impactParticle, transform.position, transform.rotation)
+        let node = g.s.enemies[i].node;
+        let mf = g.def.scripts_on(node).find(|(_, s)| s.class == "MaliciousFace").map(|(sc, _)| sc);
+        if let Some(p) = mf.and_then(|sc| g.script_prefab(sc, "impactParticle")) {
+            let (_, rot, pos) = g.node_world_now(node).to_scale_rotation_translation();
+            g.fx_instantiate(p, pos, rot);
+        }
         let en = &mut g.s.enemies[i];
         en.corpse_falling = false;
         en.corpse_landed = true;
@@ -1147,30 +1221,71 @@ impl Game {
         let max = 1000.0;
         let env = self.world.raycast(eye, dir, max);
         let env_t = env.map(|h| h.distance).unwrap_or(max);
-        let mut hits: Vec<(f32, usize, HitTarget)> = Vec::new();
+        let mut hits: Vec<(f32, usize, HitTarget, Vec3)> = Vec::new();
         for (i, en) in self.s.enemies.iter().enumerate() {
             if !en.hittable() || !self.s.active[en.node as usize] || en.spawn_t > 0.0 {
                 continue;
             }
-            if let Some((t, z)) = en.raycast(eye, dir, env_t) {
-                hits.push((t, i, z));
+            if let Some((t, z, n)) = en.raycast_n(eye, dir, env_t) {
+                hits.push((t, i, z, n));
             }
         }
         hits.sort_by(|a, b| a.0.total_cmp(&b.0));
         let damage = if pierce { 2.0 } else { 1.0 };
         let mut end = eye + dir * env_t;
+        // RevolverBeam.hitParticle of the beam prefab this shot instantiates
+        let hit_fx = self.class_prefab("Revolver", if pierce { "revolverBeamSuper>RevolverBeam.hitParticle" } else { "revolverBeam>RevolverBeam.hitParticle" });
+        let beam_rot = crate::particles::look_rotation(crate::particles::to_unity(dir));
         if pierce {
-            for (t, i, z) in hits {
+            for (t, i, z, _) in hits {
                 damage_enemy(self, i, damage, z, eye + dir * t, "revolver");
+                // PiercingShotCheck, an enemy body: at the hit point with the beam's rotation
+                if let Some(p) = hit_fx {
+                    self.fx_instantiate(p, crate::particles::to_unity(eye + dir * t), beam_rot);
+                }
             }
+            let glass = env.is_some_and(|h| self.collider_has_glass(h.collider));
             self.hit_environment(env, damage);
-        } else if let Some(&(t, i, z)) = hits.first() {
+            if !glass {
+                self.beam_enviro_gibs(env, damage);
+            }
+            // PiercingShotCheck, anything else but glass: LookRotation(hit normal)
+            if let (Some(p), Some(h)) = (hit_fx, env.filter(|_| !glass)) {
+                self.fx_instantiate(p, crate::particles::to_unity(h.point), crate::particles::look_rotation(crate::particles::to_unity(h.normal)));
+            }
+        } else if let Some(&(t, i, z, n)) = hits.first() {
             end = eye + dir * t;
             damage_enemy(self, i, damage, z, end, "revolver");
+            // HitSomething: at the hit point with the beam's rotation, then forward = hit normal
+            if let Some(p) = hit_fx {
+                self.fx_instantiate(p, crate::particles::to_unity(end), crate::particles::set_forward(beam_rot, crate::particles::to_unity(n)));
+            }
         } else {
             self.hit_environment(env, damage);
+            self.beam_enviro_gibs(env, damage);
+            if let (Some(p), Some(h)) = (hit_fx, env) {
+                self.fx_instantiate(p, crate::particles::to_unity(h.point), crate::particles::set_forward(beam_rot, crate::particles::to_unity(h.normal)));
+            }
         }
         self.events.push(GameEvent::Shot { from: eye, to: end, pierce });
+    }
+
+    /// RevolverBeam.ExecuteHits on the environment: CreateEnviroGibs(hit, round(3 * damage), damage)
+    /// when it is static environment.
+    fn beam_enviro_gibs(&mut self, env: Option<uk_core::collide::RayHit>, damage: f32) {
+        if let Some(h) = env.filter(|h| self.is_static_environment(h.collider)) {
+            self.create_enviro_gibs(h.point + h.normal, -h.normal, 5.0, crate::particles::round_half_even(3.0 * damage), damage);
+        }
+    }
+
+    /// Is a Glass script on this world collider's GameObject?
+    fn collider_has_glass(&self, c: uk_core::collide::ColliderId) -> bool {
+        let owner = self.world.owner(c);
+        if owner == uk_core::collide::ALWAYS {
+            return false;
+        }
+        let node = self.def.colliders[owner as usize].node;
+        self.def.scripts_on(node).any(|(sc, _)| matches!(self.s.scripts[sc as usize], Script::Glass(_)))
     }
 
     /// Does this ray hit a Glass object first?
@@ -1259,6 +1374,11 @@ impl Game {
         }
         if let Some(h) = self.world.raycast(eye, dir, 4.0) {
             self.events.push(GameEvent::PunchHit);
+            // Instantiate(dustParticle, hit.point, transform.rotation).transform.forward = hit.normal
+            if let Some(p) = self.class_prefab("Punch", "dustParticle") {
+                let rot = crate::particles::look_rotation(crate::particles::to_unity(dir));
+                self.fx_instantiate(p, crate::particles::to_unity(h.point), crate::particles::set_forward(rot, crate::particles::to_unity(h.normal)));
+            }
             let owner = self.world.owner(h.collider);
             if owner != uk_core::collide::ALWAYS {
                 let node = self.def.colliders[owner as usize].node;

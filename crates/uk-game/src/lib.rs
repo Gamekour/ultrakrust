@@ -13,6 +13,7 @@ pub mod nav;
 pub mod parity;
 pub mod particles;
 pub mod scripts;
+pub mod surface;
 pub mod tmp;
 pub mod ugui;
 
