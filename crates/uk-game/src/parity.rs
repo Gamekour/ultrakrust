@@ -50,7 +50,11 @@ pub const PORTED: &[(&str, Port)] = &[
     ("WallCheck", Port::Full),
     ("CameraController", Port::Partial("no screenshake, no options")),
     ("Revolver", Port::Partial("piercer variant only; no coin/alt variants, no sound; viewmodel anim fed (Shoot/ChargeShoot); the charge-up effect is always on (playtest)")),
-    ("Punch", Port::Partial("Feedbacker basics; no Knuckleblaster; viewmodel Jab/Jab2 fed")),
+    ("Punch", Port::Partial("Feedbacker basics; no Knuckleblaster; viewmodel Jab/Jab2 fed; item AltHit / ForceHold / PlaceHeldObject (one active frame, no ForceThrow/ForceDrop, no infiniteSource copies)")),
+    // items (items.rs)
+    ("ItemIdentifier", Port::Partial("pickup / put-down and onPickUp/onPutDown; no CreateCopy, ForcePutDown, hooking or physics drops")),
+    ("ItemPlaceZone", Port::Partial("CheckItem, ColorDoors (_EmissiveColor), Door.AltarControlled; no InstantiateObject raise effects, sounds or bounds-error check")),
+    ("Skull", Port::Partial("light flare / decay, OnCorrectUse emission; no audio, Flammable burn or stain ignition")),
     // enemies (enemy.rs)
     ("EnemyIdentifier", Port::Partial("damage/limb multipliers; no buffs, blessing, radiance, sand")),
     ("Zombie", Port::Partial("navmesh pursuit (TrackTick); no anim, no agent avoidance")),

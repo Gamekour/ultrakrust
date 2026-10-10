@@ -383,6 +383,18 @@ pub fn set_param(g: &mut Game, rig: usize, name: &str, value: f32) {
     }
 }
 
+/// An Animator parameter's current value (bools and triggers as 0 / 1), if the controller has it.
+pub fn get_param(g: &Game, rig: usize, name: &str) -> Option<f32> {
+    let r = &g.anim.rigs[rig];
+    let x = g.def.controllers[r.ctrl as usize].ctrl.param(path_hash(name))?;
+    let p = &g.s.anim[rig].params;
+    match x.kind {
+        param::FLOAT => p.floats.get(x.index as usize).copied(),
+        param::INT => p.ints.get(x.index as usize).map(|&v| v as f32),
+        _ => p.bools.get(x.index as usize).map(|&v| v as u8 as f32),
+    }
+}
+
 /// `Animator.Play(state)`: jump to a state of a layer by name or full path.
 pub fn play(g: &mut Game, rig: usize, layer: usize, state: &str, time: f32) {
     let r = &g.anim.rigs[rig];

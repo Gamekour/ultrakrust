@@ -9,6 +9,7 @@ pub mod enemy;
 pub mod game;
 pub mod hud;
 pub mod hudmsg;
+pub mod items;
 pub mod nav;
 pub mod parity;
 pub mod particles;

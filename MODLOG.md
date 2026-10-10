@@ -637,3 +637,12 @@ CPU-skinned enemies, 3,393 colliders/569 triggers, 11,758 MonoBehaviours with ty
 - Playtest bug (PARITY §7): a speed readout showed above the bottom-left status bar. It was the HUD's SpeedometerPanel: PlayerActivatorRelay turns it on, and its `Speedometer` script wasn't ported, so it stayed on.
 - Ported `Speedometer.OnEnable` (`hud.rs`): the object stays active only when the `speedometer` pref is above 0 (default 0; the user's prefs don't set it). The readout itself (FixedUpdate) is not ported.
 - `hud_probe` now turns SpeedometerPanel on as the relay does: with the user's prefs it goes inactive with 0 draws; with `speedometer=1` it stays active with 2 draws.
+
+## 2026-10-10 — Skulls and altars
+- New `items.rs`: ItemIdentifier, ItemPlaceZone and Skull, plus Punch's item half (AltHit, ForceHold, PlaceHeldObject). The punch's 4 m environment query now also finds layer-22 colliders (items and altars), because Unity's `queriesHitTriggers` is on.
+- Runtime SetParent (`State::reparent`): active-in-hierarchy, GetComponentInChildren and the item's mover transform all follow the new parent. A held skull stays active when its room unloads.
+- Altars: CheckItem (prelim at Start) opens and closes doors, moves ArenaStatus, toggles altar elements, plays elementChangeEffect, and turns the zone collider on or off. ColorDoors sets `_EmissiveColor` through a new per-node property-block path in the renderer and runs Door.AltarControlled.
+- Skull: PunchWith flares the light ×2.5 for 1 s, after which it decays at 5/s. OnCorrectUse turns the light off and sets the emission to 1.
+- Renderer: every item draw also has a HUD Camera copy, shown while the item is held. Lights follow movers, and a held light rides the camera (`Game::view_world`).
+- `item_probe` (0-2): picks up the hallway skull (Holding=1, colliders off), flares and decays (25 → 21.3 at 1.75 s), and places it on the 5B altar at the variant's pre-placed pose (-45, -6.36, -236). That opens the Secret Wall (y 5 → -5 over 6 s); taking the skull back closes it. `UK_PROBE_HOLD=1` in the exe picks up the first item. Playtest confirmed the held skull looks right.
+- Not ported: InstantiateObject altar raises, sounds, infiniteSource copies, ItemTrigger, ItemlessChecker, and the legacy renderer.

@@ -157,12 +157,20 @@ pub struct State {
     pub anim: Vec<crate::anim::AnimatorState>,
     /// UnityEngine.Random stand-in for viewmodel animator rolls (PunchRandomizer, RandomChance)
     pub vm_rng: u32,
+    /// Runtime Transform.SetParent: (node, new parent, Unity-space local transform)
+    pub reparent: Vec<(u32, u32, Mat4)>,
+    /// Punch.heldItem (ItemIdentifier script)
+    pub held: Option<u32>,
+    /// MaterialPropertyBlock overrides: (node, property, value, whole subtree)
+    pub mat_props: Vec<(u32, &'static str, [f32; 4], bool)>,
 }
 
 pub struct Mover {
     pub node: u32,
     pub group: usize,
     pub world0: Mat4,
+    /// an ItemIdentifier: follows its runtime parent (items.rs)
+    pub item: bool,
 }
 
 /// What the player Canvas shows on death, read from the scene: DeathSequence's "Text (TMP)"
@@ -244,6 +252,12 @@ pub struct Game {
     /// node -> mover index (nearest mover ancestor, including itself)
     pub node_mover: Vec<Option<u32>>,
     pub movers: Vec<Mover>,
+    /// layer-22 colliders (ItemIdentifiers, ItemPlaceZones)
+    pub(crate) alt_colliders: Vec<u32>,
+    /// Punch.holder: where a picked-up item is parented
+    pub(crate) punch_holder: Option<u32>,
+    /// The main camera's current world matrix (Bevy space), set by the frontend each frame.
+    pub view_world: Mat4,
     /// the player's [`uk_core::player::Bodies`]: (scene collider, enemy index) per enemy collider
     body_owners: Vec<(u32, usize)>,
     pub triggers: Vec<u32>,
@@ -366,7 +380,7 @@ impl Game {
             }
             let group = world.new_group();
             let idx = movers.len() as u32;
-            movers.push(Mover { node, group, world0: def.nodes[node as usize].world0 });
+            movers.push(Mover { node, group, world0: def.nodes[node as usize].world0, item: false });
             let mut stack = vec![node];
             while let Some(m) = stack.pop() {
                 node_mover[m as usize] = Some(idx);
@@ -387,6 +401,20 @@ impl Game {
         for e in &enemies {
             mark_mover(e.node, &mut world, &mut movers, &mut node_mover);
         }
+        // ItemIdentifiers: skulls are picked up and placed elsewhere
+        for (i, s) in def.scripts.iter().enumerate() {
+            if matches!(scripts_rt[i], Script::Item(_)) && !in_player(s.node) {
+                mark_mover(s.node, &mut world, &mut movers, &mut node_mover);
+                if let Some(m) = node_mover[s.node as usize] {
+                    movers[m as usize].item = true;
+                }
+            }
+        }
+        // layer 22 (items, altars): not in the collision world, found by Punch's environment query
+        let alt_colliders: Vec<u32> =
+            def.colliders.iter().enumerate().filter(|(_, c)| c.layer == 22 && !in_player(c.node)).map(|(i, _)| i as u32).collect();
+        // Punch.holder of the standard (blue) arm
+        let punch_holder = def.scripts.iter().find(|s| s.class == "Punch" && s.data.get("type").i64() == 0).and_then(|s| def.node_ref(s.data.get("holder")));
 
         // Collision + triggers.
         let mut triggers = Vec::new();
@@ -539,6 +567,9 @@ impl Game {
             checkpoint_yaw: 0.0,
             anim: anim_states,
             vm_rng: 0x9E37_79B9,
+            reparent: Vec::new(),
+            held: None,
+            mat_props: Vec::new(),
         };
         let mut g = Game {
             def: def.clone(),
@@ -548,6 +579,9 @@ impl Game {
             nav: crate::nav::NavGraph::build(&def.navmeshes),
             node_mover,
             movers,
+            alt_colliders,
+            punch_holder,
+            view_world: Mat4::IDENTITY,
             body_owners,
             triggers,
             spawn_yaw,
@@ -679,7 +713,8 @@ impl Game {
 
     /// Recomputes active-in-hierarchy below `n` and queues enable/disable callbacks.
     fn refresh(&mut self, n: u32) {
-        let parent_active = self.def.nodes[n as usize].parent.map(|p| self.s.active[p as usize]).unwrap_or(true);
+        let def = self.def.clone();
+        let parent_active = self.eff_parent(n).map(|p| self.s.active[p as usize]).unwrap_or(true);
         let mut stack = vec![(n, parent_active)];
         while let Some((m, pa)) = stack.pop() {
             let i = m as usize;
@@ -692,10 +727,22 @@ impl Game {
             for &sc in &self.scripts_by_node[i] {
                 self.pending_events.push((sc, now));
             }
-            for &c in self.def.nodes[i].children.iter().rev() {
-                stack.push((c, now));
+            if self.s.reparent.is_empty() {
+                stack.extend(def.nodes[i].children.iter().rev().map(|&c| (c, now)));
+            } else {
+                stack.extend(self.eff_children(m).into_iter().rev().map(|c| (c, now)));
             }
         }
+    }
+
+    /// Re-evaluates a node's active-in-hierarchy after a runtime SetParent.
+    pub(crate) fn refresh_node(&mut self, n: u32) {
+        self.refresh(n);
+        self.flush_events();
+    }
+
+    pub(crate) fn scripts_on_node(&self, n: u32) -> &[u32] {
+        &self.scripts_by_node[n as usize]
     }
 
     pub(crate) fn flush_events(&mut self) {
@@ -841,6 +888,7 @@ impl Game {
             }
             Script::Door(_) => self.door_awake(sc),
             Script::BigDoor(_) => self.big_door_awake(sc),
+            Script::Skull(_) => self.skull_awake(sc),
             Script::FinalDoorOpener { opened, .. } => {
                 if !*opened {
                     if let Some(fd) = self.parent_script(node, |s| matches!(s, Script::FinalDoor(_))) {
@@ -1007,6 +1055,7 @@ impl Game {
                     self.invoke(sc, Act::RemoveOnTime, t);
                 }
                 Script::SpawnEffect { .. } => self.spawn_effect_start(sc),
+                Script::PlaceZone(_) => self.place_zone_start(sc),
                 Script::HudMessageReceiver => self.msg_receiver_start(sc),
                 _ => {}
             }
@@ -2529,6 +2578,9 @@ impl Game {
     pub fn mover_delta(&self, m: u32) -> Affine3A {
         let mv = &self.movers[m as usize];
         let node = mv.node as usize;
+        if mv.item {
+            return self.item_mover_delta(mv.node, mv.world0);
+        }
         if let Some(e) = self.s.enemies.iter().find(|e| e.node == mv.node) {
             return e.delta();
         }
@@ -2906,6 +2958,7 @@ impl Game {
                 Script::Door(_) => self.door_update(sc, dt),
                 Script::BigDoor(_) => self.big_door_update(sc, dt),
                 Script::SpawnEffect { .. } => self.spawn_effect_update(sc, dt),
+                Script::Skull(_) => self.skull_update(sc, dt),
                 Script::DoorController(_) => self.door_controller_update(sc),
                 Script::ObjectActivator(oa) => {
                     if let Some(o) = oa.obac {

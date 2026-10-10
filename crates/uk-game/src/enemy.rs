@@ -1351,6 +1351,7 @@ impl Game {
             crate::anim::set_param(self, r, "PunchRandomizer", roll);
             crate::anim::set_param(self, r, "Punch", 1.0);
         }
+        self.punch_with_held();
         let dir = dir.normalize_or_zero();
         // parry: projectiles in the zone in front of the camera
         let mut parried = false;
@@ -1388,7 +1389,11 @@ impl Game {
             self.events.push(GameEvent::PunchHit);
             return;
         }
-        if let Some(h) = self.world.raycast(eye, dir, 4.0) {
+        let env = self.world.raycast(eye, dir, 4.0);
+        if self.punch_items(eye, dir, env.as_ref().map(|h| h.distance)) {
+            return;
+        }
+        if let Some(h) = env {
             self.events.push(GameEvent::PunchHit);
             // Instantiate(dustParticle, hit.point, transform.rotation).transform.forward = hit.normal
             if let Some(p) = self.class_prefab("Punch", "dustParticle") {

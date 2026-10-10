@@ -550,6 +550,8 @@ fn frame_sim(
     // Weapons
     let eye = sim.game.s.player.pos + sim.cam.local_pos;
     let aim = sim.cam.rotation() * Vec3::NEG_Z;
+    // where a held item's light goes (items.rs)
+    sim.game.view_world = Mat4::from_rotation_translation(sim.cam.rotation(), eye);
     let alive = !sim.game.s.dead && sim.game.s.player.activated && !sim.game.s.level_complete;
     sim.recoil = (sim.recoil - dt * 6.0).max(0.0);
     sim.punch_cd = (sim.punch_cd - dt).max(0.0);
@@ -569,6 +571,14 @@ fn frame_sim(
         if let Some(shot) = shot {
             sim.recoil = 1.0;
             sim.game.fire_revolver(eye, aim, shot == Shot::Pierce);
+        }
+    }
+    // `UK_PROBE_HOLD`: Punch picks up the level's first item, for the renderer's numbers
+    if std::env::var_os("UK_PROBE_HOLD").is_some() && sim.game.s.held.is_none() && sim.level_time > 1.0 {
+        if let Some(it) = sim.game.s.scripts.iter().position(|s| matches!(s, uk_game::scripts::Script::Item(_))) {
+            sim.game.force_hold(it as u32);
+            let l = sim.game.def.lights.iter().position(|l| sim.game.under_held(l.node));
+            info!("probe hold: {} held={:?} light {:?} at {:?} eye {eye:?}", sim.game.def.path(sim.game.def.scripts[it].node), sim.game.held_item(), l, l.map(|l| sim.game.light_world_bevy(sim.game.def.lights[l].node).w_axis));
         }
     }
     let probe_punch = std::env::var_os("UK_PROBE_PUNCH").is_some();

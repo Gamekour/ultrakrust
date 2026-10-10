@@ -123,6 +123,9 @@ pub struct Draw {
     pub sky: bool,
     /// A particle slot: world-space geometry rebuilt every frame (`UnityFrame::particles`).
     pub particle: bool,
+    /// Under an ItemIdentifier (its node): drawn twice, in the world and, while Punch holds it
+    /// on layer 13, by the HUD Camera (`hud`).
+    pub item: Option<u32>,
 }
 
 pub struct SkinDraw {
@@ -338,6 +341,8 @@ pub struct UnityFrame {
     pub hud_cam: Option<Mat4>,
     /// this frame's particle and trail geometry per slot
     pub particles: Arc<Vec<ParticleDraw>>,
+    /// MaterialPropertyBlock overrides per draw (ModifyMaterial, Door.ChangeColor)
+    pub props: Arc<HashMap<usize, Vec<(&'static str, [f32; 4])>>>,
 }
 
 impl UnityFrame {
@@ -610,6 +615,13 @@ pub fn build(
     let mut textures: Vec<TexCpu> = Vec::new();
     let mut texture_ids: HashMap<(String, i64), Option<u32>> = HashMap::new();
     let mut draws = Vec::new();
+    let item_nodes: std::collections::HashSet<u32> = def.scripts.iter().filter(|s| s.class == "ItemIdentifier").map(|s| s.node).collect();
+    let item_of = |mut n: u32| loop {
+        if item_nodes.contains(&n) {
+            return Some(n);
+        }
+        n = def.nodes[n as usize].parent?;
+    };
     let mut skipped: HashMap<String, usize> = HashMap::new();
     let mut chosen: HashMap<(String, i64), Option<uk_assets::shader::SubProgram>> = HashMap::new();
     // Unity draws the skybox material on its own sphere around the camera
@@ -917,12 +929,21 @@ pub fn build(
             hud: !sky && !particle && def.nodes[r.node as usize].layer == uk_assets::scenedef::VIEWMODEL_LAYER,
             sky,
             particle,
+            item: if sky || particle { None } else { item_of(r.node) },
         });
         if particle {
             let t = draws.len() - 1;
             let n = slot_count.get(&(key.file.clone(), key.path_id)).copied().unwrap_or(1).max(1);
             let slots: Vec<usize> = (0..n).map(|k| if k == 0 { t } else { draws.push(draws[t].clone()); draws.len() - 1 }).collect();
             particle_slots.insert((key.file.clone(), key.path_id), slots);
+        }
+    }
+    // a held item is on layer 13: its HUD Camera copy
+    for i in 0..draws.len() {
+        if draws[i].item.is_some() {
+            let mut c = draws[i].clone();
+            c.hud = true;
+            draws.push(c);
         }
     }
     // the final composite: GameController's PostProcessV2_Handler names the material and dither texture
@@ -1386,7 +1407,9 @@ fn particle_draws(game: &uk_game::Game, scene: &SceneData) -> Vec<ParticleDraw> 
 pub fn frame(game: &uk_game::Game, scene: &SceneData, time: f32, screen: [f32; 2]) -> UnityFrame {
     let m = Mat4::from_scale(Vec3::new(1.0, 1.0, -1.0));
     let particles = particle_draws(game, scene);
-    let mut visible: Vec<bool> = scene.draws.iter().map(|d| d.sky || (d.enabled && game.active(d.node))).collect();
+    let held = game.held_item();
+    let mut visible: Vec<bool> =
+        scene.draws.iter().map(|d| d.sky || (d.enabled && game.active(d.node) && d.item.is_none_or(|it| (held == Some(it)) == d.hud))).collect();
     for p in &particles {
         visible[p.slot] = true;
     }
@@ -1433,7 +1456,8 @@ pub fn frame(game: &uk_game::Game, scene: &SceneData, time: f32, screen: [f32; 2
         .iter()
         .enumerate()
         .map(|(i, l)| {
-            let w = game.def.nodes[l.node as usize].world0;
+            // movers and the held item carry their lights
+            let w = game.light_world_bevy(l.node);
             let (_, rot, pos) = w.to_scale_rotation_translation();
             // world0 is Bevy space; Unity forward (+z) is Bevy -z
             let fwd = rot * Vec3::NEG_Z;
@@ -1475,6 +1499,11 @@ pub fn frame(game: &uk_game::Game, scene: &SceneData, time: f32, screen: [f32; 2
         noise: s.screen_noise,
         hud_cam: scene.hud_cam.and(game.sway).map(|sw| game.node_world_bevy(sw.hud_cam)),
         particles: Arc::new(particles),
+        props: Arc::new(if s.mat_props.is_empty() {
+            HashMap::new()
+        } else {
+            scene.draws.iter().enumerate().filter(|(_, d)| !d.particle && !d.sky).map(|(i, d)| (i, game.mat_props_of(d.node))).filter(|p| !p.1.is_empty()).collect()
+        }),
     }
 }
 
@@ -2169,6 +2198,9 @@ fn fill_cb(out: &mut [u8], cb: &uk_assets::shader::ConstantBuffer, scene: &Scene
                 } else if n.ends_with("_HDR") && d.material.vector(n).is_none() {
                     // the texture's HDR decode values; LDR textures decode as rgb * 1
                     [1.0, 1.0, 0.0, 0.0]
+                } else if let Some(v) = frame.props.get(&di).and_then(|p| p.iter().find(|p| p.0 == n)).filter(|_| d.material.vector(n).is_some()) {
+                    // MaterialPropertyBlock: only where the material has the property
+                    v.1
                 } else {
                     d.material.vector(n).unwrap_or(if n.ends_with("_ST") { [1.0, 1.0, 0.0, 0.0] } else { [0.0; 4] })
                 }
@@ -2695,7 +2727,9 @@ fn prepare(
     for (i, (p, _, on, range)) in frame.lights.iter().enumerate() {
         if *on {
             key = (key ^ i as u64 ^ (range.to_bits() as u64) << 32).wrapping_mul(0x100000001b3);
-            key = (key ^ p.x.to_bits() as u64 ^ (p.z.to_bits() as u64) << 32).wrapping_mul(0x100000001b3);
+            // half-metre steps: a carried light re-ranks when it has moved, not every frame
+            let q = |v: f32| (v * 2.0).round() as i64 as u64;
+            key = (key ^ q(p.x) ^ q(p.y) << 21 ^ q(p.z) << 42).wrapping_mul(0x100000001b3);
         }
     }
     if gpu.light_key != key || gpu.light_pick.len() != scene.draws.len() {

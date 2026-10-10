@@ -350,6 +350,12 @@ pub enum Script {
     SpawnEffect { bubble: Option<u32>, light: Option<u32>, simple: bool },
     /// HUD scripts (hud.rs)
     Hud(Box<crate::hud::HudScript>),
+    /// ItemIdentifier (items.rs)
+    Item(Box<crate::items::Item>),
+    /// ItemPlaceZone (items.rs)
+    PlaceZone(Box<crate::items::PlaceZone>),
+    /// Skull (items.rs)
+    Skull(crate::items::Skull),
     Other,
 }
 
@@ -565,6 +571,7 @@ pub fn parse(def: &SceneDef, idx: usize) -> Script {
         "DisablePowerUp" => Script::DisablePowerUp,
         "RemoveOnTime" => Script::RemoveOnTime { time: f("time"), randomizer: f("randomizer") },
         "SpawnEffect" => Script::SpawnEffect { bubble: None, light: None, simple: false },
+        "ItemIdentifier" | "ItemPlaceZone" | "Skull" => crate::items::parse(def, idx),
         _ => crate::hud::parse(def, idx).map_or(Script::Other, |h| Script::Hud(Box::new(h))),
     }
 }
